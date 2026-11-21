@@ -417,6 +417,17 @@ impl CellConfig {
     }
 }
 
+/// Put injected boundary evidence ahead of collector symptoms.
+///
+/// The boundary-class reason names the physical condition under test. A drain
+/// or delivery symptom can appear or disappear with scheduling, so it must not
+/// decide the primary failure class when a boundary reason is present.
+fn order_acceptance_reasons(boundary: Vec<String>, observed: Vec<String>) -> Vec<String> {
+    let mut ordered = boundary;
+    ordered.extend(observed);
+    ordered
+}
+
 /// Acceptance verdict for one cell. Any failure lists every reason found; the
 /// first reason is the primary machine-readable `failure_class`.
 #[derive(Debug, Clone)]
@@ -3079,16 +3090,15 @@ async fn run_cell_inner(directory: &Path, config: &CellConfig) -> CellOutcome {
         anchored_extras_ok,
     };
 
-    // Backpressure evidence is derived after the output exists, and its own
-    // reasons are appended to the ledger and delivery reasons. A reconciled
-    // ledger alone never certifies a bounded-queue boundary.
+    // Backpressure evidence is derived after the output exists. A reconciled
+    // ledger alone never certifies a bounded-queue boundary. The injected
+    // physical boundary is the real cause; collector drain symptoms are
+    // downstream effects and must not lead the machine-readable failure class.
     let profile = super::backpressure::BackpressureProfile::from_config(config);
     let observation = super::backpressure::observe(profile.as_ref(), Some(&output));
-    reasons.extend(super::backpressure::acceptance_reasons(
-        config,
-        &observation,
-        Some(&output),
-    ));
+    let boundary_reasons =
+        super::backpressure::acceptance_reasons(config, &observation, Some(&output));
+    reasons = order_acceptance_reasons(boundary_reasons, reasons);
 
     let acceptance = if reasons.is_empty() {
         CellAcceptance::valid()
@@ -3897,6 +3907,26 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::*;
+
+    #[test]
+    fn boundary_reason_leads_regardless_of_collector_timing() {
+        let ordered = order_acceptance_reasons(
+            vec!["journal_pressure_rejected".to_owned()],
+            vec!["coverage_invalid".to_owned(), "drain_incomplete".to_owned()],
+        );
+        assert_eq!(
+            ordered.first().map(String::as_str),
+            Some("journal_pressure_rejected"),
+            "the injected boundary must name the failure class"
+        );
+        assert_eq!(ordered.len(), 3, "no reason is dropped by reordering");
+        let acceptance = CellAcceptance::from_reasons(ordered);
+        assert_eq!(
+            acceptance.failure_class.as_deref(),
+            Some("journal_pressure_rejected"),
+            "the failure class follows the boundary reason"
+        );
+    }
 
     #[test]
     fn hot_cold_partition_is_exhaustive_and_disjoint() {
