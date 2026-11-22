@@ -460,11 +460,9 @@ mod tests {
             document.manifest(),
             chain.manifest(),
         ] {
-            assert!(
-                validate_modalities(manifest).is_ok(),
-                "fixture manifest for {} must validate",
-                manifest.source_id
-            );
+            let valid = validate_modalities(manifest).is_ok();
+            let detail = format!("fixture manifest for {} must validate", manifest.source_id);
+            assert!(valid, "{detail}");
         }
     }
 

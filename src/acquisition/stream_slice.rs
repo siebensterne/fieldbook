@@ -8,7 +8,11 @@
 //! result. Raw bytes stay in the evidence store; typed records only reference
 //! them.
 
-use std::{collections::BTreeMap, sync::Mutex, time::Duration};
+use std::{
+    collections::BTreeMap, //
+    sync::Mutex,           //
+    time::Duration,        //
+};
 
 use serde::Deserialize;
 use serde::Serialize;
