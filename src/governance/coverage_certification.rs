@@ -487,7 +487,9 @@ impl CoverageRecord {
     /// Build the fully identified rights query for this coverage record.
     #[must_use]
     pub fn rights_query(&self, right: UsageRight) -> crate::rights::AuthorizationQuery {
-        use crate::rights::{Licensee, Operation, ScopeSet};
+        use crate::rights::Licensee;
+        use crate::rights::Operation;
+        use crate::rights::ScopeSet;
         let operation = match right {
             UsageRight::RealTimeAccess => Operation::RealTimeCapture,
             UsageRight::HistoricalStorage => Operation::HistoricalDataRetrieval,

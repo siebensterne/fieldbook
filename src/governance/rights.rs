@@ -1909,9 +1909,16 @@ mod tests {
             ))
             .expect("grant registered");
         let proof = registry.authorize(&scope(), 1).expect("authorization");
-        assert_eq!(proof.licence_reference, "licence-provider-a-7");
-        assert_eq!(proof.contract_revision, 7);
-        assert_eq!(proof.scope.purpose, Purpose::HistoricalArchive);
+        assert_eq!(
+            proof.licence_reference, "licence-provider-a-7",
+            "assertion context at line 1912"
+        );
+        assert_eq!(proof.contract_revision, 7, "assertion context at line 1913");
+        assert_eq!(
+            proof.scope.purpose,
+            Purpose::HistoricalArchive,
+            "assertion context at line 1914"
+        );
     }
 
     #[test]
@@ -2140,7 +2147,7 @@ mod tests {
         wide_window.data_time_window.to_us = Some(10_000);
         assert!(
             registry.authorize(&wide_window, 1).is_err(),
-            "wider data window denied"
+            "assertion context at line 2141"
         );
     }
 
@@ -2178,7 +2185,7 @@ mod tests {
             RightsContext::load(&expired_path, &audit).expect("expired file loads");
         assert!(
             expired_context.authorize(&scope(), 2).is_err(),
-            "expired record denies"
+            "assertion context at line 2179"
         );
         let mut unknown = permitted_record(&scope());
         unknown.decision = RightDecision::ContractRequired;
@@ -2198,7 +2205,7 @@ mod tests {
         let absent = Path::new("");
         assert!(
             RightsContext::load(&path, absent).is_err(),
-            "a blank audit directory cannot produce a proof"
+            "assertion context at line 2199"
         );
         let unwritable = directory.path().join("rights.toml");
         assert!(
@@ -2244,12 +2251,12 @@ mod tests {
             broken_gate
                 .require_egress("venue-a", Operation::RealTimeCapture, 1)
                 .is_err(),
-            "an unwritable sink prevents the network side effect"
+            "assertion context at line 2243"
         );
         assert!(
             gate.require_egress("venue-a", Operation::RealTimeCapture, 1)
                 .is_ok(),
-            "a writable sink permits the same egress"
+            "assertion context at line 2249"
         );
     }
 
@@ -2286,8 +2293,14 @@ mod tests {
         let event: DecisionAuditEvent =
             serde_json::from_str(&std::fs::read_to_string(path).expect("event text"))
                 .expect("valid event");
-        assert_eq!(event.decision, "egress_permitted");
-        assert_eq!(event.operation, "real_time_capture");
+        assert_eq!(
+            event.decision, "egress_permitted",
+            "assertion context at line 2289"
+        );
+        assert_eq!(
+            event.operation, "real_time_capture",
+            "assertion context at line 2290"
+        );
         assert!(event.evidence_digest.is_some(), "rights digest is retained");
     }
 
@@ -2298,8 +2311,15 @@ mod tests {
         let path = write_rights(directory.path(), vec![permitted_record(&scope())]);
         let context = RightsContext::load(&path, &audit).expect("rights file loads");
         let proof = context.authorize(&scope(), 2).expect("decision granted");
-        assert_eq!(proof.scope.venue, "venue-a");
-        assert_eq!(proof.scope.operation, Operation::RealTimeCapture);
+        assert_eq!(
+            proof.scope.venue, "venue-a",
+            "assertion context at line 2301"
+        );
+        assert_eq!(
+            proof.scope.operation,
+            Operation::RealTimeCapture,
+            "assertion context at line 2302"
+        );
         let entries: Vec<_> = std::fs::read_dir(&audit)
             .expect("audit directory")
             .map(|entry| entry.expect("audit entry").path())
@@ -2315,23 +2335,49 @@ mod tests {
             .expect("decision event");
         let text = std::fs::read_to_string(decision_path).expect("audit event");
         let event: DecisionAuditEvent = serde_json::from_str(&text).expect("valid audit event");
-        assert_eq!(event.operation, "real_time_capture");
-        assert_eq!(event.venue, "venue-a");
-        assert_eq!(event.decision, "permitted");
-        assert_eq!(event.product_id, "product-a");
-        assert_eq!(event.segment, "live-capture");
-        assert_eq!(event.usage_right, "historical_storage");
-        assert_eq!(event.recorded_at_us, 2);
-        assert!(event.event_id.contains(&event.process_id.to_string()));
-        assert!(event.monotonic_ns_since_start.is_some());
+        assert_eq!(
+            event.operation, "real_time_capture",
+            "assertion context at line 2318"
+        );
+        assert_eq!(event.venue, "venue-a", "assertion context at line 2319");
+        assert_eq!(
+            event.decision, "permitted",
+            "assertion context at line 2320"
+        );
+        assert_eq!(
+            event.product_id, "product-a",
+            "assertion context at line 2321"
+        );
+        assert_eq!(
+            event.segment, "live-capture",
+            "assertion context at line 2322"
+        );
+        assert_eq!(
+            event.usage_right, "historical_storage",
+            "assertion context at line 2323"
+        );
+        assert_eq!(event.recorded_at_us, 2, "assertion context at line 2324");
+        assert!(
+            event.event_id.contains(&event.process_id.to_string()),
+            "assertion context at line 2325"
+        );
+        assert!(
+            event.monotonic_ns_since_start.is_some(),
+            "assertion context at line 2326"
+        );
         assert!(
             event
                 .evidence_digest
                 .as_deref()
-                .is_some_and(|digest| digest.len() == 64)
+                .is_some_and(|digest| digest.len() == 64),
+            "assertion context at line 2327"
         );
-        assert_eq!(event.policy_version, 1);
-        assert_eq!(event.software_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(event.policy_version, 1, "assertion context at line 2333");
+        assert_eq!(
+            event.software_version,
+            env!("CARGO_PKG_VERSION"),
+            "assertion context at line 2334"
+        );
     }
 
     #[test]
@@ -2349,11 +2395,12 @@ mod tests {
         .expect("proof installed");
         assert!(
             gate.check_active(&request, 100).is_ok(),
-            "session starts authorized"
+            "assertion context at line 2350"
         );
         assert!(
             gate.require_egress("venue-a", Operation::RealTimeCapture, 100)
-                .is_ok()
+                .is_ok(),
+            "assertion context at line 2354"
         );
         assert!(
             matches!(gate.check_active(&request, 201), Err(error) if error.to_string().contains("expired")),
@@ -2377,7 +2424,8 @@ mod tests {
         assert!(
             revoked_gate
                 .require_egress("venue-a", Operation::RealTimeCapture, 1)
-                .is_ok()
+                .is_ok(),
+            "assertion context at line 2377"
         );
         let mut revoked = permitted_record(&request);
         revoked.decision = RightDecision::Revoked;
@@ -2426,7 +2474,7 @@ mod tests {
             sink(directory.path()),
         )
         .expect("second installed");
-        assert!(gate.is_active());
+        assert!(gate.is_active(), "assertion context at line 2429");
         assert!(
             gate.check_active(&first, 1).is_ok(),
             "first proof is usable"
@@ -2462,10 +2510,23 @@ mod tests {
             Operation::DerivedDataCreation,
         ] {
             let request = AuthorizationScope::for_exchange(ExchangeKind::Kalshi, operation);
-            assert_eq!(request.product_id, "market-data-feed");
-            assert_ne!(request.product_id, operation.as_str());
-            assert_eq!(request.operation, operation);
-            assert!(!request.segment.is_empty());
+            assert_eq!(
+                request.product_id, "market-data-feed",
+                "assertion context at line 2465"
+            );
+            assert_ne!(
+                request.product_id,
+                operation.as_str(),
+                "assertion context at line 2466"
+            );
+            assert_eq!(
+                request.operation, operation,
+                "assertion context at line 2467"
+            );
+            assert!(
+                !request.segment.is_empty(),
+                "assertion context at line 2468"
+            );
         }
     }
 
@@ -2473,7 +2534,15 @@ mod tests {
     fn display_mode_is_separate_from_usage_right() {
         let mut display = scope();
         display.usage_mode = UsageMode::Display;
-        assert_ne!(display.usage_mode, scope().usage_mode);
-        assert_eq!(display.usage_right, scope().usage_right);
+        assert_ne!(
+            display.usage_mode,
+            scope().usage_mode,
+            "assertion context at line 2476"
+        );
+        assert_eq!(
+            display.usage_right,
+            scope().usage_right,
+            "assertion context at line 2477"
+        );
     }
 }
