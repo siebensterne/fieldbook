@@ -21,6 +21,7 @@ use serde::Serialize;
 use crate::{
     config::{ExchangeKind, Settings},
     egress::{EgressRoute, RouteProvenance},
+    rights::Operation,
     util::sha256_hex,
     ws::{self, ConnectOptions, ProbeStage, ProbeTrace},
 };
@@ -133,6 +134,8 @@ pub async fn run_with_route(
         egress: route,
         trace: Some(ProbeTrace::begin()),
         venue: settings.network.venue.clone(),
+        // A network probe only contacts the source; it never captures data.
+        operation: Operation::SourceContact,
     };
 
     let started = Instant::now();

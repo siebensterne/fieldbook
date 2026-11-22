@@ -7,7 +7,9 @@ global financial information platform. It makes coverage and limitations
 visible to consumers. A free endpoint is not a redistribution licence, and a
 single instrument price is not proof of country coverage.
 
-The Rust implementation is `src/coverage_certification.rs` and `src/rights.rs`.
+The Rust implementation is `src/governance/coverage_certification.rs` and
+`src/governance/rights.rs`. The 2026-11-23 enforcement fix is recorded in
+[`docs/rights-enforcement-2026-11-23.md`](../rights-enforcement-2026-11-23.md).
 
 ## Coverage matrix
 
@@ -43,14 +45,19 @@ set, recorded history bounds and no known gaps.
 
 ## Rights model
 
-A licensing record binds a provider, dataset, territory, rights map, validity
-bound and reference. Rights include real-time access, historical storage,
-internal processing, derived data, redistribution, display and non-display.
-Decisions are `permitted`, `prohibited`, `contract_required` or `unknown`.
+A licensing record binds a licensee, provider, source product, venue, segment,
+instrument/field/modality/time-window scope, territory, delivery method,
+purpose, recipient, retention rule, typed lifecycle operation, validity bound
+and reference. Rights include real-time access, historical storage, internal
+processing, derived data and redistribution. Display mode is a separate
+concept from the right. Decisions are `permitted`, `prohibited`,
+`contract_required`, `unknown` or `revoked`.
 
 The registry is fail-closed. A missing record, a missing right, a conditional
-right or an expired record denies the operation. No venue name or API
-availability implies permission.
+right, an expired record or a mismatched identity denies the operation. No
+venue name or API availability implies permission. A writable audit directory
+is mandatory, and a permitted decision is committed before any provider
+egress.
 
 ## Source acquisition categories
 

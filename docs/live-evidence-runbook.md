@@ -199,8 +199,9 @@ smoke capture can therefore pass `coverage` while still being only
 The test suite has separate venue tests:
 
 Both tests require `LIVE_RIGHTS_FILE` naming a rights file with a `permitted`
-decision for the selected venue and `collect` operation. They refuse to start
-without it; an environment attestation is not a right.
+decision for the selected venue and `real_time_capture` operation, plus a
+writable `LIVE_RIGHTS_AUDIT_DIR` (the tests default to `target/live-audit`).
+They refuse to start without them; an environment attestation is not a right.
 
 ```bash
 RUN_LIVE_TESTS=1 LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml \
@@ -222,10 +223,11 @@ environment to allow only `main` and require reviewer approval. Store these as
 environment-scoped secrets/variables rather than general repository secrets:
 
 Variable `LIVE_RIGHTS_FILE`, the path to a contract-derived rights file
-  provisioned on the runner for the selected venue and `collect` operation.
-  The variable names the file; it is not itself an authorization. The collector
-  validates the file and denies if it is missing, malformed, expired or out of
-  scope.
+  provisioned on the runner for the selected venue and `real_time_capture`
+  operation. The variable names the file; it is not itself an authorization.
+  The collector validates the file and denies if it is missing, malformed,
+  expired or out of scope. Variable `LIVE_RIGHTS_AUDIT_DIR` names the mandatory
+  writable decision-audit directory.
 Secret `KALSHI_API_KEY_ID`.
 Secret `KALSHI_PRIVATE_KEY_PEM`.
 

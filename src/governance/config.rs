@@ -680,6 +680,9 @@ impl NetworkSettings {
             egress,
             trace: None,
             venue: self.venue.clone(),
+            // Settings-derived sessions capture a feed. Probes override this
+            // to `source_contact` at their own call site.
+            operation: crate::rights::Operation::RealTimeCapture,
         })
     }
 }

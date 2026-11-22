@@ -17,7 +17,10 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
-use crate::egress::{self, EgressRoute, ProxyEndpoint, ProxyScheme};
+use crate::{
+    egress::{self, EgressRoute, ProxyEndpoint, ProxyScheme},
+    rights::Operation,
+};
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -80,6 +83,10 @@ pub struct ConnectOptions {
     /// default is the `loopback` test identity, which never permits a provider
     /// host; production options are built from the effective venue in settings.
     pub venue: String,
+    /// Typed lifecycle operation this connection performs. A websocket that
+    /// captures a feed is `real_time_capture`; a diagnostic probe is
+    /// `source_contact`. The gate compares this with the installed proof.
+    pub operation: Operation,
 }
 
 /// One recorded phase of a connection attempt.
@@ -166,6 +173,7 @@ impl Default for ConnectOptions {
             egress: EgressRoute::Direct,
             trace: None,
             venue: "loopback".to_owned(),
+            operation: Operation::RealTimeCapture,
         }
     }
 }
@@ -215,7 +223,7 @@ pub async fn connect(
     headers: &[(http::HeaderName, http::HeaderValue)],
     options: &ConnectOptions,
 ) -> anyhow::Result<WsStream> {
-    authorize_connect(&options.venue, url)?;
+    authorize_connect(&options.venue, url, options.operation)?;
     match tokio::time::timeout(
         options.connect_timeout,
         connect_inner(url, headers, options),
@@ -234,7 +242,7 @@ pub async fn connect(
 /// venue-scoped right covers it. The `loopback` identity is the library's test
 /// default and is accepted only for a loopback target, so it can never be used
 /// to reach a provider.
-fn authorize_connect(venue: &str, url: &str) -> anyhow::Result<()> {
+fn authorize_connect(venue: &str, url: &str, operation: Operation) -> anyhow::Result<()> {
     if venue.eq_ignore_ascii_case("loopback") {
         let host = Url::parse(url).ok().and_then(|parsed| {
             parsed
@@ -247,7 +255,9 @@ fn authorize_connect(venue: &str, url: &str) -> anyhow::Result<()> {
         );
         return Ok(());
     }
-    crate::rights::require_provider_egress(venue, "websocket_connect")
+    // The caller declares the actual lifecycle operation. It is compared with
+    // the installed proof; no transport action string can widen a grant.
+    crate::rights::require_provider_egress(venue, operation)
 }
 
 fn is_loopback_host(host: &str) -> bool {

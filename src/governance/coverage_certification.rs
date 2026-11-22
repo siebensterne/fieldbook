@@ -17,8 +17,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::{
+    config::ExchangeKind,
     quality::QualityReport,
-    rights::{LicensingRegistry, UsageRight},
+    rights::{AuthorizationScope, LicensingRegistry, UsageRight},
     taxonomy::{AssetClass, CountryCode, DataCategory, DepthModel, Frequency},
 };
 
@@ -486,22 +487,33 @@ impl CoverageRecord {
     /// Build the fully identified rights query for this coverage record.
     #[must_use]
     pub fn rights_query(&self, right: UsageRight) -> crate::rights::AuthorizationQuery {
-        crate::rights::AuthorizationQuery {
-            venue: self.provider_id.clone(),
-            operation: crate::rights::Operation::Collect,
-            provider_id: self.provider_id.clone(),
-            source_id: self.source_id.clone(),
-            dataset_id: self.dataset.clone(),
-            product_id: self
+        use crate::rights::{Licensee, Operation, ScopeSet};
+        let operation = match right {
+            UsageRight::RealTimeAccess => Operation::RealTimeCapture,
+            UsageRight::HistoricalStorage => Operation::HistoricalDataRetrieval,
+            UsageRight::InternalProcessing => Operation::InternalAnalytics,
+            UsageRight::DerivedData => Operation::DerivedDataCreation,
+            UsageRight::Redistribution => Operation::ExternalRedistribution,
+        };
+        // The declared command scope supplies the contract vocabulary; the
+        // coverage record overrides only the identities it genuinely owns.
+        AuthorizationScope::for_exchange(ExchangeKind::Kalshi, operation).with(|scope| {
+            scope.licensee = Licensee::system();
+            scope.venue = self.provider_id.clone();
+            scope.provider_id = self.provider_id.clone();
+            scope.source_id = self.source_id.clone();
+            scope.dataset_id = self.dataset.clone();
+            scope.product_id = self
                 .scope
                 .product
                 .clone()
-                .unwrap_or_else(|| self.dataset.clone()),
-            territory: self.scope.country.clone(),
-            usage_right: right,
-            recipient_class: crate::rights::RecipientClass::Internal,
-            purpose: crate::rights::Purpose::InternalAnalysis,
-        }
+                .unwrap_or_else(|| self.dataset.clone());
+            scope.territory = self.scope.country.clone();
+            scope.usage_right = right;
+            scope.instruments = ScopeSet::All;
+            scope.fields = ScopeSet::All;
+            scope.modalities = ScopeSet::All;
+        })
     }
 }
 
@@ -837,11 +849,23 @@ mod tests {
     use crate::{
         quality::Reconciliation,
         rights::{
-            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, Operation, Purpose,
-            RecipientClass, RightDecision,
+            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, Operation, RightDecision,
         },
     };
     use std::collections::BTreeMap;
+
+    fn rights_scope() -> AuthorizationScope {
+        AuthorizationScope::for_exchange(ExchangeKind::Kalshi, Operation::InternalAnalytics).with(
+            |scope| {
+                scope.venue = "source".to_owned();
+                scope.provider_id = "source".to_owned();
+                scope.source_id = "source".to_owned();
+                scope.dataset_id = "quotes".to_owned();
+                scope.product_id = "quotes".to_owned();
+                scope.usage_right = UsageRight::InternalProcessing;
+            },
+        )
+    }
 
     fn universe() -> ExpectedUniverse {
         ExpectedUniverse::Enumerated {
@@ -904,16 +928,7 @@ mod tests {
         registry
             .register(AuthorizationRecord {
                 identity: AuthorizationIdentity {
-                    venue: "source".to_owned(),
-                    operation: Operation::Collect,
-                    provider_id: "source".to_owned(),
-                    source_id: "source".to_owned(),
-                    dataset_id: "quotes".to_owned(),
-                    product_id: "quotes".to_owned(),
-                    territory: CountryCode::new("US").expect("country code"),
-                    usage_right: UsageRight::InternalProcessing,
-                    recipient_class: RecipientClass::Internal,
-                    purpose: Purpose::InternalAnalysis,
+                    scope: rights_scope(),
                     valid_from: 0,
                     valid_until: Some(200),
                 },
@@ -1263,16 +1278,10 @@ mod tests {
         matching_rights
             .register(AuthorizationRecord {
                 identity: AuthorizationIdentity {
-                    venue: "other-provider".to_owned(),
-                    operation: Operation::Collect,
-                    provider_id: "other-provider".to_owned(),
-                    source_id: "source".to_owned(),
-                    dataset_id: "quotes".to_owned(),
-                    product_id: "quotes".to_owned(),
-                    territory: CountryCode::new("US").expect("country code"),
-                    usage_right: UsageRight::InternalProcessing,
-                    recipient_class: RecipientClass::Internal,
-                    purpose: Purpose::InternalAnalysis,
+                    scope: rights_scope().with(|scope| {
+                        scope.venue = "other-provider".to_owned();
+                        scope.provider_id = "other-provider".to_owned();
+                    }),
                     valid_from: 0,
                     valid_until: Some(200),
                 },

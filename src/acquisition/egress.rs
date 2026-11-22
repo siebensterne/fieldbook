@@ -35,7 +35,11 @@ use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::{config::NetworkSettings, util::sha256_hex};
+use crate::{
+    config::NetworkSettings,
+    rights::{Operation, require_provider_egress},
+    util::sha256_hex,
+};
 
 /// Proxy protocol the venue must be reached through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,7 +395,9 @@ pub fn http_client_with(
 ) -> anyhow::Result<reqwest::Client> {
     // Fail closed before a client exists: no provider HTTP client is built
     // without a live, venue-scoped authorization for this process.
-    crate::rights::require_provider_egress(&network.venue, "http_client")?;
+    // A REST client performs reference-data retrieval. The typed operation is
+    // checked against the installed proof; a transport action name never is.
+    require_provider_egress(&network.venue, Operation::ReferenceDataRetrieval)?;
     let route = EgressRoute::from_network_with(network, lookup)?;
     let mut builder = reqwest::Client::builder()
         .user_agent(user_agent.to_owned())
