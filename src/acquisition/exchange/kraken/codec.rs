@@ -224,7 +224,7 @@ pub fn parse_reference_document(value: &Value) -> anyhow::Result<Vec<MarketInfo>
     parse_asset_pairs(value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
 

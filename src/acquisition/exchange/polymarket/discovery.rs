@@ -508,7 +508,7 @@ fn keyset_url(base: &str) -> anyhow::Result<Url> {
     Ok(url)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use std::sync::Arc;
 

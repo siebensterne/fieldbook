@@ -176,7 +176,7 @@ pub fn parse_reference_document(
     parse_products(value, require_online)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
 

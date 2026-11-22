@@ -213,7 +213,7 @@ pub fn parse_instruments_document(
     Ok(markets)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
 

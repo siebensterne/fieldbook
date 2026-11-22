@@ -241,7 +241,9 @@ anchor masking and polish argument validation) and PR #82 (the bounded D10
 reconnect-drain deadline correction). Its verification record reported
 `cargo xtask ci` and `scripts/assurance/polish.sh` passing, 850 Rust tests and
 37 Python tests passing, and four consecutive locked full-suite runs passing
-before the PR #82 merge. Hosted run identifiers were not included.
+before the PR #82 merge. Hosted run identifiers were not included. That count
+is a historical record of the 2026-11-18 export and is not the current test
+count; see `docs/synthetic-test-policy-2026-11-23.md` for the present gate.
 
 ## Subsequent integrations (reconciled in canonical Git)
 

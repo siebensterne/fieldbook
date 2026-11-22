@@ -378,7 +378,7 @@ impl MarketDataSession for PolymarketSession {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;

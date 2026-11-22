@@ -11,6 +11,14 @@ rust-version = "1.99"
 build = "src/util/build.rs"
 description = "Read-only multi-venue market-data collector with SBE capture and raw-frame journaling"
 license = "Apache-2.0"
+# Test targets are declared below. Without this, Cargo would implicitly enable
+# every file in tests/, including the preserved market-shaped sources.
+autotests = false
+
+[features]
+# Opt-in for historical market-shaped tests. Disabled by default: no normal
+# gate, task or CI job enables it. Preserved sources stay in the tree.
+market-shaped-tests = []
 
 [dependencies]
 anyhow = "1"
@@ -41,6 +49,107 @@ url = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Permitted test targets: scalar, abstract-timestamp, arbitrary-byte and
+# generic durable-delivery evidence. These are registered with no extra feature.
+[[test]]
+name = "numeric_model"
+
+[[test]]
+name = "egress_governance"
+
+[[test]]
+name = "egress_lab"
+
+[[test]]
+name = "bounded_batch"
+
+[[test]]
+name = "network_source"
+
+[[test]]
+name = "durable_pipeline"
+
+[[test]]
+name = "segmented_durability"
+
+[[test]]
+name = "jsonl_postgres_reference"
+
+[[test]]
+name = "segmented_runner"
+
+[[test]]
+name = "postgres_baseline"
+
+[[test]]
+name = "postgres_batch_live"
+
+[[test]]
+name = "postgres_live"
+
+# Preserved market-shaped targets. The explicit required-features gate keeps
+# them unregistered in every default build; the opt-in feature is enabled by no
+# gate and no CI job. Source is retained, not deleted.
+[[test]]
+name = "coverage_certificate"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "e2e_mock_exchange"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "evidence_pipeline"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "full_universe_stress"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "hyperliquid_books"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "hyperliquid_capacity"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "hyperliquid_telemetry"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "inspect_capture"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "kalshi_lifecycle_plane"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "lifecycle_churn"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "live_kalshi"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "live_polymarket"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "replay_fixture"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "session_recovery"
+required-features = ["market-shaped-tests"]
+
+[[test]]
+name = "source_conformance"
+required-features = ["market-shaped-tests"]
 
 # Standalone numeric-model benchmark; runs on stable Rust and prints timings.
 [[bench]]

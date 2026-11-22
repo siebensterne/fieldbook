@@ -150,7 +150,7 @@ cargo xtask style     # language, added-line Rust and isolation gates
 cargo xtask style-fix # apply safe Pyink and Markdown fixes
 cargo xtask fmt       # rustfmt check
 cargo xtask lint      # clippy -D warnings
-cargo xtask test      # all-target and doc tests
+cargo xtask test      # permitted all-target and doc tests
 cargo xtask docs      # rustdoc with broken links rejected
 cargo xtask verify    # matrix, architecture and generated-path gates
 cargo xtask e2e       # curated end-to-end suites (no live venues)
@@ -160,6 +160,11 @@ cargo xtask check     # style, Rust gates, checks and e2e
 cargo xtask ci        # the full gate, including release build
 cargo xtask fixtures  # verify checked-in journal fixtures
 ```
+
+Market-shaped test targets and unit modules are gated by the
+`market-shaped-tests` Cargo feature, which is off by default. No default task
+or CI job enables it; the inventory, counts and withdrawn coverage are recorded
+in `docs/synthetic-test-policy-2026-11-23.md`.
 
 The complete cross-language contract is in [`docs/style-guide.md`](docs/style-guide.md).
 Rust follows the [Linux kernel Rust guidelines](https://docs.kernel.org/rust/coding-guidelines.html)

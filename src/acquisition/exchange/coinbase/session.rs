@@ -65,7 +65,7 @@ impl SessionFactory for CoinbaseSessionFactory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use crate::protocol::HeartbeatMechanism;

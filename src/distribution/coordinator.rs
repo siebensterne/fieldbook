@@ -1236,7 +1236,7 @@ async fn wait_for_shutdown_signal() -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

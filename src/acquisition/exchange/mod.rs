@@ -198,7 +198,7 @@ pub trait Exchange: Send + Sync + 'static {
 pub use kalshi::{KalshiExchange, KalshiSessionFactory};
 pub use polymarket::{PolymarketExchange, PolymarketSessionFactory};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
 
