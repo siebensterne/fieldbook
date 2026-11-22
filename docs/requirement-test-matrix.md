@@ -216,3 +216,11 @@ is explicitly
 | Original frame kind, codec schema and sequence domain survive | `tests/evidence_pipeline.rs::frame_kind_and_source_schema_survive_journal_and_extension` | V1 journal observation contract is unchanged; the extension carries new fields. |
 | D1-D3 acknowledgements match real writer boundaries | `tests/evidence_pipeline.rs::acknowledgement_matches_the_declared_durability_boundary` | D4/D5 remain refused; replication does not exist. |
 | Post-run binding is indexed and bounded | `src/acquisition/evidence.rs::bind_and_verify`, `src/acquisition/evidence.rs::MAX_BINDING_ENTRIES` | Binding is linear in journal and extension counts with a fixed entry ceiling. |
+
+## M3.1.6-D replay identity and dispositions
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Buffered packets keep their own evidence identity | `src/acquisition/stream_slice.rs::reordered_duplicate_and_stale_replay_reconciles_journal_typed_events_and_replay` | Identity is carried by sequence through arbitration, not reconstructed from arrival position. |
+| Replay reproduces arbitration and ordered event identity | `src/acquisition/stream_slice.rs::reordered_duplicate_and_stale_replay_reconciles_journal_typed_events_and_replay`, `src/acquisition/stream_slice.rs::integrated_slice_reconciles_journal_typed_events_and_replay` | Replay no longer accepts a digest multiset with different order. |
+| Every raw record has a processing disposition | `src/acquisition/stream_slice.rs::ProcessingDisposition`, `src/acquisition/stream_slice.rs::SliceDispositionRecord` | Disposition records are part of the slice outcome. |

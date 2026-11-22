@@ -140,7 +140,16 @@ carries that acknowledgement. D4 and D5 remain refused. Post-run binding uses
 an indexed lookup with a fixed entry ceiling instead of nested full scans, and
 extension rewrites stream through a bounded writer.
 
-M3.1.6-D through F remain open work from the independent review.
+M3.1.6-D closes replay findings. Evidence identity now travels with each
+sequence through the arbiter, so buffered drainage no longer reuses the last
+arrival's identity. Each raw record produces an explicit processing
+disposition covering acceptance, buffering, duplicate classes, stale, gap and
+buffer rejection, and decode or normalization rejection. Replay reruns the
+same arbitration from journal records and reconciles ordered event identities
+and digests against canonical records instead of comparing digest multiplicity.
+A reordered duplicate/stale scenario is covered by a reproducer test.
+
+M3.1.6-E and F remain open work from the independent review.
 
 ## Domain reorganisation
 
