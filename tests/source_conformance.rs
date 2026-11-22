@@ -144,6 +144,12 @@ fn declaration() -> ConformanceDeclaration {
         rights_required: vec![UsageRight::InternalProcessing],
         integration: None,
         external: fieldbook::conformance::ExternalEvidence::default(),
+        provider_id: "fixture-provider".to_owned(),
+        product_id: "trades".to_owned(),
+        code_reference: Some("src/acquisition/fixture_connectors.rs".to_owned()),
+        rights_exemption: None,
+        unknown_event_policy: fieldbook::conformance::UnknownEventPolicy::Reject,
+        connector_fixture: None,
     }
 }
 
@@ -221,8 +227,8 @@ fn fixture_declared_source_is_certified() {
     );
     assert_eq!(
         report.checks.len(),
-        7,
-        "seven independent checks must be reported"
+        8,
+        "eight independent checks must be reported"
     );
     assert!(
         report.to_json().is_ok(),

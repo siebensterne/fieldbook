@@ -6,6 +6,8 @@
 //! venue or a rights claim. Each connector declares only the capability it
 //! implements and its manifest validates against the typed port it serves.
 
+use std::collections::BTreeSet;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -93,6 +95,7 @@ pub struct FixtureStreamFrame {
 pub struct FixtureStreamingConnector {
     manifest: SourceCapabilityManifest,
     frames: Vec<FixtureStreamFrame>,
+    subscribed: BTreeSet<String>,
     cursor: usize,
     recovered: usize,
 }
@@ -122,6 +125,7 @@ impl FixtureStreamingConnector {
         Self {
             manifest,
             frames,
+            subscribed: BTreeSet::new(),
             cursor: 0,
             recovered: 0,
         }
@@ -152,14 +156,22 @@ impl StreamingConnector for FixtureStreamingConnector {
 
     async fn subscribe(&mut self, object_ids: &[String]) -> Result<()> {
         anyhow::ensure!(!object_ids.is_empty(), "no objects subscribed");
+        self.subscribed.extend(object_ids.iter().cloned());
         Ok(())
     }
 
     async fn next_record(&mut self) -> Result<Option<AcquiredRecord>> {
-        let Some(frame) = self.frames.get(self.cursor) else {
+        let subscribed = self.subscribed.clone();
+        let found = self.frames[self.cursor..]
+            .iter()
+            .enumerate()
+            .find(|(_, frame)| subscribed.contains(&frame.object_id))
+            .map(|(offset, frame)| (self.cursor + offset, frame.clone()));
+        let Some((index, frame)) = found else {
+            self.cursor = self.frames.len();
             return Ok(None);
         };
-        self.cursor = self.cursor.saturating_add(1);
+        self.cursor = index.saturating_add(1);
         Ok(Some(AcquiredRecord {
             object_id: frame.object_id.clone(),
             raw: frame.payload.clone(),
@@ -224,23 +236,26 @@ impl SourceLifecycle for FixtureSnapshotConnector {
 #[async_trait]
 impl SnapshotConnector for FixtureSnapshotConnector {
     async fn fetch(&mut self, object_id: &str) -> Result<Option<AcquiredRecord>> {
-        let page = self
+        Ok(self
             .pages
-            .first()
-            .ok_or_else(|| anyhow::anyhow!("empty fixture"))?;
-        Ok(page
             .iter()
+            .flat_map(|page| page.iter())
             .find(|record| record.object_id == object_id)
             .cloned())
     }
-}
 
-impl FixtureSnapshotConnector {
-    /// Fetch the next page with an explicit cursor.
-    pub fn next_page(&mut self) -> Option<Vec<AcquiredRecord>> {
-        let page = self.pages.get(self.cursor)?.clone();
-        self.cursor = self.cursor.saturating_add(1);
-        Some(page)
+    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<Vec<AcquiredRecord>> {
+        let index = match cursor {
+            None => self.cursor,
+            Some(value) => value.parse::<usize>()?,
+        };
+        let page = self
+            .pages
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("cursor outside snapshot fixture"))?
+            .clone();
+        self.cursor = index.saturating_add(1);
+        Ok(page)
     }
 }
 
@@ -359,25 +374,48 @@ impl DocumentConnector for FixtureDocumentConnector {
     }
 
     async fn fetch_document(&mut self, object_id: &str) -> Result<Option<DocumentRecord>> {
-        Ok(self
+        let document = self
             .documents
             .iter()
             .find(|document| document.object_id == object_id)
-            .cloned())
+            .cloned();
+        if let Some(document) = &document {
+            let digest = crate::util::sha256_hex(&document.bytes);
+            anyhow::ensure!(
+                digest == document.sha256,
+                "document hash does not match original bytes"
+            );
+        }
+        Ok(document)
     }
+}
+
+/// Evidence that a previously observed block was replaced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReorgEvidence {
+    pub chain_id: String,
+    pub replaced_block: String,
+    pub replacement_block: String,
+    pub observed_at_us: i64,
 }
 
 /// Fixture-backed on-chain source with block continuity and reorg evidence.
 pub struct FixtureOnChainConnector {
     manifest: SourceCapabilityManifest,
     blocks: Vec<AcquiredRecord>,
+    reorgs: Vec<ReorgEvidence>,
     cursor: usize,
 }
 
 impl FixtureOnChainConnector {
     /// Construct an on-chain fixture with explicit chain identity.
     #[must_use]
-    pub fn new(country: CountryCode, source_id: &str, blocks: Vec<AcquiredRecord>) -> Self {
+    pub fn new(
+        country: CountryCode,
+        source_id: &str,
+        blocks: Vec<AcquiredRecord>,
+        reorgs: Vec<ReorgEvidence>,
+    ) -> Self {
         let mut manifest = manifest(source_id, Protocol::BlockchainRpc, Transport::Http, country);
         manifest.modalities = vec![crate::modality::AcquisitionModality::OnChain];
         manifest.on_chain = Some(OnChainCapability {
@@ -388,8 +426,23 @@ impl FixtureOnChainConnector {
         Self {
             manifest,
             blocks,
+            reorgs,
             cursor: 0,
         }
+    }
+
+    /// Return recorded reorganization evidence.
+    #[must_use]
+    pub fn reorgs(&self) -> &[ReorgEvidence] {
+        &self.reorgs
+    }
+
+    /// Whether a block identity was superseded by a reorganization.
+    #[must_use]
+    pub fn is_superseded(&self, block: &str) -> bool {
+        self.reorgs
+            .iter()
+            .any(|reorg| reorg.replaced_block == block)
     }
 }
 
@@ -452,7 +505,7 @@ mod tests {
         let snapshot = FixtureSnapshotConnector::new(country(), "snapshot", Vec::new());
         let batch = FixtureBatchConnector::new(country(), "batch", Vec::new());
         let document = FixtureDocumentConnector::new(country(), "document", Vec::new());
-        let chain = FixtureOnChainConnector::new(country(), "chain", Vec::new());
+        let chain = FixtureOnChainConnector::new(country(), "chain", Vec::new(), Vec::new());
         for manifest in [
             source.manifest(),
             snapshot.manifest(),
@@ -485,7 +538,7 @@ mod tests {
         let mut connector = FixtureStreamingConnector::new(country(), "stream", frames);
         connector.connect().await.expect("connect");
         connector
-            .subscribe(&["a".to_owned()])
+            .subscribe(&["a".to_owned(), "b".to_owned()])
             .await
             .expect("subscribe");
         let first = connector.next_record().await.expect("next").expect("frame");
@@ -503,6 +556,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_fixture_filters_unsubscribed_objects() {
+        let frames = vec![
+            FixtureStreamFrame {
+                object_id: "a".to_owned(),
+                payload: b"a".to_vec(),
+                sequence: 1,
+                source_timestamp_us: 1_000,
+            },
+            FixtureStreamFrame {
+                object_id: "b".to_owned(),
+                payload: b"b".to_vec(),
+                sequence: 2,
+                source_timestamp_us: 2_000,
+            },
+        ];
+        let mut connector = FixtureStreamingConnector::new(country(), "stream", frames);
+        connector
+            .subscribe(&["b".to_owned()])
+            .await
+            .expect("subscribe");
+        let first = connector.next_record().await.expect("next").expect("frame");
+        assert_eq!(
+            first.object_id, "b",
+            "only subscribed objects are delivered"
+        );
+        assert!(
+            connector.next_record().await.expect("end").is_none(),
+            "unsubscribed frames are skipped"
+        );
+    }
+
+    #[tokio::test]
     async fn snapshot_fixture_supports_keyed_lookup_and_pagination() {
         let first = vec![acquired("a", "value-a", 1)];
         let second = vec![acquired("b", "value-b", 2)];
@@ -513,9 +598,14 @@ mod tests {
         );
         let fetched = connector.fetch("a").await.expect("fetch").expect("record");
         assert_eq!(fetched.object_id, "a", "keyed lookup works");
-        assert_eq!(connector.next_page(), Some(first), "first page returned");
-        assert_eq!(connector.next_page(), Some(second), "second page returned");
-        assert!(connector.next_page().is_none(), "pagination terminates");
+        let page1 = connector.fetch_page(None).await.expect("first page");
+        assert_eq!(page1, first, "first page returned by the port");
+        let page2 = connector.fetch_page(Some("1")).await.expect("second page");
+        assert_eq!(page2, second, "second page returned by the port");
+        assert!(
+            connector.fetch_page(Some("2")).await.is_err(),
+            "pagination terminates at the fixture boundary"
+        );
     }
 
     #[tokio::test]
@@ -535,13 +625,13 @@ mod tests {
     async fn document_fixture_keeps_original_bytes_and_versions() {
         let original = DocumentRecord {
             object_id: "filing:v1".to_owned(),
-            sha256: "a".repeat(64),
+            sha256: crate::util::sha256_hex(b"original"),
             published_us: Some(1_000),
             bytes: b"original".to_vec(),
         };
         let revised = DocumentRecord {
             object_id: "filing:v2".to_owned(),
-            sha256: "b".repeat(64),
+            sha256: crate::util::sha256_hex(b"revised"),
             published_us: Some(2_000),
             bytes: b"revised".to_vec(),
         };
@@ -566,7 +656,14 @@ mod tests {
             acquired("chain-1:100", "block-100", 100),
             acquired("chain-1:101", "block-101", 101),
         ];
-        let mut connector = FixtureOnChainConnector::new(country(), "chain", blocks.clone());
+        let reorgs = vec![ReorgEvidence {
+            chain_id: "chain-1".to_owned(),
+            replaced_block: "chain-1:101".to_owned(),
+            replacement_block: "chain-1:101b".to_owned(),
+            observed_at_us: 2_000,
+        }];
+        let mut connector =
+            FixtureOnChainConnector::new(country(), "chain", blocks.clone(), reorgs);
         let first = connector.next_block().await.expect("next").expect("block");
         assert!(
             first.object_id.contains("chain-1"),
@@ -575,5 +672,36 @@ mod tests {
         let queried = connector.query("101").await.expect("query");
         assert_eq!(queried.len(), 1, "query filters by block identity");
         assert_eq!(queried[0].sequence, Some(101), "block continuity retained");
+        assert_eq!(
+            connector.reorgs().len(),
+            1,
+            "reorganization evidence retained"
+        );
+        assert!(
+            connector.is_superseded("chain-1:101"),
+            "superseded blocks are explicit"
+        );
+    }
+
+    #[tokio::test]
+    async fn document_fixture_refuses_a_hash_mismatch() {
+        let mut document = DocumentRecord {
+            object_id: "filing:bad".to_owned(),
+            sha256: "a".repeat(64),
+            published_us: Some(1_000),
+            bytes: b"original".to_vec(),
+        };
+        let mut connector =
+            FixtureDocumentConnector::new(country(), "document", vec![document.clone()]);
+        assert!(
+            connector.fetch_document("filing:bad").await.is_err(),
+            "a false document hash must fail closed"
+        );
+        document.sha256 = crate::util::sha256_hex(&document.bytes);
+        let mut valid = FixtureDocumentConnector::new(country(), "document", vec![document]);
+        assert!(
+            valid.fetch_document("filing:bad").await.is_ok(),
+            "a verified hash is accepted"
+        );
     }
 }

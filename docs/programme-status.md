@@ -149,7 +149,16 @@ same arbitration from journal records and reconciles ordered event identities
 and digests against canonical records instead of comparing digest multiplicity.
 A reordered duplicate/stale scenario is covered by a reproducer test.
 
-M3.1.6-E and F remain open work from the independent review.
+M3.1.6-E closes connector and conformance findings. Streaming fixtures filter
+by subscription; snapshot pagination is part of the actual port; document
+fixtures verify hashes against original bytes; on-chain fixtures carry parent
+continuity and reorganization evidence. The conformance harness invokes an
+actual modality connector, requires an explicit code reference, refuses a
+vacuous rights check, and rejects observation kinds absent from the declaration
+unless a documented policy allows them. Fixture conformance stays separate
+from live certification.
+
+M3.1.6-F remains open work from the independent review.
 
 ## Domain reorganisation
 
