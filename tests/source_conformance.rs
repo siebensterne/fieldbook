@@ -17,8 +17,6 @@
 //! evidence. They verify that a source declaration is tested against actual
 //! connector output and rights evidence before it can be certified.
 
-use std::collections::BTreeMap;
-
 use fieldbook::acquisition::codec::{
     CodecRegistry,      //
     DecodeStatus,       //
@@ -40,10 +38,14 @@ use fieldbook::modality::{
 };
 use fieldbook::reference_data::VenueCategory;
 use fieldbook::rights::{
-    LicensingRecord,   //
-    LicensingRegistry, //
-    RightDecision,     //
-    UsageRight,        //
+    AuthorizationIdentity, //
+    AuthorizationRecord,   //
+    DecisionAudit,         //
+    LicensingRegistry,     //
+    Purpose,               //
+    RecipientClass,        //
+    RightDecision,         //
+    UsageRight,            //
 };
 use fieldbook::taxonomy::{
     AssetClass,   //
@@ -169,15 +171,30 @@ fn codecs(status: DecodeStatus) -> CodecRegistry {
 
 fn licensing() -> LicensingRegistry {
     let mut registry = LicensingRegistry::new();
-    registry.register(LicensingRecord {
-        provider: "fixture-provider".to_owned(),
-        dataset: "trades".to_owned(),
-        territory: CountryCode::new("US").expect("country code"),
-        rights: BTreeMap::from([(UsageRight::InternalProcessing, RightDecision::Permitted)]),
-        valid_until_us: Some(200),
-        audit_required: false,
-        reference: "fixture-contract".to_owned(),
-    });
+    registry
+        .register(AuthorizationRecord {
+            identity: AuthorizationIdentity {
+                provider_id: "fixture-provider".to_owned(),
+                source_id: "fixture-source".to_owned(),
+                dataset_id: "trades".to_owned(),
+                product_id: "trades".to_owned(),
+                territory: CountryCode::new("US").expect("country code"),
+                usage_right: UsageRight::InternalProcessing,
+                recipient_class: RecipientClass::Internal,
+                purpose: Purpose::InternalAnalysis,
+                valid_from: 0,
+                valid_until: Some(200),
+            },
+            decision: RightDecision::Permitted,
+            audit: DecisionAudit {
+                licence_reference: "fixture-contract".to_owned(),
+                licence_document_hash: "fixture-hash".to_owned(),
+                contract_revision: 1,
+                recorded_at_us: 0,
+                authority: "fixture-registry".to_owned(),
+            },
+        })
+        .expect("rights registered");
     registry
 }
 

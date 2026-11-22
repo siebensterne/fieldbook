@@ -49,6 +49,25 @@ unchanged.
 
 The V2 acquisition plane is implemented as additive modules under `src/acquisition/`. Loopback UDP receive, typed codec resolution, dual-channel sequence arbitration, raw packet evidence and bounded connection supervision are tested offline. No live venue, multicast deployment, FIX session, native binary feed, hardware timestamp or latency certification is claimed.
 
+## Integrated acquisition programme
+
+M3.0 (`ac93bbf`, PR #27) established bounded arbitration primitives, a versioned
+packet-evidence envelope, fail-closed codec registration, typed normalization,
+modality ports, independent coverage dimensions, bitemporal information
+payloads and a fixture conformance harness. Those components were contracts
+and primitives with deterministic fixture evidence; no production path claimed
+them as connected.
+
+M3.1.1 strengthens the governance layer. Authorization is scoped to provider,
+source, dataset, product, territory, recipient class, purpose, usage right and
+an effective interval. Conflicting decisions are refused at registration,
+revocation takes effect at its recorded instant, and public access cannot imply
+retention, derived-data use or redistribution. Coverage universes now require
+supported identifiers to be a subset of expected identifiers, require an
+explicit enumerated or unmeasurable declaration, and use a complete structured
+identity key that rejects conflicting records. These are offline properties;
+no source onboarding or live entitlement is asserted.
+
 ## Domain reorganisation
 
 The source tree is organised by the six architectural planes. Modules moved

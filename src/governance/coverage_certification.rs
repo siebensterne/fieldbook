@@ -348,27 +348,69 @@ pub struct UniverseMeasurement {
     pub supported_per_mille: u32,
 }
 
+/// Failure to define a measurable coverage universe.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UniverseError {
+    /// An enumerated universe had no expected objects.
+    #[error("expected universe is empty")]
+    EmptyExpected,
+    /// A supported identifier was absent from the expected set.
+    #[error("supported identifiers outside the expected universe: {0:?}")]
+    UnsupportedOutsideExpected(Vec<String>),
+    /// An unmeasurable declaration had no reason.
+    #[error("unmeasurable universe requires a reason")]
+    MissingReason,
+}
+
 impl ExpectedUniverse {
-    /// Measure an enumerated universe, or return `None` when it is unmeasurable.
-    #[must_use]
-    pub fn measure(&self) -> Option<UniverseMeasurement> {
+    /// Validate the universe contract before it is used for certification.
+    pub fn validate(&self) -> Result<(), UniverseError> {
         match self {
             Self::Enumerated {
                 expected,
                 supported,
             } => {
-                let supported_per_mille = if expected.is_empty() {
-                    0
+                if expected.is_empty() {
+                    return Err(UniverseError::EmptyExpected);
+                }
+                let outside: Vec<String> = supported.difference(expected).cloned().collect();
+                if !outside.is_empty() {
+                    return Err(UniverseError::UnsupportedOutsideExpected(outside));
+                }
+                Ok(())
+            }
+            Self::Unmeasurable { reason } => {
+                if reason.trim().is_empty() {
+                    Err(UniverseError::MissingReason)
                 } else {
-                    (supported.len() * 1_000 / expected.len()).min(1_000) as u32
-                };
-                Some(UniverseMeasurement {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// Measure an enumerated universe, or return `None` when it is unmeasurable.
+    ///
+    /// # Errors
+    /// Returns an error when the declaration is empty, unsupported identifiers
+    /// lie outside the expected set, or an unmeasurable declaration has no
+    /// reason. No denominator is invented for an opaque market.
+    pub fn measure(&self) -> Result<Option<UniverseMeasurement>, UniverseError> {
+        self.validate()?;
+        match self {
+            Self::Enumerated {
+                expected,
+                supported,
+            } => {
+                let supported_per_mille =
+                    (supported.len() * 1_000 / expected.len()).min(1_000) as u32;
+                Ok(Some(UniverseMeasurement {
                     expected: expected.len(),
                     supported: supported.len(),
                     supported_per_mille,
-                })
+                }))
             }
-            Self::Unmeasurable { .. } => None,
+            Self::Unmeasurable { .. } => Ok(None),
         }
     }
 }
@@ -387,6 +429,9 @@ pub struct CoverageRecord {
     /// Expected universe, when a denominator can be defined.
     #[serde(default)]
     pub expected_universe: Option<ExpectedUniverse>,
+    /// Granularity of the claim made by this record.
+    #[serde(default)]
+    pub granularity: CoverageGranularity,
     pub history_start_us: Option<i64>,
     pub history_end_us: Option<i64>,
     pub real_time: bool,
@@ -420,14 +465,40 @@ impl CoverageRecord {
             && self.known_gaps.is_empty()
             && !self.evidence.is_empty()
             && self.history_start_us.is_some()
+            && self
+                .expected_universe
+                .as_ref()
+                .is_some_and(|universe| universe.validate().is_ok())
     }
 
     /// Measured expected universe, absent for opaque markets.
+    ///
+    /// # Errors
+    /// Returns an error when the universe is missing or invalid.
+    pub fn universe_measurement(&self) -> Result<Option<UniverseMeasurement>, UniverseError> {
+        match &self.expected_universe {
+            Some(universe) => universe.measure(),
+            None => Err(UniverseError::EmptyExpected),
+        }
+    }
+
+    /// Build the fully identified rights query for this coverage record.
     #[must_use]
-    pub fn universe_measurement(&self) -> Option<UniverseMeasurement> {
-        self.expected_universe
-            .as_ref()
-            .and_then(ExpectedUniverse::measure)
+    pub fn rights_query(&self, right: UsageRight) -> crate::rights::AuthorizationQuery {
+        crate::rights::AuthorizationQuery {
+            provider_id: self.source_id.clone(),
+            source_id: self.source_id.clone(),
+            dataset_id: self.dataset.clone(),
+            product_id: self
+                .scope
+                .product
+                .clone()
+                .unwrap_or_else(|| self.dataset.clone()),
+            territory: self.scope.country.clone(),
+            usage_right: right,
+            recipient_class: crate::rights::RecipientClass::Internal,
+            purpose: crate::rights::Purpose::InternalAnalysis,
+        }
     }
 }
 
@@ -459,6 +530,83 @@ pub struct CountryDossier {
     pub authorized_providers: Vec<String>,
 }
 
+/// Granularity at which a coverage record makes a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoverageGranularity {
+    #[default]
+    Source,
+    Product,
+    Instrument,
+}
+
+/// Structured coverage identity used as the matrix key.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CoverageIdentity {
+    pub source: String,
+    pub dataset: String,
+    pub country: String,
+    pub venue: String,
+    pub asset_class: String,
+    pub data_category: String,
+    pub depth: String,
+    pub product: String,
+    pub asset: String,
+    pub instrument: String,
+    pub frequency: String,
+    pub history_scope: String,
+    pub rights_scope: String,
+}
+
+impl CoverageIdentity {
+    /// Check that every field required at this granularity is present.
+    pub fn validate(&self, granularity: CoverageGranularity) -> Result<(), &'static str> {
+        if self.source.is_empty() || self.dataset.is_empty() || self.country.is_empty() {
+            return Err("source, dataset and country are required at every granularity");
+        }
+        if granularity >= CoverageGranularity::Product
+            && (self.product.is_empty()
+                || self.venue.is_empty()
+                || self.asset_class.is_empty()
+                || self.data_category.is_empty())
+        {
+            return Err("product, venue, asset class and data category are required");
+        }
+        if granularity >= CoverageGranularity::Instrument
+            && (self.asset.is_empty() || self.instrument.is_empty())
+        {
+            return Err("asset and instrument are required at instrument granularity");
+        }
+        Ok(())
+    }
+}
+
+impl From<&CoverageRecord> for CoverageIdentity {
+    fn from(record: &CoverageRecord) -> Self {
+        Self {
+            source: record.source_id.clone(),
+            dataset: record.dataset.clone(),
+            country: record.scope.country.as_str().to_owned(),
+            venue: record.scope.venue.clone().unwrap_or_default(),
+            asset_class: record.scope.asset_class.as_str().to_owned(),
+            data_category: record.scope.category.as_str().to_owned(),
+            depth: record.scope.depth.as_str().to_owned(),
+            product: record.scope.product.clone().unwrap_or_default(),
+            asset: record.scope.asset.clone().unwrap_or_default(),
+            instrument: record.scope.instrument.clone().unwrap_or_default(),
+            frequency: record.scope.frequency.as_str().to_owned(),
+            history_scope: record.scope.history.clone().unwrap_or_default(),
+            rights_scope: record.scope.rights.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// Two records claimed the same structured coverage identity with different
+/// content. The second record is rejected instead of overwriting the first.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("conflicting coverage record for identity {0:?}")]
+pub struct CoverageConflict(pub Box<CoverageIdentity>);
+
 /// Certification failure for one coverage record.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CertificationError {
@@ -477,6 +625,9 @@ pub enum CertificationError {
         source_id: String,
         requirement: &'static str,
     },
+    /// The declared universe is invalid.
+    #[error("coverage universe is invalid for {source_id}: {reason}")]
+    InvalidUniverse { source_id: String, reason: String },
 }
 
 /// Promote a record only when every applicable prerequisite is present.
@@ -503,13 +654,27 @@ pub fn certify(
             requirement: "known_gaps",
         });
     }
+    let universe = record.expected_universe.as_ref().ok_or_else(|| {
+        CertificationError::MissingPrerequisite {
+            source_id: record.source_id.clone(),
+            requirement: "expected_universe",
+        }
+    })?;
+    universe
+        .measure()
+        .map_err(|error| CertificationError::InvalidUniverse {
+            source_id: record.source_id.clone(),
+            reason: error.to_string(),
+        })?;
+    let identity = CoverageIdentity::from(record);
+    identity.validate(record.granularity).map_err(|reason| {
+        CertificationError::InvalidUniverse {
+            source_id: record.source_id.clone(),
+            reason: reason.to_owned(),
+        }
+    })?;
     rights
-        .authorize(
-            &record.dataset,
-            &record.scope.country,
-            UsageRight::InternalProcessing,
-            at_us,
-        )
+        .authorize(&record.rights_query(UsageRight::InternalProcessing), at_us)
         .map_err(|_| CertificationError::MissingPrerequisite {
             source_id: record.source_id.clone(),
             requirement: "licensing",
@@ -526,10 +691,10 @@ pub fn certify(
     Ok(promoted)
 }
 
-/// Aggregate matrix of coverage records by source.
+/// Aggregate matrix of coverage records keyed by complete structured identity.
 #[derive(Debug, Default)]
 pub struct CoverageMatrix {
-    records: BTreeMap<String, CoverageRecord>,
+    records: BTreeMap<CoverageIdentity, CoverageRecord>,
 }
 
 impl CoverageMatrix {
@@ -538,10 +703,21 @@ impl CoverageMatrix {
         Self::default()
     }
 
-    /// Insert a coverage record under its source and dataset key.
-    pub fn insert(&mut self, record: CoverageRecord) {
-        let key = format!("{}:{}", record.source_id, record.dataset);
+    /// Insert a coverage record, rejecting a conflicting identity.
+    ///
+    /// # Errors
+    /// Returns a conflict when the same structured identity already holds a
+    /// different record. Identical re-insertion is idempotent.
+    pub fn insert(&mut self, record: CoverageRecord) -> Result<(), CoverageConflict> {
+        let key = CoverageIdentity::from(&record);
+        if let Some(existing) = self.records.get(&key) {
+            if existing != &record {
+                return Err(CoverageConflict(Box::new(key)));
+            }
+            return Ok(());
+        }
         self.records.insert(key, record);
+        Ok(())
     }
 
     /// Return the number of records at or above a status threshold.
@@ -574,9 +750,19 @@ mod tests {
     use super::*;
     use crate::{
         quality::Reconciliation,
-        rights::{LicensingRecord, RightDecision},
+        rights::{
+            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, Purpose, RecipientClass,
+            RightDecision,
+        },
     };
     use std::collections::BTreeMap;
+
+    fn universe() -> ExpectedUniverse {
+        ExpectedUniverse::Enumerated {
+            expected: BTreeSet::from(["A".to_owned(), "B".to_owned()]),
+            supported: BTreeSet::from(["A".to_owned(), "B".to_owned()]),
+        }
+    }
 
     fn scope() -> CoverageScope {
         CoverageScope {
@@ -615,7 +801,8 @@ mod tests {
             scope: scope(),
             status: CoverageStatus::TechnicallyValidated,
             dimensions: dimensions(),
-            expected_universe: None,
+            expected_universe: Some(universe()),
+            granularity: CoverageGranularity::Source,
             history_start_us: Some(0),
             history_end_us: Some(100),
             real_time: true,
@@ -625,18 +812,31 @@ mod tests {
     }
 
     fn rights() -> LicensingRegistry {
-        let mut decision = BTreeMap::new();
-        decision.insert(UsageRight::InternalProcessing, RightDecision::Permitted);
         let mut registry = LicensingRegistry::new();
-        registry.register(LicensingRecord {
-            provider: "example".to_owned(),
-            dataset: "quotes".to_owned(),
-            territory: CountryCode::new("US").expect("country code"),
-            rights: decision,
-            valid_until_us: Some(200),
-            audit_required: false,
-            reference: "contract".to_owned(),
-        });
+        registry
+            .register(AuthorizationRecord {
+                identity: AuthorizationIdentity {
+                    provider_id: "source".to_owned(),
+                    source_id: "source".to_owned(),
+                    dataset_id: "quotes".to_owned(),
+                    product_id: "quotes".to_owned(),
+                    territory: CountryCode::new("US").expect("country code"),
+                    usage_right: UsageRight::InternalProcessing,
+                    recipient_class: RecipientClass::Internal,
+                    purpose: Purpose::InternalAnalysis,
+                    valid_from: 0,
+                    valid_until: Some(200),
+                },
+                decision: RightDecision::Permitted,
+                audit: DecisionAudit {
+                    licence_reference: "contract".to_owned(),
+                    licence_document_hash: "contract-hash".to_owned(),
+                    contract_revision: 1,
+                    recorded_at_us: 0,
+                    authority: "contract-registry".to_owned(),
+                },
+            })
+            .expect("rights registered");
         registry
     }
 
@@ -681,7 +881,7 @@ mod tests {
     #[test]
     fn matrix_counts_only_declared_status() {
         let mut matrix = CoverageMatrix::new();
-        matrix.insert(record());
+        matrix.insert(record()).expect("record inserted");
         assert_eq!(
             matrix.count_at_least(CoverageStatus::Certified),
             0,
@@ -745,7 +945,9 @@ mod tests {
             reason: "opaque OTC market".to_owned(),
         });
         assert_eq!(
-            source.universe_measurement(),
+            source
+                .universe_measurement()
+                .expect("valid unmeasurable declaration"),
             None,
             "no denominator may be invented"
         );
@@ -767,9 +969,127 @@ mod tests {
         });
         let measurement = source
             .universe_measurement()
+            .expect("valid enumerated universe")
             .expect("enumerated measurement");
         assert_eq!(measurement.expected, 4, "expected universe size retained");
         assert_eq!(measurement.supported, 2, "supported universe size retained");
         assert_eq!(measurement.supported_per_mille, 500, "coverage measured");
+    }
+
+    #[test]
+    fn supported_outside_expected_cannot_measure_coverage() {
+        let universe = ExpectedUniverse::Enumerated {
+            expected: BTreeSet::from(["A".to_owned(), "B".to_owned()]),
+            supported: BTreeSet::from(["C".to_owned(), "D".to_owned()]),
+        };
+        assert!(
+            matches!(
+                universe.validate(),
+                Err(UniverseError::UnsupportedOutsideExpected(_))
+            ),
+            "supported objects outside expected must be rejected"
+        );
+        let mut source = record();
+        source.expected_universe = Some(universe);
+        assert!(
+            !source.certifiable(),
+            "invalid universe blocks certification"
+        );
+        assert!(
+            certify(&source, &rights(), &quality(), 50).is_err(),
+            "unsupported identifiers must block certification"
+        );
+    }
+
+    #[test]
+    fn empty_expected_universe_is_invalid() {
+        let universe = ExpectedUniverse::Enumerated {
+            expected: BTreeSet::new(),
+            supported: BTreeSet::new(),
+        };
+        assert_eq!(
+            universe.validate(),
+            Err(UniverseError::EmptyExpected),
+            "an empty expected set has no denominator"
+        );
+        let mut source = record();
+        source.expected_universe = Some(universe);
+        assert!(
+            certify(&source, &rights(), &quality(), 50).is_err(),
+            "no denominator may be certified"
+        );
+    }
+
+    #[test]
+    fn missing_universe_declaration_blocks_certification() {
+        let mut source = record();
+        source.expected_universe = None;
+        assert!(!source.certifiable(), "undisclosed universe cannot certify");
+        assert!(
+            matches!(
+                certify(&source, &rights(), &quality(), 50),
+                Err(CertificationError::MissingPrerequisite {
+                    requirement: "expected_universe",
+                    ..
+                })
+            ),
+            "certification must name the missing universe"
+        );
+    }
+
+    #[test]
+    fn unmeasurable_universe_requires_a_reason() {
+        let universe = ExpectedUniverse::Unmeasurable {
+            reason: String::new(),
+        };
+        assert_eq!(
+            universe.validate(),
+            Err(UniverseError::MissingReason),
+            "unmeasurable declarations must state why"
+        );
+    }
+
+    #[test]
+    fn duplicate_coverage_scope_conflicts() {
+        let mut matrix = CoverageMatrix::new();
+        matrix.insert(record()).expect("first record inserted");
+        let mut different = record();
+        different.real_time = false;
+        assert!(
+            matches!(matrix.insert(different), Err(CoverageConflict(_))),
+            "a conflicting scope must not overwrite the first record"
+        );
+        assert_eq!(
+            matrix.certified().len(),
+            1,
+            "the first record remains authoritative"
+        );
+    }
+
+    #[test]
+    fn identical_coverage_scope_is_idempotent() {
+        let mut matrix = CoverageMatrix::new();
+        matrix.insert(record()).expect("first record inserted");
+        matrix
+            .insert(record())
+            .expect("identical re-insertion is safe");
+        assert_eq!(
+            matrix.by_certification(CertificationState::Certified).len(),
+            1,
+            "one record per identity"
+        );
+    }
+
+    #[test]
+    fn product_granularity_requires_a_complete_identity() {
+        let mut source = record();
+        source.granularity = CoverageGranularity::Product;
+        source.scope.product = None;
+        assert!(
+            CoverageIdentity::from(&source)
+                .validate(source.granularity)
+                .is_err(),
+            "product granularity needs a product identity"
+        );
     }
 }
