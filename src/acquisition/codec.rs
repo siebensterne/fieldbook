@@ -99,12 +99,12 @@ impl DecodedObservation {
     }
 }
 
-/// Original bytes retained independently of the typed domain record.
+/// Reference to one raw record retained once in the evidence store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RawEvidence {
-    /// Exact original payload bytes.
-    pub bytes: Vec<u8>,
-    /// SHA-256 of `bytes`, for independent verification.
+pub struct RawRecordRef {
+    /// Stable identifier of the single stored raw record.
+    pub record_id: String,
+    /// SHA-256 of the original payload, for independent verification.
     pub sha256: String,
 }
 
@@ -133,8 +133,8 @@ pub struct NormalizedEvent {
     pub kind: String,
     /// Typed domain payload, absent for rejected or unsupported observations.
     pub payload: Option<TypedPayload>,
-    /// Original payload bytes and their digest.
-    pub raw: RawEvidence,
+    /// Reference to the single stored raw record, never a byte copy.
+    pub raw: RawRecordRef,
     /// Decode outcome attached to the event.
     pub status: DecodeStatus,
     /// Reason text for a status other than [`DecodeStatus::Decoded`].
@@ -316,21 +316,25 @@ fn typed_payload(observation: &DecodedObservation) -> Result<TypedPayload, Norma
 }
 
 impl DecodedObservation {
-    /// Convert one decoded observation into a typed domain record, retaining
-    /// the original payload bytes as independent evidence.
+    /// Convert one decoded observation into a typed domain record carrying a
+    /// reference to the single raw record in the evidence store.
     ///
     /// # Errors
     /// Returns an error when the kind has no normalizer or the JSON body does
     /// not carry the required typed fields. Unknown kinds fail closed.
-    pub fn try_normalize(&self, raw: &[u8]) -> Result<NormalizedEvent, NormalizationError> {
+    pub fn try_normalize(
+        &self,
+        raw: &[u8],
+        record_id: &str,
+    ) -> Result<NormalizedEvent, NormalizationError> {
         Ok(NormalizedEvent {
             packet_id: self.packet_id.clone(),
             source: self.source.clone(),
             schema_version: self.schema_version,
             kind: self.kind.clone(),
             payload: Some(typed_payload(self)?),
-            raw: RawEvidence {
-                bytes: raw.to_vec(),
+            raw: RawRecordRef {
+                record_id: record_id.to_owned(),
                 sha256: sha256_hex(raw),
             },
             status: self.status,
@@ -499,8 +503,8 @@ impl CodecRegistry {
                 schema_version: observation.schema_version,
                 kind: observation.kind,
                 payload,
-                raw: RawEvidence {
-                    bytes: raw_payload.to_vec(),
+                raw: RawRecordRef {
+                    record_id: packet_id.to_owned(),
                     sha256: sha256_hex(raw_payload),
                 },
                 status: observation.status,
@@ -752,7 +756,10 @@ mod tests {
             .expect("typed decode succeeds");
         assert_eq!(events.len(), 1, "one normalized event");
         let event = &events[0];
-        assert_eq!(event.raw.bytes, payload, "original bytes retained");
+        assert_eq!(
+            event.raw.record_id, "packet-7",
+            "raw record referenced once"
+        );
         assert_eq!(event.raw.sha256, sha256_hex(&payload), "digest retained");
         let typed = event.payload.as_ref().expect("typed payload present");
         assert_eq!(typed.payload_type, "trade", "payload type is stable");
@@ -779,7 +786,7 @@ mod tests {
             reason: None,
         };
         assert!(
-            observation.try_normalize(b"raw").is_err(),
+            observation.try_normalize(b"raw", "packet-1").is_err(),
             "unknown kind must not be downgraded"
         );
     }
@@ -805,6 +812,10 @@ mod tests {
             events[0].payload.is_none(),
             "no typed payload for rejection"
         );
-        assert_eq!(events[0].raw.bytes, b"raw-bytes", "raw bytes preserved");
+        assert_eq!(
+            events[0].raw.sha256,
+            sha256_hex(b"raw-bytes"),
+            "raw digest preserved"
+        );
     }
 }

@@ -276,9 +276,10 @@ pub fn run_conformance(
                 } else {
                     event.payload.is_none()
                 }
-            }) && events
-                .iter()
-                .all(|event| event.raw.bytes == fixture.raw_payload && !event.raw.sha256.is_empty())
+            }) && events.iter().all(|event| {
+                event.raw.sha256 == crate::util::sha256_hex(&fixture.raw_payload)
+                    && !event.raw.record_id.is_empty()
+            })
         }
         Err(_) => false,
     };

@@ -177,3 +177,11 @@ is explicitly
 | Byte budgets and entry bounds are enforced | `src/acquisition/arbiter.rs::byte_budgets_are_enforced`, `src/acquisition/arbiter.rs::buffered_byte_budget_is_enforced`, `src/acquisition/arbiter.rs::deterministic_reordered_stream_keeps_bounds_and_accounting` | Memory figures count retained payloads and a fixed map estimate, process RSS. |
 | Conflicting duplicates, exhaustion and faults are explicit | `src/acquisition/arbiter.rs::identical_and_conflicting_duplicates_are_distinct`, `src/acquisition/arbiter.rs::sequence_exhaustion_is_explicit`, `src/acquisition/arbiter.rs::injected_fault_produces_explicit_verdict` | Raw packets are retained before any arbitration decision. |
 | Arbiter state survives restart | `src/acquisition/arbiter.rs::snapshot_restores_arbiter_state` | Serialized state is verified on restore; no live restart claim. |
+
+## Integrated acquisition paths
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Five modalities have functional fixture implementations | `src/acquisition/fixture_connectors.rs::every_fixture_manifest_declares_one_realizable_modality`, `src/acquisition/fixture_connectors.rs::streaming_fixture_delivers_ordered_frames_and_recovers`, `src/acquisition/fixture_connectors.rs::snapshot_fixture_supports_keyed_lookup_and_pagination`, `src/acquisition/fixture_connectors.rs::batch_fixture_resumes_from_cursor`, `src/acquisition/fixture_connectors.rs::document_fixture_keeps_original_bytes_and_versions`, `src/acquisition/fixture_connectors.rs::onchain_fixture_keeps_block_continuity_and_reorg_evidence` | Deterministic fixtures only; no venue connection. |
+| A streaming slice reaches replay verification | `src/acquisition/stream_slice.rs::integrated_slice_reconciles_journal_typed_events_and_replay` | One source codec path; fixture evidence only. |
+| Typed events reference one stored raw record | `src/acquisition/codec.rs::typed_normalization_keeps_raw_evidence`, `src/acquisition/codec.rs::rejected_observations_keep_raw_evidence_without_typed_payload` | Raw bytes live in the evidence store, not in each typed event. |

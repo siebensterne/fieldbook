@@ -90,6 +90,19 @@ reordering tests and injected faults exercise the budget and recovery paths.
 Memory figures describe retained payloads and a fixed bookkeeping estimate,
 not allocator occupancy or process RSS.
 
+M3.1.4 connects the M3.0 primitives into one streaming slice. Five modality
+ports have functional deterministic fixture implementations that declare only
+their real capabilities. The slice journals each packet through the evidence
+pipeline, orders it with the sequence arbiter, decodes through the codec
+registry, produces typed records with a single raw-record reference, records
+quality transitions, persists canonical records and replays the journal to
+reconcile typed digests. `decode_normalized()` no longer copies raw bytes into
+every event. A `std`-only benchmark compares the JSON interchange path with
+typed normalization. On this Apple Silicon development host at 50,000
+iterations of one fixed trade payload, the interchange path measured 171 ns per
+operation and typed normalization measured 1,263 ns per operation. These are
+measurements of one workload, not latency targets or production results.
+
 ## Domain reorganisation
 
 The source tree is organised by the six architectural planes. Modules moved
