@@ -2145,10 +2145,8 @@ mod tests {
         );
         let mut wide_window = scope();
         wide_window.data_time_window.to_us = Some(10_000);
-        assert!(
-            registry.authorize(&wide_window, 1).is_err(),
-            "assertion context at line 2141"
-        );
+        let denied = registry.authorize(&wide_window, 1).is_err();
+        assert!(denied, "wide window denied");
     }
 
     #[test]
@@ -2183,10 +2181,8 @@ mod tests {
         let expired_path = write_rights(directory.path(), vec![expired]);
         let expired_context =
             RightsContext::load(&expired_path, &audit).expect("expired file loads");
-        assert!(
-            expired_context.authorize(&scope(), 2).is_err(),
-            "assertion context at line 2179"
-        );
+        let denied = expired_context.authorize(&scope(), 2).is_err();
+        assert!(denied, "expired context denied");
         let mut unknown = permitted_record(&scope());
         unknown.decision = RightDecision::ContractRequired;
         let unknown_path = write_rights(directory.path(), vec![unknown]);
@@ -2247,12 +2243,10 @@ mod tests {
                 broken,
             )
             .expect("proof installed");
-        assert!(
-            broken_gate
-                .require_egress("venue-a", Operation::RealTimeCapture, 1)
-                .is_err(),
-            "assertion context at line 2243"
-        );
+        let denied = broken_gate
+            .require_egress("venue-a", Operation::RealTimeCapture, 1)
+            .is_err();
+        assert!(denied, "audit write failure denies egress");
         assert!(
             gate.require_egress("venue-a", Operation::RealTimeCapture, 1)
                 .is_ok(),
@@ -2539,10 +2533,7 @@ mod tests {
             scope().usage_mode,
             "assertion context at line 2476"
         );
-        assert_eq!(
-            display.usage_right,
-            scope().usage_right,
-            "assertion context at line 2477"
-        );
+        let expected_right = scope().usage_right;
+        assert_eq!(display.usage_right, expected_right, "usage right unchanged");
     }
 }
