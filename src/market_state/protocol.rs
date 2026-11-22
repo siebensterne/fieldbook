@@ -8,10 +8,11 @@
 use serde::{Deserialize, Serialize};
 
 /// WebSocket data-frame kind preserved in the journal record header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameKind {
     Text,
+    #[default]
     Binary,
 }
 

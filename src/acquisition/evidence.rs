@@ -8,9 +8,10 @@
 //! mismatch, an absent extension or an ambiguous position fails closed.
 
 use std::{
+    collections::BTreeMap,
     fmt,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::Duration,
@@ -23,8 +24,8 @@ use crate::{
     acquisition::codec::CodecRegistry,
     acquisition::packet::PacketEvidence,
     integrity::journal::{
-        DataRecord, DecodeOutcome, JournalHandle, JournalPosition, JournalStreamConfig,
-        JournalVisitor, RawFrame, visit_observations_with_config,
+        DataRecord, DecodeOutcome, JournalAckLevel, JournalHandle, JournalPosition,
+        JournalStreamConfig, JournalVisitor, RawFrame, visit_observations_with_config,
     },
     protocol::{HeartbeatMechanism, SessionSignal},
     util::sha256_hex,
@@ -32,6 +33,9 @@ use crate::{
 
 /// Schema version of the evidence extension contract.
 pub const EVIDENCE_EXTENSION_SCHEMA_VERSION: u32 = 1;
+
+/// Upper bound on post-run binding work for one evidence store.
+pub const MAX_BINDING_ENTRIES: usize = 1_000_000;
 
 /// Stage at which an ingest may be interrupted in tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,13 +180,31 @@ pub struct EvidenceExtension {
     pub sequence: Option<u64>,
     pub channel: String,
     pub protocol: String,
+    pub source_protocol: String,
+    pub frame_kind: String,
+    pub source_schema_id: String,
+    pub source_schema_version: u32,
+    pub sequence_domain_id: String,
+    pub receive_sequence: u64,
     pub capture_location: String,
     pub decoder_version: String,
     pub received_at_us: i64,
     pub payload_sha256: String,
+    /// Acknowledgement returned by the journal writer for this record.
+    #[serde(default)]
+    pub journal_ack: Option<crate::integrity::journal::JournalAck>,
     /// Bound after the journal run is closed.
     #[serde(default)]
     pub position: Option<JournalPosition>,
+}
+
+/// Source decoding context that must travel with durable evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceContext {
+    pub sequence_domain_id: String,
+    pub source_schema_id: String,
+    pub source_schema_version: u32,
+    pub receive_sequence: u64,
 }
 
 impl EvidenceExtension {
@@ -199,12 +221,29 @@ impl EvidenceExtension {
             sequence: evidence.sequence,
             channel: evidence.channel.as_str().to_owned(),
             protocol: evidence.protocol.clone(),
+            source_protocol: evidence.protocol.clone(),
+            frame_kind: format!("{:?}", evidence.frame_kind).to_ascii_lowercase(),
+            source_schema_id: String::new(),
+            source_schema_version: 0,
+            sequence_domain_id: String::new(),
+            receive_sequence: 0,
             capture_location: evidence.capture_location.clone(),
             decoder_version: evidence.decoder_version.clone(),
             received_at_us: evidence.received_at_us,
             payload_sha256: evidence.payload_sha256(),
+            journal_ack: None,
             position: None,
         }
+    }
+
+    /// Attach source decoding context before persistence.
+    #[must_use]
+    pub fn with_context(mut self, context: &EvidenceContext) -> Self {
+        self.source_schema_id = context.source_schema_id.clone();
+        self.source_schema_version = context.source_schema_version;
+        self.sequence_domain_id = context.sequence_domain_id.clone();
+        self.receive_sequence = context.receive_sequence;
+        self
     }
 
     /// Derive a stable identity from immutable receive inputs.
@@ -296,16 +335,19 @@ impl EvidenceStore {
 
     /// Rewrite the store with bound extensions.
     pub fn write_all(&self, extensions: &[EvidenceExtension]) -> anyhow::Result<()> {
-        let mut body = String::new();
-        for extension in extensions {
-            extension.validate()?;
-            let line = serde_json::to_string(extension)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            body.push_str(&line);
-            body.push('\n');
-        }
         let temporary = self.path.with_extension("tmp");
-        std::fs::write(&temporary, body)?;
+        {
+            let file = File::create(&temporary)?;
+            let mut writer = BufWriter::new(file);
+            for extension in extensions {
+                extension.validate()?;
+                let line = serde_json::to_string(extension)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                writeln!(writer, "{line}")?;
+            }
+            writer.flush()?;
+            writer.get_ref().sync_all()?;
+        }
         std::fs::rename(&temporary, &self.path)?;
         Ok(())
     }
@@ -375,24 +417,36 @@ pub fn bind_and_verify(
     let mut collector = PositionCollector { refs: Vec::new() };
     visit_observations_with_bounded_records(journal_directory, &mut collector)?;
     let mut extensions = store.load()?;
+    anyhow::ensure!(
+        collector.refs.len() <= MAX_BINDING_ENTRIES && extensions.len() <= MAX_BINDING_ENTRIES,
+        "binding workload exceeds the configured entry bound"
+    );
     let mut used = vec![false; collector.refs.len()];
     let mut conflicts = Vec::new();
     let mut unbound = Vec::new();
+    let mut index: BTreeMap<(u16, u16, u64, i64, String), Vec<usize>> = BTreeMap::new();
+    for (position, reference) in collector.refs.iter().enumerate() {
+        index
+            .entry((
+                reference.source_shard,
+                reference.source_replica,
+                reference.connection_epoch,
+                reference.received_at_us,
+                reference.payload_sha256.clone(),
+            ))
+            .or_default()
+            .push(position);
+    }
 
     for extension in &mut extensions {
-        let matches: Vec<usize> = collector
-            .refs
-            .iter()
-            .enumerate()
-            .filter(|(_, reference)| {
-                reference.source_shard == extension.source_shard
-                    && reference.source_replica == extension.source_replica
-                    && reference.connection_epoch == extension.connection_epoch
-                    && reference.received_at_us == extension.received_at_us
-                    && reference.payload_sha256 == extension.payload_sha256
-            })
-            .map(|(index, _)| index)
-            .collect();
+        let key = (
+            extension.source_shard,
+            extension.source_replica,
+            extension.connection_epoch,
+            extension.received_at_us,
+            extension.payload_sha256.clone(),
+        );
+        let matches = index.get(&key).map_or(&[][..], Vec::as_slice);
         match matches.len() {
             0 => unbound.push(extension.evidence_id.clone()),
             1 => {
@@ -608,9 +662,10 @@ impl EvidencePipeline {
         &self,
         evidence: &PacketEvidence,
         source: crate::model::SourceId,
-        schema_version: u32,
+        context: &EvidenceContext,
     ) -> EvidenceReceipt {
-        let extension = EvidenceExtension::from_packet(evidence, source);
+        let mut extension = EvidenceExtension::from_packet(evidence, source).with_context(context);
+        extension.receive_sequence = context.receive_sequence;
         let evidence_id = extension.evidence_id.clone();
         if self.injected_failure == Some(FailurePoint::Receive) {
             return Self::rejected(
@@ -632,18 +687,34 @@ impl EvidencePipeline {
             connection_epoch: evidence.connection_epoch,
             receive_seq,
             received_at_us: evidence.received_at_us,
-            frame: RawFrame::binary(evidence.payload.clone()),
+            frame: RawFrame {
+                kind: evidence.frame_kind,
+                payload: evidence.payload.clone(),
+            },
             outcome: DecodeOutcome::ignored("raw_evidence_before_arbitration"),
             signal: SessionSignal::MarketData,
             mechanism: HeartbeatMechanism::Disabled,
         };
-        if let Err(error) = self.journal.record(record) {
-            return Self::rejected(
-                evidence_id,
-                FailurePoint::JournalSubmit,
-                &format!("journal submission failed: {error}"),
-            );
-        }
+        let ack_level = match self.profile {
+            DurabilityProfile::D1 => JournalAckLevel::Written,
+            DurabilityProfile::D2 => JournalAckLevel::Flushed,
+            DurabilityProfile::D3 => JournalAckLevel::Synced,
+            DurabilityProfile::D4 | DurabilityProfile::D5 => JournalAckLevel::Synced,
+        };
+        let ack = match self
+            .journal
+            .record_ack(record, ack_level, Duration::from_secs(5))
+        {
+            Ok(ack) => ack,
+            Err(error) => {
+                return Self::rejected(
+                    evidence_id,
+                    FailurePoint::JournalPersist,
+                    &format!("journal acknowledgement failed: {error}"),
+                );
+            }
+        };
+        extension.journal_ack = Some(ack.clone());
         if self.injected_failure == Some(FailurePoint::JournalPersist) {
             return EvidenceReceipt {
                 evidence_id,
@@ -691,7 +762,7 @@ impl EvidencePipeline {
             && let Err(error) = stages.run(
                 &evidence_id,
                 &evidence.source,
-                schema_version,
+                context.source_schema_version,
                 &evidence.payload,
             )
         {
@@ -704,10 +775,16 @@ impl EvidencePipeline {
                 ack: DurabilityAck::Journalled,
             };
         }
+        let achieved = match ack.level {
+            JournalAckLevel::Queued => DurabilityAck::Journalled,
+            JournalAckLevel::Written => DurabilityAck::Written,
+            JournalAckLevel::Flushed => DurabilityAck::Flushed,
+            JournalAckLevel::Synced => DurabilityAck::Synced,
+        };
         EvidenceReceipt {
             evidence_id,
             disposition: EvidenceDisposition::EvidencePersisted,
-            ack: self.profile.required_ack(),
+            ack: achieved,
         }
     }
 }
@@ -883,7 +960,13 @@ mod tests {
         let pipeline = EvidencePipeline::new(journal, store.clone(), DurabilityProfile::D1)
             .expect("pipeline created");
         let packet = evidence(7, b"bound-payload");
-        let receipt = pipeline.ingest(&packet, SourceId::new(3, 1), 1);
+        let context = EvidenceContext {
+            sequence_domain_id: "fixture-feed".to_owned(),
+            source_schema_id: "fixture-schema".to_owned(),
+            source_schema_version: 1,
+            receive_sequence: 1,
+        };
+        let receipt = pipeline.ingest(&packet, SourceId::new(3, 1), &context);
         assert_eq!(
             receipt.disposition,
             EvidenceDisposition::EvidencePersisted,
