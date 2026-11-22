@@ -192,3 +192,11 @@ is explicitly
 |---|---|---|
 | Code, fixture, integration, rights and external stages stay separate | `src/integrity/conformance.rs::connect_success_is_not_a_certification_signal`, `src/integrity/conformance.rs::integration_stage_uses_a_real_end_to_end_fixture`, `src/integrity/conformance.rs::external_evidence_is_declared_not_passing` | External references are declarations, not passes. |
 | A fixture run cannot certify a live source | `tests/source_conformance.rs::fixture_declared_source_is_certified`, `src/integrity/conformance.rs::mismatched_fixture_fails_closed` | Full certification requires independently validated network, live and history evidence. |
+
+## M3.1.6-A rights and certification closure
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Authorization keys use the complete identity and effective intervals | `src/governance/rights.rs::revision_keys_include_full_identity`, `src/governance/rights.rs::non_overlapping_decisions_coexist`, `src/governance/rights.rs::reinstatement_supersedes_revocation` | Audit evidence shape is validated; external document contents are not fetched. |
+| Certification has one oracle shared by every query | `src/governance/coverage_certification.rs::single_evaluation_oracle_agrees_across_all_queries`, `src/governance/coverage_certification.rs::evidence_history_and_operations_prerequisites_cannot_be_bypassed` | Only `certify` produces an evaluation; legacy ordinal status cannot override it. |
+| Provider and source identities remain distinct | `src/governance/coverage_certification.rs::provider_identity_is_distinct_from_source_identity` | Source registry resolution is the caller's responsibility. |

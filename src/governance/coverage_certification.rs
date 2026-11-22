@@ -418,6 +418,9 @@ impl ExpectedUniverse {
 /// Public, independently measurable coverage record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoverageRecord {
+    /// Provider identity, distinct from the source identity when applicable.
+    #[serde(default)]
+    pub provider_id: String,
     pub source_id: String,
     pub dataset: String,
     pub scope: CoverageScope,
@@ -437,38 +440,36 @@ pub struct CoverageRecord {
     pub real_time: bool,
     pub known_gaps: Vec<String>,
     pub evidence: Vec<String>,
+    /// Result of the single certification evaluation, set only by `certify`.
+    #[serde(default)]
+    pub last_evaluation: Option<CertificationEvaluation>,
 }
 
 impl CoverageRecord {
-    /// Compute certification from applicable requirements.
+    /// Return the certification state from the single evaluation oracle.
     #[must_use]
     pub fn certification(&self) -> CertificationState {
-        if self.dimensions.certification == CertificationState::Revoked {
-            return CertificationState::Revoked;
-        }
-        let operations_satisfied = !self.real_time
-            || matches!(
-                self.dimensions.operations,
-                OperationsState::Live | OperationsState::Degraded
-            );
-        if self.dimensions.requirements_met() && operations_satisfied {
-            CertificationState::Certified
-        } else {
-            CertificationState::NotCertified
-        }
+        self.last_evaluation
+            .as_ref()
+            .map_or(CertificationState::NotCertified, |evaluation| {
+                evaluation.certification_state
+            })
     }
 
-    /// Whether this record meets the structural requirements for certification.
+    /// Whether the stored evaluation satisfies every applicable requirement.
     #[must_use]
     pub fn certifiable(&self) -> bool {
-        self.certification() == CertificationState::Certified
-            && self.known_gaps.is_empty()
-            && !self.evidence.is_empty()
-            && self.history_start_us.is_some()
-            && self
-                .expected_universe
-                .as_ref()
-                .is_some_and(|universe| universe.validate().is_ok())
+        self.last_evaluation
+            .as_ref()
+            .is_some_and(CertificationEvaluation::certified)
+    }
+
+    /// Requirements that blocked the last evaluation.
+    #[must_use]
+    pub fn failed_requirements(&self) -> &[String] {
+        self.last_evaluation
+            .as_ref()
+            .map_or(&[], |evaluation| evaluation.failed_requirements.as_slice())
     }
 
     /// Measured expected universe, absent for opaque markets.
@@ -486,7 +487,7 @@ impl CoverageRecord {
     #[must_use]
     pub fn rights_query(&self, right: UsageRight) -> crate::rights::AuthorizationQuery {
         crate::rights::AuthorizationQuery {
-            provider_id: self.source_id.clone(),
+            provider_id: self.provider_id.clone(),
             source_id: self.source_id.clone(),
             dataset_id: self.dataset.clone(),
             product_id: self
@@ -628,6 +629,129 @@ pub enum CertificationError {
     /// The declared universe is invalid.
     #[error("coverage universe is invalid for {source_id}: {reason}")]
     InvalidUniverse { source_id: String, reason: String },
+    /// One or more requirements failed the single evaluation oracle.
+    #[error("coverage certification failed for {source_id}: {requirements:?}")]
+    FailedRequirements {
+        source_id: String,
+        requirements: Vec<String>,
+    },
+}
+
+/// Version of the single coverage certification policy.
+pub const CERTIFICATION_POLICY_VERSION: u32 = 2;
+
+/// Complete result of one coverage certification evaluation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertificationEvaluation {
+    pub certification_state: CertificationState,
+    pub failed_requirements: Vec<String>,
+    pub evidence_references: Vec<String>,
+    pub rights_proof: Option<crate::rights::AuthorizationProof>,
+    pub universe_measurement: Option<UniverseMeasurement>,
+    pub policy_version: u32,
+    pub evaluated_at_us: i64,
+}
+
+impl CertificationEvaluation {
+    /// Whether this evaluation satisfies every requirement.
+    #[must_use]
+    pub fn certified(&self) -> bool {
+        self.certification_state == CertificationState::Certified
+            && self.failed_requirements.is_empty()
+            && !self.evidence_references.is_empty()
+            && self.rights_proof.is_some()
+    }
+}
+
+/// Single certification oracle used by `certify` and every matrix query.
+pub fn evaluate(
+    record: &CoverageRecord,
+    rights: &LicensingRegistry,
+    quality: &QualityReport,
+    at_us: i64,
+) -> CertificationEvaluation {
+    use crate::rights::UsageRight;
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut reject = |requirement: &str| failed.push(requirement.to_owned());
+
+    if record.status < CoverageStatus::TechnicallyValidated {
+        reject("status");
+    }
+    if record.dimensions.certification == CertificationState::Revoked {
+        reject("revocation");
+    }
+    if !record.dimensions.requirements_met() {
+        reject("dimensions");
+    }
+    let operations_satisfied = !record.real_time
+        || matches!(
+            record.dimensions.operations,
+            OperationsState::Live | OperationsState::Degraded
+        );
+    if !operations_satisfied {
+        reject("operations");
+    }
+    if !record.known_gaps.is_empty() {
+        reject("known_gaps");
+    }
+    if record.evidence.is_empty() {
+        reject("evidence");
+    }
+    let history_ok = match (record.history_start_us, record.history_end_us) {
+        (Some(start), Some(end)) => start <= end,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if !history_ok {
+        reject("history");
+    }
+    let universe_measurement = match &record.expected_universe {
+        Some(universe) => match universe.measure() {
+            Ok(measurement) => measurement,
+            Err(_) => {
+                reject("universe");
+                None
+            }
+        },
+        None => {
+            reject("universe");
+            None
+        }
+    };
+    let identity = CoverageIdentity::from(record);
+    if identity.validate(record.granularity).is_err() {
+        reject("identity");
+    }
+    if record.provider_id.trim().is_empty() {
+        reject("provider_identity");
+    }
+    let rights_proof = rights
+        .authorize(&record.rights_query(UsageRight::InternalProcessing), at_us)
+        .ok();
+    if rights_proof.is_none() {
+        reject("licensing");
+    }
+    if !quality.valid() {
+        reject("reconciliation");
+    }
+
+    let certification_state = if failed.is_empty() {
+        CertificationState::Certified
+    } else if record.dimensions.certification == CertificationState::Revoked {
+        CertificationState::Revoked
+    } else {
+        CertificationState::NotCertified
+    };
+    CertificationEvaluation {
+        certification_state,
+        failed_requirements: failed,
+        evidence_references: record.evidence.clone(),
+        rights_proof,
+        universe_measurement,
+        policy_version: CERTIFICATION_POLICY_VERSION,
+        evaluated_at_us: at_us,
+    }
 }
 
 /// Promote a record only when every applicable prerequisite is present.
@@ -637,57 +761,17 @@ pub fn certify(
     quality: &QualityReport,
     at_us: i64,
 ) -> Result<CoverageRecord, CertificationError> {
-    if record.status < CoverageStatus::TechnicallyValidated {
-        return Err(CertificationError::InsufficientStatus {
+    let evaluation = evaluate(record, rights, quality, at_us);
+    if !evaluation.certified() {
+        return Err(CertificationError::FailedRequirements {
             source_id: record.source_id.clone(),
-            status: record.status,
-        });
-    }
-    if !record.dimensions.requirements_met() {
-        return Err(CertificationError::InsufficientDimensions(
-            record.source_id.clone(),
-        ));
-    }
-    if !record.known_gaps.is_empty() {
-        return Err(CertificationError::MissingPrerequisite {
-            source_id: record.source_id.clone(),
-            requirement: "known_gaps",
-        });
-    }
-    let universe = record.expected_universe.as_ref().ok_or_else(|| {
-        CertificationError::MissingPrerequisite {
-            source_id: record.source_id.clone(),
-            requirement: "expected_universe",
-        }
-    })?;
-    universe
-        .measure()
-        .map_err(|error| CertificationError::InvalidUniverse {
-            source_id: record.source_id.clone(),
-            reason: error.to_string(),
-        })?;
-    let identity = CoverageIdentity::from(record);
-    identity.validate(record.granularity).map_err(|reason| {
-        CertificationError::InvalidUniverse {
-            source_id: record.source_id.clone(),
-            reason: reason.to_owned(),
-        }
-    })?;
-    rights
-        .authorize(&record.rights_query(UsageRight::InternalProcessing), at_us)
-        .map_err(|_| CertificationError::MissingPrerequisite {
-            source_id: record.source_id.clone(),
-            requirement: "licensing",
-        })?;
-    if !quality.valid() {
-        return Err(CertificationError::MissingPrerequisite {
-            source_id: record.source_id.clone(),
-            requirement: "reconciliation",
+            requirements: evaluation.failed_requirements.clone(),
         });
     }
     let mut promoted = record.clone();
     promoted.status = CoverageStatus::Certified;
     promoted.dimensions.certification = CertificationState::Certified;
+    promoted.last_evaluation = Some(evaluation);
     Ok(promoted)
 }
 
@@ -796,6 +880,7 @@ mod tests {
 
     fn record() -> CoverageRecord {
         CoverageRecord {
+            provider_id: "source".to_owned(),
             source_id: "source".to_owned(),
             dataset: "quotes".to_owned(),
             scope: scope(),
@@ -808,6 +893,7 @@ mod tests {
             real_time: true,
             known_gaps: Vec::new(),
             evidence: vec!["fixture".to_owned()],
+            last_evaluation: None,
         }
     }
 
@@ -830,7 +916,7 @@ mod tests {
                 decision: RightDecision::Permitted,
                 audit: DecisionAudit {
                     licence_reference: "contract".to_owned(),
-                    licence_document_hash: "contract-hash".to_owned(),
+                    licence_document_hash: "a".repeat(64),
                     contract_revision: 1,
                     recorded_at_us: 0,
                     authority: "contract-registry".to_owned(),
@@ -919,8 +1005,9 @@ mod tests {
         let mut source = record();
         source.real_time = false;
         source.dimensions.operations = OperationsState::Offline;
+        let certified = certify(&source, &rights(), &quality(), 50).expect("certification");
         assert_eq!(
-            source.certification(),
+            certified.certification(),
             CertificationState::Certified,
             "historical data can certify without a live feed"
         );
@@ -930,11 +1017,13 @@ mod tests {
     fn revocation_overrides_computed_certification() {
         let mut source = record();
         source.dimensions.certification = CertificationState::Revoked;
+        let evaluation = evaluate(&source, &rights(), &quality(), 50);
         assert_eq!(
-            source.certification(),
+            evaluation.certification_state,
             CertificationState::Revoked,
             "revocation must be visible"
         );
+        source.last_evaluation = Some(evaluation);
         assert!(!source.certifiable(), "revoked record cannot certify");
     }
 
@@ -1025,14 +1114,10 @@ mod tests {
         let mut source = record();
         source.expected_universe = None;
         assert!(!source.certifiable(), "undisclosed universe cannot certify");
+        let error = certify(&source, &rights(), &quality(), 50)
+            .expect_err("missing universe must block certification");
         assert!(
-            matches!(
-                certify(&source, &rights(), &quality(), 50),
-                Err(CertificationError::MissingPrerequisite {
-                    requirement: "expected_universe",
-                    ..
-                })
-            ),
+            format!("{error:?}").contains("universe"),
             "certification must name the missing universe"
         );
     }
@@ -1052,7 +1137,8 @@ mod tests {
     #[test]
     fn duplicate_coverage_scope_conflicts() {
         let mut matrix = CoverageMatrix::new();
-        matrix.insert(record()).expect("first record inserted");
+        let certified = certify(&record(), &rights(), &quality(), 50).expect("certification");
+        matrix.insert(certified).expect("first record inserted");
         let mut different = record();
         different.real_time = false;
         assert!(
@@ -1069,9 +1155,12 @@ mod tests {
     #[test]
     fn identical_coverage_scope_is_idempotent() {
         let mut matrix = CoverageMatrix::new();
-        matrix.insert(record()).expect("first record inserted");
+        let certified = certify(&record(), &rights(), &quality(), 50).expect("certification");
         matrix
-            .insert(record())
+            .insert(certified.clone())
+            .expect("first record inserted");
+        matrix
+            .insert(certified)
             .expect("identical re-insertion is safe");
         assert_eq!(
             matrix.by_certification(CertificationState::Certified).len(),
@@ -1090,6 +1179,110 @@ mod tests {
                 .validate(source.granularity)
                 .is_err(),
             "product granularity needs a product identity"
+        );
+    }
+
+    #[test]
+    fn single_evaluation_oracle_agrees_across_all_queries() {
+        let certified = certify(&record(), &rights(), &quality(), 50).expect("certification");
+        assert_eq!(
+            certified.certification(),
+            CertificationState::Certified,
+            "oracle state is certified"
+        );
+        assert!(
+            certified.certifiable(),
+            "certifiable agrees with certification"
+        );
+        assert!(
+            certified.failed_requirements().is_empty(),
+            "no requirements failed"
+        );
+        assert_eq!(
+            certified
+                .last_evaluation
+                .as_ref()
+                .expect("evaluation stored")
+                .policy_version,
+            CERTIFICATION_POLICY_VERSION,
+            "policy version is recorded"
+        );
+        let mut matrix = CoverageMatrix::new();
+        matrix.insert(certified).expect("record inserted");
+        assert_eq!(
+            matrix.by_certification(CertificationState::Certified).len(),
+            1,
+            "by_certification uses the stored evaluation"
+        );
+        assert_eq!(
+            matrix.certified().len(),
+            1,
+            "certified uses the stored evaluation"
+        );
+    }
+
+    #[test]
+    fn evidence_history_and_operations_prerequisites_cannot_be_bypassed() {
+        let mut missing_evidence = record();
+        missing_evidence.evidence.clear();
+        let error = certify(&missing_evidence, &rights(), &quality(), 50)
+            .expect_err("evidence is required");
+        assert!(
+            format!("{error:?}").contains("evidence"),
+            "the evidence requirement is named"
+        );
+
+        let mut missing_history = record();
+        missing_history.history_start_us = None;
+        assert!(
+            certify(&missing_history, &rights(), &quality(), 50).is_err(),
+            "history start is required"
+        );
+
+        let mut offline_live = record();
+        offline_live.dimensions.operations = OperationsState::Offline;
+        assert!(
+            certify(&offline_live, &rights(), &quality(), 50).is_err(),
+            "a real-time claim needs live operations"
+        );
+    }
+
+    #[test]
+    fn provider_identity_is_distinct_from_source_identity() {
+        let mut source = record();
+        source.provider_id = "other-provider".to_owned();
+        assert!(
+            certify(&source, &rights(), &quality(), 50).is_err(),
+            "another provider's rights cannot authorize this record"
+        );
+        let mut matching_rights = rights();
+        matching_rights
+            .register(AuthorizationRecord {
+                identity: AuthorizationIdentity {
+                    provider_id: "other-provider".to_owned(),
+                    source_id: "source".to_owned(),
+                    dataset_id: "quotes".to_owned(),
+                    product_id: "quotes".to_owned(),
+                    territory: CountryCode::new("US").expect("country code"),
+                    usage_right: UsageRight::InternalProcessing,
+                    recipient_class: RecipientClass::Internal,
+                    purpose: Purpose::InternalAnalysis,
+                    valid_from: 0,
+                    valid_until: Some(200),
+                },
+                decision: RightDecision::Permitted,
+                audit: DecisionAudit {
+                    licence_reference: "other-contract".to_owned(),
+                    licence_document_hash: "c".repeat(64),
+                    contract_revision: 2,
+                    recorded_at_us: 0,
+                    authority: "contract-registry".to_owned(),
+                },
+            })
+            .expect("other provider rights registered");
+        assert!(
+            certify(&source, &matching_rights, &quality(), 50).is_ok(),
+            "the matching provider grant authorizes the record"
         );
     }
 }

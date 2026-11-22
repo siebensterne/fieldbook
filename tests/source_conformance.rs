@@ -190,7 +190,7 @@ fn licensing() -> LicensingRegistry {
             decision: RightDecision::Permitted,
             audit: DecisionAudit {
                 licence_reference: "fixture-contract".to_owned(),
-                licence_document_hash: "fixture-hash".to_owned(),
+                licence_document_hash: "a".repeat(64),
                 contract_revision: 1,
                 recorded_at_us: 0,
                 authority: "fixture-registry".to_owned(),

@@ -111,6 +111,18 @@ the journal. External references are recorded as declarations, not passes, so
 a fixture run, a successful connection or a successful writer cannot certify a
 live dataset. No live collection or rights approval was added.
 
+M3.1.6-A closes the rights and certification review findings. Authorization
+revision keys now cover the complete identity rather than only the provider.
+Decisions are checked for interval overlap, so non-overlapping permits and
+prohibitions coexist while overlapping contradictions fail. Revocation has an
+effective time and a later approved revision reauthorizes the source. Audit
+evidence shape is validated before a decision is trusted. Coverage has one
+evaluation oracle; `certify` stores its result and all certification queries
+read that result. Evidence, history, operations, provider identity and universe
+requirements cannot be bypassed by a legacy ordinal status.
+
+M3.1.6-B through F remain open work from the independent review.
+
 ## Domain reorganisation
 
 The source tree is organised by the six architectural planes. Modules moved
