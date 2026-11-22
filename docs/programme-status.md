@@ -158,7 +158,17 @@ vacuous rights check, and rejects observation kinds absent from the declaration
 unless a documented policy allows them. Fixture conformance stays separate
 from live certification.
 
-M3.1.6-F remains open work from the independent review.
+M3.1.6-F closes the benchmark-methodology finding. A stage benchmark now
+separates framing, protocol decode, typed conversion, identity stamping, raw
+digest, arbitration, canonical persistence and evidence journaling. It uses a
+payload, event-count and domain matrix with warm-up, repeated trials, median
+and spread, allocation counts and peak live bytes. The earlier two-path
+result is retained in the historical record, and both sets of numbers are
+described as host-specific measurements rather than targets. Cargo profiles
+are unchanged.
+
+M3.1.6 is complete. All review findings have reproducer tests. M3.2 has not
+started.
 
 ## Domain reorganisation
 
