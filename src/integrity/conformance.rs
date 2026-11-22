@@ -14,13 +14,22 @@ use serde::Serialize;
 use crate::{
     acquisition::arbiter::{ArbiterLimits, SequencedPacket},
     acquisition::codec::{CodecRegistry, DecodeStatus},
+    acquisition::fixture_connectors::{
+        FixtureBatchConnector, FixtureDocumentConnector, FixtureOnChainConnector,
+        FixtureSnapshotConnector, FixtureStreamFrame, FixtureStreamingConnector,
+    },
     acquisition::stream_slice::{CollectingSink, SliceConfig, run_stream_slice},
+    governance::modality::{
+        AcquiredRecord, AcquisitionModality, BatchConnector, BatchPage, DocumentConnector,
+        DocumentRecord, OnChainConnector, SnapshotConnector, StreamingConnector,
+    },
     governance::{
         adapter::SourceCapabilityManifest,
         coverage_certification::ExpectedUniverse,
         modality::validate_modalities,
         rights::{AuthorizationQuery, LicensingRegistry, Purpose, RecipientClass, UsageRight},
     },
+    taxonomy::CountryCode,
 };
 
 /// Evidence state of one independent conformance stage.
@@ -104,11 +113,34 @@ pub struct IntegrationFixture {
     pub expected_typed_events: usize,
 }
 
+/// Policy for observation kinds absent from the declaration.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnknownEventPolicy {
+    #[default]
+    Reject,
+    AllowDocumented,
+}
+
+/// Description of a modality fixture the harness must invoke.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectorFixture {
+    pub modality: AcquisitionModality,
+    pub object_id: String,
+    pub expected_records: usize,
+}
+
 /// What a source claims before any conformance evidence is examined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConformanceDeclaration {
     /// Source identity used by the codec registry.
     pub source_id: String,
+    /// Provider identity, distinct from the source when applicable.
+    #[serde(default)]
+    pub provider_id: String,
+    /// Product identity whose rights are exercised.
+    #[serde(default)]
+    pub product_id: String,
     /// Dataset whose rights are exercised.
     pub dataset: String,
     /// Machine-readable capability manifest.
@@ -125,6 +157,18 @@ pub struct ConformanceDeclaration {
     /// Optional references to externally validated evidence.
     #[serde(default)]
     pub external: ExternalEvidence,
+    /// Source or test path proving the implementation exists.
+    #[serde(default)]
+    pub code_reference: Option<String>,
+    /// Explicit exemption reason when no rights are required.
+    #[serde(default)]
+    pub rights_exemption: Option<String>,
+    /// How undeclared observation kinds are treated.
+    #[serde(default)]
+    pub unknown_event_policy: UnknownEventPolicy,
+    /// Modality connector fixture the harness must invoke.
+    #[serde(default)]
+    pub connector_fixture: Option<ConnectorFixture>,
 }
 
 impl ConformanceDeclaration {
@@ -241,6 +285,87 @@ impl ConformanceReport {
     }
 }
 
+/// Invoke the real modality fixture and count the records it produces.
+fn invoke_connector_fixture(
+    fixture: &ConnectorFixture,
+    country: CountryCode,
+) -> anyhow::Result<usize> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let object_id = fixture.object_id.clone();
+        match fixture.modality {
+            AcquisitionModality::Streaming => {
+                let frames = vec![FixtureStreamFrame {
+                    object_id: object_id.clone(),
+                    payload: b"fixture".to_vec(),
+                    sequence: 1,
+                    source_timestamp_us: 1_000,
+                }];
+                let mut connector = FixtureStreamingConnector::new(country, "conformance", frames);
+                connector.connect().await?;
+                connector.subscribe(&[object_id]).await?;
+                let mut count = 0;
+                while connector.next_record().await?.is_some() {
+                    count += 1;
+                }
+                Ok(count)
+            }
+            AcquisitionModality::Snapshot => {
+                let record = AcquiredRecord {
+                    object_id,
+                    raw: b"fixture".to_vec(),
+                    source_timestamp_us: Some(1_000),
+                    sequence: Some(1),
+                };
+                let mut connector =
+                    FixtureSnapshotConnector::new(country, "conformance", vec![vec![record]]);
+                Ok(connector.fetch_page(None).await?.len())
+            }
+            AcquisitionModality::Batch => {
+                let record = AcquiredRecord {
+                    object_id: object_id.clone(),
+                    raw: b"fixture".to_vec(),
+                    source_timestamp_us: Some(1_000),
+                    sequence: Some(1),
+                };
+                let page = BatchPage {
+                    records: vec![record],
+                    next_cursor: None,
+                };
+                let mut connector = FixtureBatchConnector::new(country, "conformance", vec![page]);
+                Ok(connector.fetch_page(None).await?.records.len())
+            }
+            AcquisitionModality::Document => {
+                let bytes = b"fixture".to_vec();
+                let document = DocumentRecord {
+                    object_id: object_id.clone(),
+                    sha256: crate::util::sha256_hex(&bytes),
+                    published_us: Some(1_000),
+                    bytes,
+                };
+                let mut connector =
+                    FixtureDocumentConnector::new(country, "conformance", vec![document]);
+                Ok(usize::from(
+                    connector.fetch_document(&object_id).await?.is_some(),
+                ))
+            }
+            AcquisitionModality::OnChain => {
+                let block = AcquiredRecord {
+                    object_id,
+                    raw: b"fixture".to_vec(),
+                    source_timestamp_us: Some(1_000),
+                    sequence: Some(1),
+                };
+                let mut connector =
+                    FixtureOnChainConnector::new(country, "conformance", vec![block], Vec::new());
+                Ok(usize::from(connector.next_block().await?.is_some()))
+            }
+        }
+    })
+}
+
 fn add_check(report: &mut ConformanceReport, name: &str, passed: bool, detail: String) {
     report.checks.push(ConformanceCheck {
         name: name.to_owned(),
@@ -334,13 +459,28 @@ pub fn run_conformance(
 
     match declaration.validate() {
         Ok(()) => {
-            report.statuses.code_present = ConformanceStageState::Pass;
+            let code_ok = declaration
+                .code_reference
+                .as_ref()
+                .is_some_and(|reference| !reference.trim().is_empty());
+            report.statuses.code_present = if code_ok {
+                ConformanceStageState::Pass
+            } else {
+                ConformanceStageState::Fail
+            };
             add_check(
                 &mut report,
                 "declaration",
-                true,
-                "manifest, modalities and identity are valid".to_owned(),
+                code_ok,
+                if code_ok {
+                    "manifest, identity and code reference are valid".to_owned()
+                } else {
+                    "a code reference is required for code presence".to_owned()
+                },
             );
+            if !code_ok {
+                return report;
+            }
         }
         Err(error) => {
             report.statuses.code_present = ConformanceStageState::Fail;
@@ -418,19 +558,22 @@ pub fn run_conformance(
     };
 
     let mut denied_rights = Vec::new();
+    if declaration.rights_required.is_empty() && declaration.rights_exemption.is_none() {
+        denied_rights.push("no rights requirements declared".to_owned());
+    }
     for right in &declaration.rights_required {
         let query = AuthorizationQuery {
-            provider_id: declaration.manifest.provider.clone(),
+            provider_id: declaration.provider_id.clone(),
             source_id: declaration.source_id.clone(),
             dataset_id: declaration.dataset.clone(),
-            product_id: declaration.dataset.clone(),
+            product_id: declaration.product_id.clone(),
             territory: declaration.manifest.country.clone(),
             usage_right: *right,
             recipient_class: RecipientClass::Internal,
             purpose: Purpose::InternalAnalysis,
         };
         if rights.authorize(&query, at_us).is_err() {
-            denied_rights.push(right.as_str());
+            denied_rights.push(right.as_str().to_owned());
         }
     }
     add_check(
@@ -496,6 +639,38 @@ pub fn run_conformance(
             format!("declared kinds not observed: {}", missing_kinds.join(", "))
         },
     );
+    let undeclared_kinds: Vec<&str> = observed_kinds
+        .difference(&declared_kinds)
+        .copied()
+        .collect();
+    let unexpected_kinds_ok = undeclared_kinds.is_empty()
+        || declaration.unknown_event_policy == UnknownEventPolicy::AllowDocumented;
+    add_check(
+        &mut report,
+        "undeclared_kinds_absent",
+        unexpected_kinds_ok,
+        if unexpected_kinds_ok {
+            "observed kinds match the declaration".to_owned()
+        } else {
+            format!("undeclared kinds observed: {}", undeclared_kinds.join(", "))
+        },
+    );
+
+    if let Some(connector) = &declaration.connector_fixture {
+        let observed = invoke_connector_fixture(connector, declaration.manifest.country.clone());
+        let passed = observed
+            .as_ref()
+            .is_ok_and(|count| *count == connector.expected_records);
+        add_check(
+            &mut report,
+            "connector_fixture",
+            passed,
+            match observed {
+                Ok(count) => format!("connector produced {count} records"),
+                Err(error) => format!("connector fixture failed: {error}"),
+            },
+        );
+    }
 
     if let Some(integration) = &declaration.integration {
         let sink = CollectingSink::default();
@@ -594,6 +769,39 @@ mod tests {
         }
     }
 
+    struct MultiKindCodec {
+        version: u32,
+        payloads: Vec<Vec<u8>>,
+    }
+
+    impl FeedCodec for MultiKindCodec {
+        fn decode(&self, _payload: &[u8]) -> anyhow::Result<Vec<DecodedObservation>> {
+            self.payloads
+                .iter()
+                .map(|body| {
+                    let kind = if body.len() <= 2 {
+                        "unknown_kind"
+                    } else {
+                        "trade"
+                    };
+                    Ok(DecodedObservation {
+                        packet_id: String::new(),
+                        source: String::new(),
+                        schema_version: 0,
+                        kind: kind.to_owned(),
+                        payload_json: String::from_utf8(body.clone())?,
+                        status: DecodeStatus::Decoded,
+                        reason: None,
+                    })
+                })
+                .collect()
+        }
+
+        fn schema_version(&self) -> u32 {
+            self.version
+        }
+    }
+
     fn declaration() -> ConformanceDeclaration {
         ConformanceDeclaration {
             source_id: "source".to_owned(),
@@ -661,6 +869,12 @@ mod tests {
             rights_required: vec![UsageRight::InternalProcessing],
             integration: None,
             external: ExternalEvidence::default(),
+            provider_id: "provider".to_owned(),
+            product_id: "quotes".to_owned(),
+            code_reference: Some("src/acquisition/fixture_connectors.rs".to_owned()),
+            rights_exemption: None,
+            unknown_event_policy: UnknownEventPolicy::Reject,
+            connector_fixture: None,
         }
     }
 
@@ -731,7 +945,7 @@ mod tests {
             "rights approval is explicit"
         );
         assert!(!report.certified, "a fixture cannot certify a live source");
-        assert_eq!(report.checks.len(), 7, "seven explicit checks reported");
+        assert_eq!(report.checks.len(), 8, "eight explicit checks reported");
         assert!(
             report.checks.iter().all(|check| check.name != "connect"),
             "connection success is never a conformance check"
@@ -848,6 +1062,96 @@ mod tests {
         assert!(
             !report.statuses.fully_certified(),
             "no stage was validated live"
+        );
+    }
+
+    #[test]
+    fn vacuous_rights_and_missing_code_reference_fail() {
+        let mut source = declaration();
+        source.rights_required.clear();
+        source.code_reference = None;
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register(
+                "source",
+                Box::new(JsonCodec {
+                    version: 1,
+                    status: DecodeStatus::Decoded,
+                }),
+            )
+            .expect("codec registered");
+        let report = run_conformance(&source, &fixture(), &codecs, &LicensingRegistry::new(), 100);
+        assert_eq!(
+            report.statuses.code_present,
+            ConformanceStageState::Fail,
+            "code presence is a separate check"
+        );
+        assert!(
+            report.checks.iter().any(|check| !check.passed),
+            "an undeclared rights set cannot pass vacuously"
+        );
+        assert!(!report.certified, "no stage was satisfied");
+    }
+
+    #[test]
+    fn undeclared_observation_kinds_are_rejected() {
+        let mut source = declaration();
+        source.declared_kinds = vec!["trade".to_owned()];
+        let mut observed = fixture();
+        observed.expected.push(ExpectedObservation {
+            kind: "unknown_kind".to_owned(),
+            payload_json: "{}".to_owned(),
+            status: DecodeStatus::Decoded,
+        });
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register(
+                "source",
+                Box::new(MultiKindCodec {
+                    version: 1,
+                    payloads: vec![
+                        b"{\"trade_id\":\"t-1\",\"price_mantissa\":10,\"quantity_mantissa\":2}"
+                            .to_vec(),
+                        b"{}".to_vec(),
+                    ],
+                }),
+            )
+            .expect("codec registered");
+        let report = run_conformance(&source, &observed, &codecs, &LicensingRegistry::new(), 100);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "undeclared_kinds_absent" && !check.passed),
+            "an unexpected kind must be reported"
+        );
+    }
+
+    #[test]
+    fn connector_fixture_is_invoked_by_the_harness() {
+        let mut source = declaration();
+        source.connector_fixture = Some(ConnectorFixture {
+            modality: AcquisitionModality::Streaming,
+            object_id: "fixture-object".to_owned(),
+            expected_records: 1,
+        });
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register(
+                "source",
+                Box::new(JsonCodec {
+                    version: 1,
+                    status: DecodeStatus::Decoded,
+                }),
+            )
+            .expect("codec registered");
+        let report = run_conformance(&source, &fixture(), &codecs, &LicensingRegistry::new(), 100);
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "connector_fixture" && check.passed),
+            "the actual connector implementation must run"
         );
     }
 

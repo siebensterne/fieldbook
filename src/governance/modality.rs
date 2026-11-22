@@ -191,6 +191,9 @@ pub trait StreamingConnector: SourceLifecycle {
 pub trait SnapshotConnector: SourceLifecycle {
     /// Fetch one object by source-local identifier.
     async fn fetch(&mut self, object_id: &str) -> Result<Option<AcquiredRecord>>;
+
+    /// Fetch one result page by opaque cursor.
+    async fn fetch_page(&mut self, cursor: Option<&str>) -> Result<Vec<AcquiredRecord>>;
 }
 
 /// Manifest- or cursor-driven batch port.

@@ -224,3 +224,10 @@ is explicitly
 | Buffered packets keep their own evidence identity | `src/acquisition/stream_slice.rs::reordered_duplicate_and_stale_replay_reconciles_journal_typed_events_and_replay` | Identity is carried by sequence through arbitration, not reconstructed from arrival position. |
 | Replay reproduces arbitration and ordered event identity | `src/acquisition/stream_slice.rs::reordered_duplicate_and_stale_replay_reconciles_journal_typed_events_and_replay`, `src/acquisition/stream_slice.rs::integrated_slice_reconciles_journal_typed_events_and_replay` | Replay no longer accepts a digest multiset with different order. |
 | Every raw record has a processing disposition | `src/acquisition/stream_slice.rs::ProcessingDisposition`, `src/acquisition/stream_slice.rs::SliceDispositionRecord` | Disposition records are part of the slice outcome. |
+
+## M3.1.6-E connector and conformance closure
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Fixture behaviour matches declared capabilities | `src/acquisition/fixture_connectors.rs::streaming_fixture_filters_unsubscribed_objects`, `src/acquisition/fixture_connectors.rs::snapshot_fixture_supports_keyed_lookup_and_pagination`, `src/acquisition/fixture_connectors.rs::document_fixture_refuses_a_hash_mismatch`, `src/acquisition/fixture_connectors.rs::onchain_fixture_keeps_block_continuity_and_reorg_evidence` | Deterministic fixtures only; no venue behaviour is claimed. |
+| Conformance invokes real connectors and rejects vacuous checks | `src/integrity/conformance.rs::connector_fixture_is_invoked_by_the_harness`, `src/integrity/conformance.rs::vacuous_rights_and_missing_code_reference_fail`, `src/integrity/conformance.rs::undeclared_observation_kinds_are_rejected` | Code presence is separate from manifest validity and from live certification. |
