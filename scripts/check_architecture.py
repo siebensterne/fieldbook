@@ -122,6 +122,7 @@ SOURCE_RESPONSIBILITIES = {
     "src/storage/mod.rs": "storage plane module root for archive, event store, analytics and reference application",
     "src/acquisition/transport.rs": "tokio TCP/UDP/multicast transport configuration, bounded datagram receive and packet metadata",
     "src/acquisition/codec.rs": "protocol codec registry with fail-closed decode batches and raw packet identity retention",
+    "src/acquisition/evidence.rs": "durable packet evidence extension bound to stable journal positions with verification, durability profiles and staged dispositions",
     "src/acquisition/arbiter.rs": "dual-channel sequence arbitration with duplicate, gap, stale and out-of-order decisions",
     "src/acquisition/packet.rs": "raw packet evidence with payload digests and explicit-source journal mapping",
     "src/acquisition/supervisor.rs": "typed connection supervision with bounded retry and backoff decisions",
