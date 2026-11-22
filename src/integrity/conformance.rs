@@ -27,9 +27,7 @@ use crate::{
         adapter::SourceCapabilityManifest,
         coverage_certification::ExpectedUniverse,
         modality::validate_modalities,
-        rights::{
-            AuthorizationQuery, LicensingRegistry, Operation, Purpose, RecipientClass, UsageRight,
-        },
+        rights::{AuthorizationScope, LicensingRegistry, Operation, ScopeSet, UsageRight},
     },
     taxonomy::CountryCode,
 };
@@ -564,18 +562,28 @@ pub fn run_conformance(
         denied_rights.push("no rights requirements declared".to_owned());
     }
     for right in &declaration.rights_required {
-        let query = AuthorizationQuery {
-            venue: declaration.provider_id.clone(),
-            operation: Operation::Collect,
-            provider_id: declaration.provider_id.clone(),
-            source_id: declaration.source_id.clone(),
-            dataset_id: declaration.dataset.clone(),
-            product_id: declaration.product_id.clone(),
-            territory: declaration.manifest.country.clone(),
-            usage_right: *right,
-            recipient_class: RecipientClass::Internal,
-            purpose: Purpose::InternalAnalysis,
+        let operation = match right {
+            UsageRight::RealTimeAccess => Operation::RealTimeCapture,
+            UsageRight::HistoricalStorage => Operation::HistoricalDataRetrieval,
+            UsageRight::InternalProcessing => Operation::InternalAnalytics,
+            UsageRight::DerivedData => Operation::DerivedDataCreation,
+            UsageRight::Redistribution => Operation::ExternalRedistribution,
         };
+        let query =
+            AuthorizationScope::for_exchange(crate::config::ExchangeKind::Kalshi, operation).with(
+                |scope| {
+                    scope.venue = declaration.provider_id.clone();
+                    scope.provider_id = declaration.provider_id.clone();
+                    scope.source_id = declaration.source_id.clone();
+                    scope.dataset_id = declaration.dataset.clone();
+                    scope.product_id = declaration.product_id.clone();
+                    scope.territory = declaration.manifest.country.clone();
+                    scope.usage_right = *right;
+                    scope.instruments = ScopeSet::All;
+                    scope.fields = ScopeSet::All;
+                    scope.modalities = ScopeSet::All;
+                },
+            );
         if rights.authorize(&query, at_us).is_err() {
             denied_rights.push(right.as_str().to_owned());
         }
@@ -728,6 +736,7 @@ mod tests {
         DecodedObservation, //
         FeedCodec,          //
     };
+    use crate::config::ExchangeKind;
     use crate::governance::adapter::{
         AccessStatus, HistoricalCapability, Protocol, RecoveryCapability, TimestampCapability,
         Transport,
@@ -742,6 +751,25 @@ mod tests {
         RightDecision,         //
     };
     use crate::reference_data::VenueCategory;
+
+    fn rights_identity() -> AuthorizationIdentity {
+        AuthorizationIdentity {
+            scope: AuthorizationScope::for_exchange(
+                ExchangeKind::Kalshi,
+                Operation::InternalAnalytics,
+            )
+            .with(|scope| {
+                scope.venue = "provider".to_owned();
+                scope.provider_id = "provider".to_owned();
+                scope.source_id = "source".to_owned();
+                scope.dataset_id = "quotes".to_owned();
+                scope.product_id = "quotes".to_owned();
+                scope.usage_right = UsageRight::InternalProcessing;
+            }),
+            valid_from: 0,
+            valid_until: Some(200),
+        }
+    }
     use crate::taxonomy::{
         AssetClass,   //
         CountryCode,  //
@@ -914,20 +942,7 @@ mod tests {
         let mut licensing = LicensingRegistry::new();
         licensing
             .register(AuthorizationRecord {
-                identity: AuthorizationIdentity {
-                    venue: "provider".to_owned(),
-                    operation: Operation::Collect,
-                    provider_id: "provider".to_owned(),
-                    source_id: "source".to_owned(),
-                    dataset_id: "quotes".to_owned(),
-                    product_id: "quotes".to_owned(),
-                    territory: CountryCode::new("US").expect("country code"),
-                    usage_right: UsageRight::InternalProcessing,
-                    recipient_class: RecipientClass::Internal,
-                    purpose: Purpose::InternalAnalysis,
-                    valid_from: 0,
-                    valid_until: Some(200),
-                },
+                identity: rights_identity(),
                 decision: RightDecision::Permitted,
                 audit: DecisionAudit {
                     licence_reference: "contract".to_owned(),
@@ -998,20 +1013,7 @@ mod tests {
         let mut licensing = LicensingRegistry::new();
         licensing
             .register(AuthorizationRecord {
-                identity: AuthorizationIdentity {
-                    venue: "provider".to_owned(),
-                    operation: Operation::Collect,
-                    provider_id: "provider".to_owned(),
-                    source_id: "source".to_owned(),
-                    dataset_id: "quotes".to_owned(),
-                    product_id: "quotes".to_owned(),
-                    territory: CountryCode::new("US").expect("country code"),
-                    usage_right: UsageRight::InternalProcessing,
-                    recipient_class: RecipientClass::Internal,
-                    purpose: Purpose::InternalAnalysis,
-                    valid_from: 0,
-                    valid_until: Some(200),
-                },
+                identity: rights_identity(),
                 decision: RightDecision::Permitted,
                 audit: DecisionAudit {
                     licence_reference: "contract".to_owned(),

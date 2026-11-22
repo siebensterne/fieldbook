@@ -305,22 +305,33 @@ pub enum JournalCommand {
 
 /// Commands that would contact a provider or publish derived provider data.
 /// Every one of them is gated before its library implementation is called.
+///
+/// A command declares the lifecycle operations it may require. Each operation
+/// is authorized independently; none is inferred from the command name.
 #[must_use]
-pub fn gated_operation(command: &Command) -> Option<crate::rights::Operation> {
+pub fn gated_operations(command: &Command) -> &'static [crate::rights::Operation] {
     use crate::rights::Operation;
     match command {
-        Command::Collect => Some(Operation::Collect),
-        Command::Discover { .. } => Some(Operation::Discover),
-        Command::Latency { .. } => Some(Operation::Latency),
-        Command::NetworkProbe { .. } => Some(Operation::NetworkProbe),
-        Command::AnalyticsExport { .. } => Some(Operation::AnalyticsExport),
+        Command::Collect => &[
+            Operation::SourceContact,
+            Operation::ReferenceDataRetrieval,
+            Operation::RealTimeCapture,
+            Operation::RawStorage,
+            Operation::Normalization,
+        ],
+        Command::Discover { .. } => &[Operation::SourceContact, Operation::ReferenceDataRetrieval],
+        Command::Latency { .. } => &[Operation::SourceContact, Operation::RealTimeCapture],
+        Command::NetworkProbe { .. } => &[Operation::SourceContact],
+        Command::AnalyticsExport { .. } => {
+            &[Operation::InternalAnalytics, Operation::DerivedDataCreation]
+        }
         Command::Replay { .. }
         | Command::Inspect { .. }
         | Command::Verify { .. }
         | Command::Completeness { .. }
         | Command::Coverage { .. }
         | Command::AnalyticsVerify { .. }
-        | Command::Journal { .. } => None,
+        | Command::Journal { .. } => &[],
     }
 }
 
@@ -435,7 +446,7 @@ mod tests {
     use super::Cli;
     use super::Command;
     use super::JournalCommand;
-    use super::gated_operation;
+    use super::gated_operations;
     use crate::rights::Operation;
     use clap::Parser;
     use std::path::Path;
@@ -451,13 +462,28 @@ mod tests {
 
     #[test]
     fn only_provider_facing_commands_are_gated() {
-        let expectations = [
-            ("collect", Some(Operation::Collect)),
-            ("discover", Some(Operation::Discover)),
-            ("latency", Some(Operation::Latency)),
-            ("network-probe", Some(Operation::NetworkProbe)),
-            ("inspect", None),
-            ("verify", None),
+        let expectations: [(&str, &[Operation]); 6] = [
+            (
+                "collect",
+                &[
+                    Operation::SourceContact,
+                    Operation::ReferenceDataRetrieval,
+                    Operation::RealTimeCapture,
+                    Operation::RawStorage,
+                    Operation::Normalization,
+                ],
+            ),
+            (
+                "discover",
+                &[Operation::SourceContact, Operation::ReferenceDataRetrieval],
+            ),
+            (
+                "latency",
+                &[Operation::SourceContact, Operation::RealTimeCapture],
+            ),
+            ("network-probe", &[Operation::SourceContact]),
+            ("inspect", &[]),
+            ("verify", &[]),
         ];
         for (name, expected) in expectations {
             let mut argv = vec!["fieldbook", name];
@@ -466,7 +492,7 @@ mod tests {
             }
             let cli = Cli::try_parse_from(argv).expect("parse command");
             assert_eq!(
-                gated_operation(cli.command.as_ref().expect("command")),
+                gated_operations(cli.command.as_ref().expect("command")),
                 expected,
                 "gate classification for {name}"
             );

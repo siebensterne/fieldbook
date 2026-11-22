@@ -27,6 +27,7 @@ use fieldbook::adapter::{
     AccessStatus, HistoricalCapability, Protocol, RecoveryCapability, SourceCapabilityManifest,
     TimestampCapability, Transport,
 };
+use fieldbook::config::ExchangeKind;
 use fieldbook::conformance::{
     ConformanceDeclaration, ConformanceFixture, ExpectedObservation, run_conformance,
 };
@@ -40,11 +41,10 @@ use fieldbook::reference_data::VenueCategory;
 use fieldbook::rights::{
     AuthorizationIdentity, //
     AuthorizationRecord,   //
+    AuthorizationScope,    //
     DecisionAudit,         //
     LicensingRegistry,     //
     Operation,             //
-    Purpose,               //
-    RecipientClass,        //
     RightDecision,         //
     UsageRight,            //
 };
@@ -183,16 +183,18 @@ fn licensing() -> LicensingRegistry {
     registry
         .register(AuthorizationRecord {
             identity: AuthorizationIdentity {
-                venue: "fixture-provider".to_owned(),
-                operation: Operation::Collect,
-                provider_id: "fixture-provider".to_owned(),
-                source_id: "fixture-source".to_owned(),
-                dataset_id: "trades".to_owned(),
-                product_id: "trades".to_owned(),
-                territory: CountryCode::new("US").expect("country code"),
-                usage_right: UsageRight::InternalProcessing,
-                recipient_class: RecipientClass::Internal,
-                purpose: Purpose::InternalAnalysis,
+                scope: AuthorizationScope::for_exchange(
+                    ExchangeKind::Kalshi,
+                    Operation::InternalAnalytics,
+                )
+                .with(|scope| {
+                    scope.venue = "fixture-provider".to_owned();
+                    scope.provider_id = "fixture-provider".to_owned();
+                    scope.source_id = "fixture-source".to_owned();
+                    scope.dataset_id = "trades".to_owned();
+                    scope.product_id = "trades".to_owned();
+                    scope.usage_right = UsageRight::InternalProcessing;
+                }),
                 valid_from: 0,
                 valid_until: Some(200),
             },

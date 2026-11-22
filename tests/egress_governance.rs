@@ -33,8 +33,9 @@ use fieldbook::{
 fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
     format!(
         "schema_version = 1\n\
+         licensee = \"fieldbook-operator\"\n\
          territory = \"US\"\n\
-         recipient_class = \"internal\"\n\
+         recipient = \"internal\"\n\
          \n\
          [[rights]]\n\
          decision = \"{decision}\"\n\
@@ -42,16 +43,28 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          [rights.identity]\n\
          venue = \"{venue}\"\n\
          provider_id = \"kalshi\"\n\
-         source_id = \"reference-data-source\"\n\
-         dataset_id = \"market-reference\"\n\
-         product_id = \"collect\"\n\
+         source_id = \"provider-source\"\n\
+         dataset_id = \"market-data\"\n\
+         product_id = \"market-data-feed\"\n\
+         segment = \"live-capture\"\n\
          territory = \"US\"\n\
-         operation = \"collect\"\n\
+         operation = \"real_time_capture\"\n\
          usage_right = \"real_time_access\"\n\
-         recipient_class = \"internal\"\n\
+         usage_mode = \"non_display\"\n\
+         recipient = \"internal\"\n\
          purpose = \"internal_analysis\"\n\
+         delivery_method = \"stream\"\n\
+         instruments = \"all\"\n\
+         fields = \"all\"\n\
+         modalities = \"all\"\n\
          valid_from = 0\n\
          valid_until = {valid_until}\n\
+         \n\
+         [rights.identity.retention]\n\
+         max_age_secs = 86400\n\
+         purge_required = true\n\
+         \n\
+         [rights.identity.data_time_window]\n\
          \n\
          [rights.audit]\n\
          licence_reference = \"contract-1\"\n\
@@ -68,6 +81,7 @@ fn settings_with_rights(text: &str) -> (tempfile::TempDir, Settings) {
     std::fs::write(&path, text).expect("write rights file");
     let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
     settings.governance.rights_file = Some(path);
+    settings.governance.audit_dir = Some(directory.path().join("audit"));
     (directory, settings)
 }
 
@@ -92,7 +106,7 @@ fn collect_without_rights_file_denies_before_egress() {
     );
     let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
     settings.governance.rights_file = None;
-    let error = authorize_command(&settings, Operation::Collect)
+    let error = authorize_command(&settings, Operation::RealTimeCapture)
         .expect_err("collection without a rights file must deny");
     assert!(
         error.to_string().contains("runtime authorization file"),
@@ -103,7 +117,7 @@ fn collect_without_rights_file_denies_before_egress() {
         "a denied command installs no authorization"
     );
     assert!(
-        require_provider_egress("kalshi", "http_client").is_err(),
+        require_provider_egress("kalshi", Operation::ReferenceDataRetrieval).is_err(),
         "no proof means no HTTP client"
     );
     assert!(
@@ -121,17 +135,17 @@ fn collect_without_rights_file_denies_before_egress() {
 fn expired_and_unknown_rights_deny_every_gated_command() {
     let (_expired_dir, expired) = settings_with_rights(&rights_toml("kalshi", "permitted", 1));
     assert!(
-        authorize_command(&expired, Operation::Collect).is_err(),
+        authorize_command(&expired, Operation::RealTimeCapture).is_err(),
         "an expired right denies collection"
     );
     assert!(
-        authorize_command(&expired, Operation::Discover).is_err(),
+        authorize_command(&expired, Operation::ReferenceDataRetrieval).is_err(),
         "an expired right denies discovery"
     );
     let (_unknown_dir, unknown) =
         settings_with_rights(&rights_toml("kalshi", "contract_required", i64::MAX));
     assert!(
-        authorize_command(&unknown, Operation::NetworkProbe).is_err(),
+        authorize_command(&unknown, Operation::SourceContact).is_err(),
         "an UNKNOWN right denies a network probe"
     );
     assert!(
@@ -144,7 +158,7 @@ fn expired_and_unknown_rights_deny_every_gated_command() {
 fn right_without_a_venue_is_refused_at_load() {
     let (_directory, settings) = settings_with_rights(&rights_toml("", "permitted", i64::MAX));
     assert!(
-        authorize_command(&settings, Operation::Collect).is_err(),
+        authorize_command(&settings, Operation::RealTimeCapture).is_err(),
         "a record without a venue is never a grant"
     );
     assert!(
@@ -198,7 +212,7 @@ fn analytics_export_denial_publishes_nothing() {
     let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
     settings.governance.rights_file = None;
     assert!(
-        authorize_command(&settings, Operation::AnalyticsExport).is_err(),
+        authorize_command(&settings, Operation::DerivedDataCreation).is_err(),
         "derived-data publication requires a right"
     );
     let published: Vec<_> = std::fs::read_dir(&staging)

@@ -15,7 +15,7 @@ use fieldbook::{
 use fieldbook::distribution::cli::Cli;
 use fieldbook::distribution::cli::Command;
 use fieldbook::distribution::cli::JournalCommand;
-use fieldbook::distribution::cli::gated_operation;
+use fieldbook::distribution::cli::gated_operations;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,8 +29,9 @@ async fn main() -> anyhow::Result<()> {
     };
     // Gate before dispatch: a denied decision must stop the command before a
     // client is built, a socket is opened, or a file is published.
-    if let Some(operation) = gated_operation(&command) {
-        rights::authorize_command(&settings, operation)?;
+    let required_operations = gated_operations(&command);
+    if !required_operations.is_empty() {
+        rights::authorize_operations(&settings, required_operations)?;
     }
     match command {
         Command::Collect => {

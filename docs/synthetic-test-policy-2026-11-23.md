@@ -112,10 +112,12 @@ or `--all-features`. `cargo xtask e2e` runs the six permitted suites
 `network_source` and `segmented_runner`.
 
 On the verified run, `cargo test --workspace --all-targets --locked` executed
-559 tests: 547 passed and 12 ignored. The library contributed 460 passed and 4
+569 tests: 557 passed and 12 ignored. The library contributed 470 passed and 4
 ignored; the 12 permitted integration binaries contributed 73 passed and 8
 ignored; the `xtask` binary contributed 14 passed. The doc-test command added
-1 passed test. Combined current result: 548 passed and 12 ignored.
+1 passed test. Combined current result: 558 passed and 12 ignored. The increase
+from the earlier 548-pass result comes from the abstract authorization tests
+recorded in [`rights-enforcement-2026-11-23.md`](rights-enforcement-2026-11-23.md).
 
 ## 5. Inspecting preserved source
 

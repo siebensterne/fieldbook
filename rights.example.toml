@@ -3,19 +3,26 @@
 # This file is the ONLY authorization input: set [governance].rights_file or
 # --rights-file to its path. Environment variables, operator attestations and
 # command flags cannot grant a right. Point CLAIM to a config file with real
-# records via --rights-file (or [governance].rights_file) before running
-# collect, discover, latency, network-probe or analytics-export. Missing,
-# malformed or expired records deny.
+# records via --rights-file (or [governance].rights_file) and configure a
+# writable [governance].audit_dir (or --rights-audit-dir) before running
+# collect, discover, latency, network-probe or analytics-export. A missing
+# rights file, missing audit directory, malformed, expired or out-of-scope
+# record denies; a denied decision is recorded when the sink is writable.
 #
 # Identifiers below are abstract placeholders. The example decision is
 # `contract_required`, which denies. Change it to `permitted` only after the
-# contract has been reviewed: the venue, provider, source, operation and
-# purpose must all match the intended use, and the licence reference must
-# name the actual document.
+# contract has been reviewed: every exact identity and every scoped dimension
+# below must match the intended use, and the licence reference must name the
+# actual document. Display mode, purpose, recipient and licensee are separate
+# concepts: none is inferred from a command name. One command may need several
+# records, one per declared lifecycle operation: `collect` requires
+# source_contact, reference_data_retrieval, real_time_capture, raw_storage and
+# normalization; `network-probe` requires only source_contact.
 
 schema_version = 1
+licensee = "REPLACE_WITH_LEGAL_LICENSEE"
 territory = "US"
-recipient_class = "internal"
+recipient = "internal"                # separate from usage_right and purpose
 
 [[rights]]
 decision = "contract_required"
@@ -23,16 +30,29 @@ decision = "contract_required"
 [rights.identity]
 venue = "venue-a"
 provider_id = "provider-a"
-source_id = "reference-data-source"
-dataset_id = "market-reference"
-product_id = "collect"
+source_id = "provider-source"
+dataset_id = "market-data"
+product_id = "market-data-feed"       # the source product, never the command name
+segment = "live-capture"
 territory = "US"
-operation = "collect"
+operation = "real_time_capture"       # lifecycle vocabulary, not a CLI command
 usage_right = "real_time_access"
-recipient_class = "internal"
+usage_mode = "non_display"            # separate display/non-display concept
+recipient = "internal"
 purpose = "internal_analysis"
+delivery_method = "stream"
+instruments = "all"                   # replace with { only = [...] } to narrow
+fields = "all"
+modalities = "all"                    # l1, l2, l3, order_by_order
 valid_from = 0
-valid_until = 4102444800000000
+valid_until = 4102444800000000        # effective interval, distinct from data window
+
+[rights.identity.retention]
+max_age_secs = 86400
+purge_required = true
+
+[rights.identity.data_time_window]
+# from_us / to_us are omitted: this example covers all data instants.
 
 [rights.audit]
 licence_reference = "REPLACE_WITH_CONTRACT_REFERENCE"

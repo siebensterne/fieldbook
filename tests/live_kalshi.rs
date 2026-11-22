@@ -48,7 +48,12 @@ fn network() -> &'static fieldbook::config::NetworkSettings {
             .expect("LIVE_RIGHTS_FILE must name a contract-derived rights TOML file");
         let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
         settings.governance.rights_file = Some(PathBuf::from(path));
-        authorize_command(&settings, Operation::Collect)
+        settings.governance.audit_dir = Some(
+            std::env::var("LIVE_AUDIT_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("target/live-audit")),
+        );
+        authorize_command(&settings, Operation::RealTimeCapture)
             .expect("rights must authorize this venue and operation");
         settings.network
     })

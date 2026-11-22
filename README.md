@@ -198,8 +198,12 @@ LIVE_DURATION_SECS=120 LIVE_MAX_MARKETS=5 scripts/run-live-evidence.sh
 
 `LIVE_RIGHTS_FILE` only names a contract-derived authorization file; it is not
 an attestation. The collector denies before any provider contact when the file
-is missing, malformed, expired or out of scope, and records each decision in
-the directory named by `--rights-audit-dir` / `LIVE_RIGHTS_AUDIT_DIR`.
+is missing, malformed, expired or out of scope, or when its full identity,
+scope or typed operation does not match the requested use. A writable audit
+directory is mandatory: set `--rights-audit-dir` / `LIVE_RIGHTS_AUDIT_DIR`, or
+the run script defaults it to a per-run directory. Each permitted decision is
+committed there before provider egress. See
+[`docs/rights-enforcement-2026-11-23.md`](docs/rights-enforcement-2026-11-23.md).
 
 The script refuses to claim a dual-venue success if either venue is skipped or a capture/journal verification fails. It certifies per-symbol coverage: every expected symbol in `markets.json` must appear in the run report's acknowledged subscription set and must have its own snapshot in the capture. A five-market run emits `LIVE_SMOKE_OK`, never `LIVE_UNIVERSE_OK`. To claim the universe tier, run `LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml LIVE_EVIDENCE_SCOPE=universe LIVE_MAX_MARKETS=0 LIVE_DURATION_SECS=900 scripts/run-live-evidence.sh` — pass `LIVE_CONFIG=config.live-universe.toml` for the reviewed full-universe capacity envelope (capacity planning uses 548,942 discovered outcome tokens; the failed 2026-11-14 live capture expected 385,604 symbols. These are different runs and different evidence stages, not interchangeable counts; the default envelope is refused fail-closed by the capacity planner). The script then requires the expected set to equal the full discovered universe. `LIVE_SOAK_OK` is reserved for a full-universe run held for the stated soak duration and is not emitted by this script. The manual live workflow runs the same script on the protected runner and uploads the complete `captures/` bundle as a retained artifact.
 

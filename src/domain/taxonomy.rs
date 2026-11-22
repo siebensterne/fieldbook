@@ -298,6 +298,14 @@ impl TemporalStatus {
 #[serde(transparent)]
 pub struct CountryCode(String);
 
+impl Default for CountryCode {
+    fn default() -> Self {
+        // "ZZ" is a valid two-letter user-assigned code. It is never a
+        // wildcard: an absent territory still fails scope comparison.
+        Self("ZZ".to_owned())
+    }
+}
+
 impl CountryCode {
     /// Build a country code after validating its shape.
     pub fn new(value: &str) -> Result<Self, InvalidCode> {

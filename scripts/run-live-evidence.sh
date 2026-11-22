@@ -149,9 +149,10 @@ run_venue() {
     config_args=(--config "$LIVE_CONFIG")
   fi
   config_args+=(--rights-file "$RIGHTS_FILE")
-  if [[ -n "$RIGHTS_AUDIT_DIR" ]]; then
-    config_args+=(--rights-audit-dir "$RIGHTS_AUDIT_DIR")
-  fi
+  # The audit sink is mandatory: every provider-facing decision must be
+  # committed before egress. Default to a per-run directory, never to absent.
+  local audit_dir="${RIGHTS_AUDIT_DIR:-$directory/authorization-audit}"
+  config_args+=(--rights-audit-dir "$audit_dir")
 
   mkdir -p "$directory" || { echo "[$venue] cannot create $directory" >&2; \
     return 1; }

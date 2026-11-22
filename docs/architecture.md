@@ -29,7 +29,11 @@ scheduled work, not an implicit capability of this implementation.
 `src/main.rs` parses the CLI and requires an explicit subcommand; no command
 starts no provider activity. Before dispatching any provider-facing command it
 loads the runtime rights file through `src/governance/rights.rs` and denies when
-no live, venue-scoped right covers the operation. Offline commands (replay,
+no live right covers the full requested identity and scope. Each command
+declares the typed lifecycle operations it may require, and each egress
+boundary passes the actual operation for a fresh check. A configurable,
+writable audit sink is mandatory: the permitted decision is committed before a
+client, socket or published file exists. Offline commands (replay,
 inspect, verify, journal, analytics-verify) need no rights. Live collection
 enters `src/distribution/coordinator.rs`, which constructs the exchange adapter, performs
 discovery, plans capacity, loads a catalog, starts session workers (plus the
