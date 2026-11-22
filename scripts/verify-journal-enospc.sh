@@ -61,7 +61,9 @@ test_name="integrity::journal::tests::storage_write_failure_marks_run_failed"
 # A missing or renamed test makes `cargo test --exact` exit 0 with zero runs.
 # Verify the name first, then require exactly one passing test.
 list_output="$(cargo test --lib -- --list)"
-printf '%s\n' "$list_output" | grep -Fxq "${test_name}: test" || {
+# A here-string avoids a pipeline: grep -q closes its input on the first
+# match, which would give printf SIGPIPE and fail under pipefail.
+grep -Fxq "${test_name}: test" <<<"$list_output" || {
   echo "ENOSPC drill test ${test_name} is missing" >&2
   exit 1
 }

@@ -15,7 +15,7 @@ use crate::{
         adapter::SourceCapabilityManifest,
         coverage_certification::ExpectedUniverse,
         modality::validate_modalities,
-        rights::{LicensingRegistry, UsageRight},
+        rights::{AuthorizationQuery, LicensingRegistry, Purpose, RecipientClass, UsageRight},
     },
 };
 
@@ -294,12 +294,18 @@ pub fn run_conformance(
     );
 
     let mut denied_rights = Vec::new();
-    let territory = declaration.manifest.country.clone();
     for right in &declaration.rights_required {
-        if rights
-            .authorize(&declaration.dataset, &territory, *right, at_us)
-            .is_err()
-        {
+        let query = AuthorizationQuery {
+            provider_id: declaration.manifest.provider.clone(),
+            source_id: declaration.source_id.clone(),
+            dataset_id: declaration.dataset.clone(),
+            product_id: declaration.dataset.clone(),
+            territory: declaration.manifest.country.clone(),
+            usage_right: *right,
+            recipient_class: RecipientClass::Internal,
+            purpose: Purpose::InternalAnalysis,
+        };
+        if rights.authorize(&query, at_us).is_err() {
             denied_rights.push(right.as_str());
         }
     }
@@ -315,23 +321,23 @@ pub fn run_conformance(
     );
 
     let universe_detail = match &declaration.expected_universe {
-        Some(ExpectedUniverse::Enumerated { .. }) => match declaration
-            .expected_universe
-            .as_ref()
-            .and_then(ExpectedUniverse::measure)
-        {
-            Some(measurement) => format!(
+        Some(universe @ ExpectedUniverse::Enumerated { .. }) => match universe.measure() {
+            Ok(Some(measurement)) => format!(
                 "enumerated universe: {} expected, {} supported",
                 measurement.expected, measurement.supported
             ),
-            None => "enumerated universe could not be measured".to_owned(),
+            Ok(None) => "enumerated universe could not be measured".to_owned(),
+            Err(error) => format!("invalid universe: {error}"),
         },
         Some(ExpectedUniverse::Unmeasurable { reason }) => {
             format!("no denominator claimed: {reason}")
         }
         None => "no universe declaration".to_owned(),
     };
-    let universe_ok = declaration.expected_universe.is_some();
+    let universe_ok = declaration
+        .expected_universe
+        .as_ref()
+        .is_some_and(|universe| universe.validate().is_ok());
     add_check(
         &mut report,
         "universe_disclosed",
@@ -380,6 +386,12 @@ mod tests {
     use crate::governance::modality::{
         AcquisitionModality, SnapshotCapability, StreamingCapability,
     };
+    use crate::governance::rights::{
+        AuthorizationIdentity, //
+        AuthorizationRecord,   //
+        DecisionAudit,         //
+        RightDecision,         //
+    };
     use crate::reference_data::VenueCategory;
     use crate::taxonomy::{
         AssetClass,   //
@@ -388,7 +400,6 @@ mod tests {
         DepthModel,   //
         Frequency,    //
     };
-    use std::collections::BTreeMap;
 
     struct JsonCodec {
         version: u32,
@@ -511,18 +522,30 @@ mod tests {
             )
             .expect("register codec");
         let mut licensing = LicensingRegistry::new();
-        licensing.register(crate::governance::rights::LicensingRecord {
-            provider: "provider".to_owned(),
-            dataset: "quotes".to_owned(),
-            territory: CountryCode::new("US").expect("country code"),
-            rights: BTreeMap::from([(
-                UsageRight::InternalProcessing,
-                crate::governance::rights::RightDecision::Permitted,
-            )]),
-            valid_until_us: Some(200),
-            audit_required: false,
-            reference: "contract".to_owned(),
-        });
+        licensing
+            .register(AuthorizationRecord {
+                identity: AuthorizationIdentity {
+                    provider_id: "provider".to_owned(),
+                    source_id: "source".to_owned(),
+                    dataset_id: "quotes".to_owned(),
+                    product_id: "quotes".to_owned(),
+                    territory: CountryCode::new("US").expect("country code"),
+                    usage_right: UsageRight::InternalProcessing,
+                    recipient_class: RecipientClass::Internal,
+                    purpose: Purpose::InternalAnalysis,
+                    valid_from: 0,
+                    valid_until: Some(200),
+                },
+                decision: RightDecision::Permitted,
+                audit: DecisionAudit {
+                    licence_reference: "contract".to_owned(),
+                    licence_document_hash: "contract-hash".to_owned(),
+                    contract_revision: 1,
+                    recorded_at_us: 0,
+                    authority: "contract-registry".to_owned(),
+                },
+            })
+            .expect("rights registered");
         let report = run_conformance(&declaration(), &fixture(), &codecs, &licensing, 100);
         assert!(report.certified, "all evidence checks must pass");
         assert_eq!(report.checks.len(), 7, "seven explicit checks reported");
