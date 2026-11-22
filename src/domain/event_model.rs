@@ -38,20 +38,65 @@ impl TimestampRole {
     }
 }
 
-/// One timestamp with explicit clock, precision and uncertainty metadata.
+/// How a clock is synchronized to a reference time source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockSynchronization {
+    /// No synchronization has been established or declared.
+    #[default]
+    Unknown,
+    /// Clock runs freely without external discipline.
+    FreeRunning,
+    /// Distributed by network time protocol.
+    Ntp,
+    /// Distributed by precision time protocol.
+    Ptp,
+    /// Disciplined by a hardware reference.
+    HardwareDisciplined,
+}
+
+impl ClockSynchronization {
+    /// Return the stable contract string for this synchronization state.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::FreeRunning => "free_running",
+            Self::Ntp => "ntp",
+            Self::Ptp => "ptp",
+            Self::HardwareDisciplined => "hardware_disciplined",
+        }
+    }
+}
+
+/// One timestamp with explicit clock, resolution, accuracy and uncertainty.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObservedTimestamp {
     pub role: TimestampRole,
     pub value_us: i64,
     pub unit: String,
     pub clock_source: String,
+    /// Storage or display granularity. This is not an accuracy claim: a value
+    /// of one microsecond means the field is stored in microseconds.
     pub precision_us: u32,
+    /// Declared resolution of the source clock, when the source declares one.
+    #[serde(default)]
+    pub resolution_us: Option<u32>,
+    /// Declared absolute accuracy, when independent evidence supports it.
+    #[serde(default)]
+    pub accuracy_us: Option<u32>,
+    /// Bounded uncertainty of the measurement, when declared.
+    #[serde(default)]
     pub uncertainty_us: Option<u32>,
+    /// Synchronization state of the clock.
+    #[serde(default)]
+    pub synchronization: ClockSynchronization,
+    #[serde(default)]
     pub utc_offset_minutes: Option<i16>,
 }
 
 impl ObservedTimestamp {
-    /// Build a timestamp in microseconds with no claimed uncertainty.
+    /// Build a timestamp in microseconds with no accuracy or synchronization
+    /// claim. `precision_us` records storage granularity only.
     pub fn new(role: TimestampRole, value_us: i64, clock_source: &str) -> Self {
         Self {
             role,
@@ -59,9 +104,38 @@ impl ObservedTimestamp {
             unit: "microseconds".to_owned(),
             clock_source: clock_source.to_owned(),
             precision_us: 1,
+            resolution_us: None,
+            accuracy_us: None,
             uncertainty_us: None,
+            synchronization: ClockSynchronization::Unknown,
             utc_offset_minutes: Some(0),
         }
+    }
+
+    /// Build a timestamp with explicit measurement metadata.
+    pub fn declare_measured(
+        role: TimestampRole,
+        value_us: i64,
+        clock_source: &str,
+        resolution_us: u32,
+        accuracy_us: Option<u32>,
+        uncertainty_us: Option<u32>,
+        synchronization: ClockSynchronization,
+    ) -> Self {
+        Self {
+            precision_us: 1,
+            resolution_us: Some(resolution_us),
+            accuracy_us,
+            uncertainty_us,
+            synchronization,
+            ..Self::new(role, value_us, clock_source)
+        }
+    }
+
+    /// Whether an accuracy claim is backed by a declared synchronization.
+    #[must_use]
+    pub fn accuracy_claim_is_evidenced(&self) -> bool {
+        self.accuracy_us.is_none() || self.synchronization != ClockSynchronization::Unknown
     }
 }
 
@@ -216,6 +290,13 @@ impl<T> UniversalEnvelope<T> {
         {
             return Err(EventModelError::UnknownTimestampUnit);
         }
+        if self
+            .timestamps
+            .iter()
+            .any(|timestamp| !timestamp.accuracy_claim_is_evidenced())
+        {
+            return Err(EventModelError::UnevidencedAccuracyClaim);
+        }
         Ok(())
     }
 }
@@ -235,6 +316,9 @@ pub enum EventModelError {
     /// A timestamp declared an unsupported unit.
     #[error("timestamp unit must be microseconds")]
     UnknownTimestampUnit,
+    /// Accuracy was claimed without a declared clock synchronization.
+    #[error("timestamp accuracy claim requires a declared clock synchronization")]
+    UnevidencedAccuracyClaim,
 }
 
 /// Specialized market-data envelope.
@@ -304,5 +388,62 @@ mod tests {
             text.contains("\"payload_type\":\"equity_quote\""),
             "serde tag must be present"
         );
+    }
+
+    #[test]
+    fn storage_precision_is_not_an_accuracy_claim() {
+        let timestamp = ObservedTimestamp::new(TimestampRole::NetworkReceive, 100, "host_clock");
+        assert_eq!(timestamp.precision_us, 1, "storage granularity is retained");
+        assert_eq!(
+            timestamp.accuracy_us, None,
+            "no accuracy is implied by storage precision"
+        );
+        assert_eq!(
+            timestamp.synchronization,
+            ClockSynchronization::Unknown,
+            "synchronization starts unknown"
+        );
+        assert!(
+            timestamp.accuracy_claim_is_evidenced(),
+            "no claim needs no evidence"
+        );
+    }
+
+    #[test]
+    fn measured_timestamp_carries_clock_metadata() {
+        let timestamp = ObservedTimestamp::declare_measured(
+            TimestampRole::NetworkReceive,
+            100,
+            "nic_clock",
+            100,
+            Some(500),
+            Some(250),
+            ClockSynchronization::Ptp,
+        );
+        assert_eq!(timestamp.resolution_us, Some(100), "resolution retained");
+        assert_eq!(timestamp.accuracy_us, Some(500), "accuracy retained");
+        assert_eq!(timestamp.uncertainty_us, Some(250), "uncertainty retained");
+        assert_eq!(
+            timestamp.synchronization,
+            ClockSynchronization::Ptp,
+            "synchronization retained"
+        );
+        assert!(
+            timestamp.accuracy_claim_is_evidenced(),
+            "declared synchronization evidences the accuracy claim"
+        );
+    }
+
+    #[test]
+    fn envelope_rejects_unevidenced_accuracy_claim() {
+        let mut event = envelope();
+        event.timestamps[0].accuracy_us = Some(1);
+        assert_eq!(
+            event.validate(),
+            Err(EventModelError::UnevidencedAccuracyClaim),
+            "accuracy requires synchronization evidence"
+        );
+        event.timestamps[0].synchronization = ClockSynchronization::Ntp;
+        assert!(event.validate().is_ok(), "evidenced accuracy is accepted");
     }
 }

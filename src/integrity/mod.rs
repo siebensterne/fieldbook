@@ -2,6 +2,7 @@
 //! `integrity` domain module.
 
 pub mod completeness;
+pub mod conformance;
 pub mod coverage;
 pub mod journal;
 pub mod latency;

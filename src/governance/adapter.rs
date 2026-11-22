@@ -12,6 +12,10 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::{
+    governance::modality::{
+        AcquisitionModality, BatchCapability, DocumentCapability, OnChainCapability,
+        SnapshotCapability, StreamingCapability, validate_modalities,
+    },
     reference_data::VenueCategory,
     taxonomy::{AssetClass, CountryCode, DataCategory, DepthModel, Frequency},
 };
@@ -146,6 +150,24 @@ pub struct SourceCapabilityManifest {
     pub historical: HistoricalCapability,
     pub access: AccessStatus,
     pub schema_version: u32,
+    /// Acquisition modalities the connector genuinely implements.
+    #[serde(default)]
+    pub modalities: Vec<AcquisitionModality>,
+    /// Capability declaration for the streaming port, when declared.
+    #[serde(default)]
+    pub streaming: Option<StreamingCapability>,
+    /// Capability declaration for the snapshot port, when declared.
+    #[serde(default)]
+    pub snapshot: Option<SnapshotCapability>,
+    /// Capability declaration for the batch port, when declared.
+    #[serde(default)]
+    pub batch: Option<BatchCapability>,
+    /// Capability declaration for the document port, when declared.
+    #[serde(default)]
+    pub document: Option<DocumentCapability>,
+    /// Capability declaration for the on-chain port, when declared.
+    #[serde(default)]
+    pub on_chain: Option<OnChainCapability>,
 }
 
 impl SourceCapabilityManifest {
@@ -163,6 +185,7 @@ impl SourceCapabilityManifest {
         if self.schema_version == 0 {
             return Err(ManifestError::InvalidSchemaVersion);
         }
+        validate_modalities(self)?;
         Ok(())
     }
 }
@@ -185,6 +208,20 @@ pub enum ManifestError {
     /// Two different manifests claimed the same source identity.
     #[error("conflicting manifest for source {0}")]
     Conflict(String),
+    /// The manifest did not declare any acquisition modality.
+    #[error("at least one acquisition modality must be declared")]
+    MissingModalities,
+    /// A declared modality has no corresponding capability declaration.
+    #[error("modality {0} has no capability declaration")]
+    MissingModalityCapability(AcquisitionModality),
+    /// Declared protocols or transports cannot realize a declared modality.
+    #[error("modality {modality} is inconsistent with declared protocols or transports: {reason}")]
+    InconsistentModality {
+        /// Modality that could not be realized.
+        modality: AcquisitionModality,
+        /// Description of the inconsistency.
+        reason: &'static str,
+    },
 }
 
 /// Health of one connected source.
@@ -310,6 +347,22 @@ mod tests {
             },
             access: AccessStatus::Licensed,
             schema_version: 1,
+            modalities: vec![AcquisitionModality::Streaming],
+            streaming: Some(StreamingCapability {
+                continuous: true,
+                sequence_numbers: true,
+                recovery: RecoveryCapability {
+                    snapshot: true,
+                    incremental_recovery: true,
+                    packet_sequence: true,
+                    exchange_sequence: true,
+                    gap_request: true,
+                },
+            }),
+            snapshot: None,
+            batch: None,
+            document: None,
+            on_chain: None,
         }
     }
 
