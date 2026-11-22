@@ -32,9 +32,7 @@ MAX_COLUMNS = 100
 TAB = re.compile(r"\t")
 TRAILING_WS = re.compile(r"[ \t]+$")
 # Dotted globals that are namespaces, not column access.
-NAMESPACES = frozenset(
-    {".an", ".h", ".j", ".KU", ".m", ".pq", ".q", ".Q", ".z"}
-)
+NAMESPACES = frozenset({".an", ".h", ".j", ".KU", ".m", ".pq", ".q", ".Q", ".z"})
 
 
 def parse_added_lines(diff_text: str) -> dict[str, list[tuple[int, str]]]:
@@ -111,11 +109,7 @@ def check_lines(by_file: dict[str, list[tuple[int, str]]]) -> list[str]:
     for path, lines in by_file.items():
         depth = 0
         for number, content in lines:
-            code = (
-                content.split("/", 1)[0]
-                if content.strip().startswith("/")
-                else content
-            )
+            code = content.split("/", 1)[0] if content.strip().startswith("/") else content
             # A single-line lambda f:{[t] t.col} opens and closes on this line.
             in_lambda = depth > 0 or "{" in code
             for message in check_q_line(content, in_lambda=in_lambda):
@@ -150,9 +144,7 @@ class QStyleTests(unittest.TestCase):
 
     def test_long_line(self) -> None:
         """Lines over the shared q limit are rejected."""
-        self.assertTrue(
-            any("columns" in e for e in check_q_line("a:" + "x" * 120))
-        )
+        self.assertTrue(any("columns" in e for e in check_q_line("a:" + "x" * 120)))
 
     def test_dotted_column_in_lambda(self) -> None:
         """Dotted column access inside a lambda resolves to a global."""
@@ -183,9 +175,7 @@ class QStyleTests(unittest.TestCase):
     def test_diff_parser(self) -> None:
         """The unified diff parser records file and line numbers."""
         diff = "+++ b/x.q\n@@ -0,0 +1,2 @@\n+a:1\n+b:2\n"
-        self.assertEqual(
-            parse_added_lines(diff), {"x.q": [(1, "a:1"), (2, "b:2")]}
-        )
+        self.assertEqual(parse_added_lines(diff), {"x.q": [(1, "a:1"), (2, "b:2")]})
 
     def test_check_lines_reports_path(self) -> None:
         """Findings carry the file path and line number."""

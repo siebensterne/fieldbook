@@ -31,9 +31,7 @@ POLICY = Path(__file__).resolve().parent.parent / "git-policy.json"
 
 def git(*args: str) -> str:
     """Check git."""
-    result = subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=False
-    )
+    result = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)}: {result.stderr.strip()}")
     return result.stdout
@@ -59,13 +57,10 @@ def check_branch(policy: dict, branch: str) -> list[str]:
         return errors
     if prefix not in rule["allowed_topic_prefixes"]:
         allowed = ", ".join(rule["allowed_topic_prefixes"])
-        errors.append(
-            f"branch `{branch}`: prefix `{prefix}` is not one of {allowed}"
-        )
+        errors.append(f"branch `{branch}`: prefix `{prefix}` is not one of {allowed}")
     if not re.match(rule["topic_pattern"], topic):
         errors.append(
-            f"branch `{branch}`: topic `{topic}` does not match "
-            f"{rule['topic_pattern']}"
+            f"branch `{branch}`: topic `{topic}` does not match " f"{rule['topic_pattern']}"
         )
     return errors
 
@@ -78,18 +73,12 @@ def check_subjects(policy: dict, base: str) -> list[str]:
 
     try:
         subjects = [
-            line
-            for line in git("log", "--format=%s", f"{base}..HEAD").splitlines()
-            if line
+            line for line in git("log", "--format=%s", f"{base}..HEAD").splitlines() if line
         ]
     except RuntimeError:
         subjects = []
     if not subjects:
-        subjects = [
-            line
-            for line in git("log", "-1", "--format=%s").splitlines()
-            if line
-        ]
+        subjects = [line for line in git("log", "-1", "--format=%s").splitlines() if line]
 
     # This repository accepts only reviewed PR merge commits on its base
     # branch; GitHub generates their subjects, so they are exempt from the
@@ -108,10 +97,7 @@ def check_subjects(policy: dict, base: str) -> list[str]:
         if subject.strip().lower() in rule["forbidden_exact_subjects"]:
             errors.append(f"subject says nothing: `{subject}`")
         elif not pattern.match(subject):
-            errors.append(
-                f"subject does not match `type(scope): description`: "
-                f"`{subject}`"
-            )
+            errors.append(f"subject does not match `type(scope): description`: " f"`{subject}`")
     return errors
 
 
@@ -122,18 +108,14 @@ def check_authors(policy: dict, base: str) -> list[str]:
         return []
     try:
         authors = [
-            line
-            for line in git("log", "--format=%ae", f"{base}..HEAD").splitlines()
-            if line
+            line for line in git("log", "--format=%ae", f"{base}..HEAD").splitlines() if line
         ]
     except RuntimeError:
         authors = []
     if not authors:
         authors = [git("log", "-1", "--format=%ae").strip()]
     return [
-        f"commit author `{author}` is not `{expected}`"
-        for author in authors
-        if author != expected
+        f"commit author `{author}` is not `{expected}`" for author in authors if author != expected
     ]
 
 
@@ -154,20 +136,14 @@ def check_generated(policy: dict) -> list[str]:
         parts = path.split("/")
         for part in parts:
             if part in components:
-                errors.append(
-                    f"tracked generated path: `{path}` (component `{part}`)"
-                )
+                errors.append(f"tracked generated path: `{path}` (component `{part}`)")
                 break
             if prefixes and part.startswith(prefixes):
-                errors.append(
-                    f"tracked generated path: `{path}` (component `{part}`)"
-                )
+                errors.append(f"tracked generated path: `{path}` (component `{part}`)")
                 break
         else:
             if suffixes and path.endswith(suffixes):
-                errors.append(
-                    f"tracked generated path: `{path}` (forbidden suffix)"
-                )
+                errors.append(f"tracked generated path: `{path}` (forbidden suffix)")
     return errors
 
 
@@ -178,36 +154,26 @@ def check_inventory(policy: dict, branch: str) -> list[str]:
 
     branches = sorted(
         line
-        for line in git(
-            "for-each-ref", "--format=%(refname:short)", "refs/heads"
-        ).splitlines()
+        for line in git("for-each-ref", "--format=%(refname:short)", "refs/heads").splitlines()
         if line
     )
     # The policy's inventory describes the state after a change is merged.
     # An active topic branch is expected while work is in progress, so local
     # branch equality is enforced only when checked out on the base branch.
-    if branch == policy["branch"]["base"] and branches != sorted(
-        rule["target_local_branches"]
-    ):
+    if branch == policy["branch"]["base"] and branches != sorted(rule["target_local_branches"]):
         errors.append(
-            f"local branches are {branches}, target is "
-            f"{sorted(rule['target_local_branches'])}"
+            f"local branches are {branches}, target is " f"{sorted(rule['target_local_branches'])}"
         )
 
     remotes = sorted(line for line in git("remote").splitlines() if line)
     if remotes != sorted(rule["target_remote_names"]):
-        errors.append(
-            f"remotes are {remotes}, target is "
-            f"{sorted(rule['target_remote_names'])}"
-        )
+        errors.append(f"remotes are {remotes}, target is " f"{sorted(rule['target_remote_names'])}")
 
     # `%(refname:short)` collapses `refs/remotes/origin/HEAD` to `origin`, which
     # looks like a fourth target; filter the symbolic ref by its full name.
     tracking = sorted(
         ref.removeprefix("refs/remotes/")
-        for ref in git(
-            "for-each-ref", "--format=%(refname)", "refs/remotes"
-        ).splitlines()
+        for ref in git("for-each-ref", "--format=%(refname)", "refs/remotes").splitlines()
         if ref and not ref.endswith("/HEAD")
     )
     if tracking != sorted(rule["target_remote_tracking_branches"]):
@@ -218,16 +184,11 @@ def check_inventory(policy: dict, branch: str) -> list[str]:
 
     worktrees = git("worktree", "list", "--porcelain").count("worktree ")
     if worktrees != rule["target_worktree_count"]:
-        errors.append(
-            f"{worktrees} worktree(s), target is "
-            f"{rule['target_worktree_count']}"
-        )
+        errors.append(f"{worktrees} worktree(s), target is " f"{rule['target_worktree_count']}")
 
     stashes = len([line for line in git("stash", "list").splitlines() if line])
     if stashes != rule["target_stash_count"]:
-        errors.append(
-            f"{stashes} stash(es), target is {rule['target_stash_count']}"
-        )
+        errors.append(f"{stashes} stash(es), target is {rule['target_stash_count']}")
 
     return errors
 
@@ -246,13 +207,9 @@ def check_clean(policy: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     """Check main."""
-    parser = argparse.ArgumentParser(
-        description="Validate the working copy against the git policy"
-    )
+    parser = argparse.ArgumentParser(description="Validate the working copy against the git policy")
     parser.add_argument("--policy", type=Path, default=POLICY)
-    parser.add_argument(
-        "--base", default=None, help="defaults to the policy's base branch"
-    )
+    parser.add_argument("--base", default=None, help="defaults to the policy's base branch")
     parser.add_argument(
         "--strict",
         action="store_true",

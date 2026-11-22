@@ -34,10 +34,7 @@ def validate() -> list[str]:
     if "signature =" in manifest:
         errors.append("unused direct `signature` dependency returned")
     for line in manifest.splitlines():
-        if (
-            line.startswith("chrono =")
-            and "default-features = false" not in line
-        ):
+        if line.startswith("chrono =") and "default-features = false" not in line:
             errors.append("chrono must not enable default features")
         if line.startswith("clap =") and '"env"' in line:
             errors.append("clap env feature is unused")
@@ -58,10 +55,7 @@ def validate() -> list[str]:
         if "SCHEMA_VERSION: u16 = 2" not in codec:
             errors.append("generated codec lost schema version 2")
 
-    if (
-        "[profile.dev]" in manifest
-        and 'debug = "line-tables-only"' not in manifest
-    ):
+    if "[profile.dev]" in manifest and 'debug = "line-tables-only"' not in manifest:
         errors.append("dev profile lost line-table-only debug information")
     if '[profile.dev.package."*"]' in manifest and "debug = 0" not in manifest:
         errors.append("dependency debug information must stay disabled")

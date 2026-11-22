@@ -65,9 +65,7 @@ class GeneratedPathTests(unittest.TestCase):
             (root / "docs").mkdir()
             (root / "docs" / ".DS_Store").write_text("junk", encoding="utf-8")
             errors = validate(root)
-            self.assertTrue(
-                any("untracked path" in error for error in errors), errors
-            )
+            self.assertTrue(any("untracked path" in error for error in errors), errors)
 
 
 if __name__ == "__main__":

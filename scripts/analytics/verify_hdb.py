@@ -57,32 +57,20 @@ def compare(verify: dict, queries: dict, manifest: dict) -> dict[str, str]:
     """Compare q results with the export manifest."""
     rows = manifest["row_counts"]
     checks: dict[str, str] = {}
-    checks["q_counts"] = (
-        PASS if verify["rows"] == [rows[name] for name in DATASETS] else FAIL
-    )
+    checks["q_counts"] = PASS if verify["rows"] == [rows[name] for name in DATASETS] else FAIL
     checks["journal_rows"] = (
         PASS if queries["journal_rows"] == rows["journal_observation"] else FAIL
     )
-    checks["message_rows"] = (
-        PASS if queries["message_rows"] == rows["sbe_message"] else FAIL
-    )
-    checks["level_rows"] = (
-        PASS if queries["level_rows"] == rows["sbe_book_level"] else FAIL
-    )
+    checks["message_rows"] = PASS if queries["message_rows"] == rows["sbe_message"] else FAIL
+    checks["level_rows"] = PASS if queries["level_rows"] == rows["sbe_book_level"] else FAIL
     checks["instrument_rows"] = (
-        PASS
-        if queries["instrument_rows"] == rows["capture_instrument"]
-        else FAIL
+        PASS if queries["instrument_rows"] == rows["capture_instrument"] else FAIL
     )
-    checks["coverage_symbols"] = (
-        PASS if queries["coverage_symbols"] > 0 else FAIL
-    )
+    checks["coverage_symbols"] = PASS if queries["coverage_symbols"] > 0 else FAIL
     return checks
 
 
-def build_and_verify(
-    export: Path, hdb: Path, release: str
-) -> tuple[dict, dict]:
+def build_and_verify(export: Path, hdb: Path, release: str) -> tuple[dict, dict]:
     """Build one release, then verify and query it in fresh q processes."""
     target = hdb / "releases" / release
     if target.exists():
@@ -109,15 +97,11 @@ def certify(export: Path, hdb: Path) -> dict:
     second = build_and_verify(export, hdb, f"rebuild-b-{export_id[:12]}")
     second_digest = (logical_digest(second[0]), logical_digest(second[1]))
     checks = compare(first[0], first[1], manifest)
-    checks["rebuild_reconciles"] = (
-        PASS if first_digest == second_digest else FAIL
-    )
+    checks["rebuild_reconciles"] = PASS if first_digest == second_digest else FAIL
     return {
         "certificate": "analytics-hdb",
         "export_id": export_id,
-        "status": PASS
-        if all(value == PASS for value in checks.values())
-        else FAIL,
+        "status": PASS if all(value == PASS for value in checks.values()) else FAIL,
         "checks": checks,
         "logical_digests": {
             "first": first_digest,
@@ -125,8 +109,7 @@ def certify(export: Path, hdb: Path) -> dict:
         },
         "notes": [
             f"concurrent_query_serving: {NOT_APPLICABLE} for a local HDB",
-            f"uint64_to_long_range: {NOT_MEASURED} beyond 2^63-1; "
-            "values are checked at import",
+            f"uint64_to_long_range: {NOT_MEASURED} beyond 2^63-1; " "values are checked at import",
         ],
     }
 
@@ -135,9 +118,7 @@ def main() -> int:
     """Write an HDB certificate and exit with a bounded status."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--export-dir", type=Path, required=True)
-    parser.add_argument(
-        "--hdb-root", type=Path, default=ROOT / ".local/analytics/hdb"
-    )
+    parser.add_argument("--hdb-root", type=Path, default=ROOT / ".local/analytics/hdb")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
     try:

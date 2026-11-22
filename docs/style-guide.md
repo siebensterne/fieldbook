@@ -57,7 +57,7 @@ Rustdoc rejects broken intra-doc links. Do not add an `allow` where an
 ## Python
 
 Pyink is Google's Black fork and implements the guide's 4-space indentation,
-80-column lines and majority-quote rule. Its settings are in `pyproject.toml`.
+100-column lines and majority-quote rule. Its settings are in `pyproject.toml`.
 Ruff enforces pycodestyle, pyflakes, isort ordering, naming, Google-convention
 docstrings, pyupgrade, bugbear, simplification, blind-except, PIE, return,
 Ruff-specific rules and annotations. Its settings are in `ruff.toml`. Every
@@ -163,7 +163,7 @@ scripts/assurance/polish.sh --loop 2
 
 Three Python files hold long vocabulary, regex and responsibility-map
   string constants. They are exempt from E501 in `ruff.toml` and from
-  the 80-column line check by name in `scripts/check_style.py`; both lists
+  the 100-column line check by name in `scripts/check_style.py`; both lists
   must stay in lockstep.
 - Immutable evidence and the raw wire fixture are excluded from formatting.
 - The Google JSON API naming rule does not apply to persisted schema fields.

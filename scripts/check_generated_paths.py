@@ -57,9 +57,7 @@ def validate(root: Path) -> list[str]:
     """Exercise validate."""
     policy = load_policy(root)
     tracked = git_paths(root, ["ls-files", "-z"])
-    untracked = git_paths(
-        root, ["ls-files", "--others", "--exclude-standard", "-z"]
-    )
+    untracked = git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"])
     errors: list[str] = []
     for source, paths in (("tracked", tracked), ("untracked", untracked)):
         for path in paths:
@@ -82,10 +80,7 @@ def main() -> int:
         for error in errors:
             print(f"  - {error}")
         return 1
-    print(
-        "[PASS] no forbidden generated paths in tracked or "
-        "untracked source files"
-    )
+    print("[PASS] no forbidden generated paths in tracked or " "untracked source files")
     return 0
 
 

@@ -8,9 +8,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "check_naming_conventions.py"
-SPEC = importlib.util.spec_from_file_location(
-    "check_naming_conventions", SCRIPT
-)
+SPEC = importlib.util.spec_from_file_location("check_naming_conventions", SCRIPT)
 check_naming_conventions = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = check_naming_conventions
 SPEC.loader.exec_module(check_naming_conventions)
@@ -22,9 +20,7 @@ class NamingConventionTests(unittest.TestCase):
     def test_phase_label_in_active_path_is_rejected(self) -> None:
         """Check that a phase-prefixed test name is a finding."""
         self.assertEqual(
-            check_naming_conventions.phase_label_findings(
-                ["tests/p6_durable_pipeline.rs"]
-            ),
+            check_naming_conventions.phase_label_findings(["tests/p6_durable_pipeline.rs"]),
             ["tests/p6_durable_pipeline.rs"],
         )
 

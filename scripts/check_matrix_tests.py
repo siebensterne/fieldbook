@@ -68,8 +68,7 @@ REQUIRED_EVIDENCE_TESTS = frozenset(
 
 ID_RE = re.compile(r"^([MEP])(\d+)$")
 REFERENCE_RE = re.compile(
-    r"^(?P<file>(?:src|tests)/[A-Za-z0-9_./-]+\.rs)::"
-    r"(?P<test>[A-Za-z_][A-Za-z0-9_]*)$"
+    r"^(?P<file>(?:src|tests)/[A-Za-z0-9_./-]+\.rs)::" r"(?P<test>[A-Za-z_][A-Za-z0-9_]*)$"
 )
 BARE_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$")
 BACKTICK_RE = re.compile(r"`([^`]+)`")
@@ -138,9 +137,7 @@ def split_row(line: str) -> list[str]:
 
 def evidence_columns(header: list[str]) -> list[int]:
     """Column indexes whose heading declares evidence content."""
-    return [
-        index for index, name in enumerate(header) if "evidence" in name.lower()
-    ]
+    return [index for index, name in enumerate(header) if "evidence" in name.lower()]
 
 
 def scan_matrix(markdown: str) -> list[Row]:
@@ -258,15 +255,12 @@ def discover_tests(root: Path = ROOT) -> dict[str, set[str]]:
             relative = path.relative_to(root).as_posix()
             content = path.read_text(encoding="utf-8")
             discovered[relative] = {
-                match.group(1)
-                for match in TEST_DECL_RE.finditer(mask_non_code(content))
+                match.group(1) for match in TEST_DECL_RE.finditer(mask_non_code(content))
             }
     return discovered
 
 
-def classify(
-    span: Span, known_names: set[str]
-) -> tuple[Reference | None, str | None]:
+def classify(span: Span, known_names: set[str]) -> tuple[Reference | None, str | None]:
     """Resolve one span, returning either a reference or a rejection reason."""
     text = span.text
     if not text:
@@ -306,9 +300,7 @@ def validate(
 ) -> tuple[list[str], list[Reference]]:
     """Return validation errors and every resolved reference."""
     rows = scan_matrix(markdown)
-    known_names = (
-        set().union(*tests_by_file.values()) if tests_by_file else set()
-    )
+    known_names = set().union(*tests_by_file.values()) if tests_by_file else set()
     errors: list[str] = []
     references: list[Reference] = []
     seen: dict[str, int] = {}
@@ -323,9 +315,7 @@ def validate(
         else:
             seen[row.requirement] = row.line
         if row.requirement not in required_requirements:
-            errors.append(
-                f"line {row.line}: unexpected requirement ID {row.requirement}"
-            )
+            errors.append(f"line {row.line}: unexpected requirement ID {row.requirement}")
 
         resolved: list[Reference] = []
         for span in row.spans:
@@ -345,21 +335,16 @@ def validate(
 
     for reference in references:
         if reference.file not in tests_by_file:
-            errors.append(
-                f"line {reference.line}: {reference.file} does not exist"
-            )
+            errors.append(f"line {reference.line}: {reference.file} does not exist")
         elif reference.test not in tests_by_file[reference.file]:
             errors.append(
-                f"line {reference.line}: {reference.test} is not declared in "
-                f"{reference.file}"
+                f"line {reference.line}: {reference.test} is not declared in " f"{reference.file}"
             )
 
     present = {reference.test for reference in references}
     for name in sorted(required_tests):
         if name not in present:
-            errors.append(
-                f"mandatory evidence test is missing from the matrix: {name}"
-            )
+            errors.append(f"mandatory evidence test is missing from the matrix: {name}")
 
     return errors, references
 
@@ -383,17 +368,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.verbose:
         for reference in references:
-            print(
-                f"[ok] line {reference.line}: "
-                f"{reference.file}::{reference.test}"
-            )
+            print(f"[ok] line {reference.line}: " f"{reference.file}::{reference.test}")
 
     if errors:
         for error in errors:
             print(f"[FAIL] {error}", file=sys.stderr)
         print(
-            f"[FAIL] {len(errors)} requirement-matrix error(s) "
-            f"in {args.matrix.name}",
+            f"[FAIL] {len(errors)} requirement-matrix error(s) " f"in {args.matrix.name}",
             file=sys.stderr,
         )
         return 1

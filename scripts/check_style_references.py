@@ -75,8 +75,7 @@ def check(root: Path = ROOT) -> list[str]:
         actual = hashlib.sha256(data).hexdigest()
         if actual != expected:
             errors.append(
-                f"reference {name} digest mismatch: "
-                f"expected {expected}, found {actual}"
+                f"reference {name} digest mismatch: " f"expected {expected}, found {actual}"
             )
     return errors
 

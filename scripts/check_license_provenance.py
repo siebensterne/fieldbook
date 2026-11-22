@@ -46,11 +46,7 @@ EXCLUDED = (
 
 def base_ref() -> str:
     """Return the configured comparison ref."""
-    return (
-        os.environ.get("QUALITY_STYLE_BASE")
-        or os.environ.get("STYLE_BASE")
-        or "main"
-    )
+    return os.environ.get("QUALITY_STYLE_BASE") or os.environ.get("STYLE_BASE") or "main"
 
 
 def added_paths(root: Path = ROOT, base: str | None = None) -> list[str]:
@@ -72,15 +68,11 @@ def added_paths(root: Path = ROOT, base: str | None = None) -> list[str]:
         text=True,
         cwd=root,
     )
-    paths = set(tracked.stdout.splitlines()) | set(
-        untracked.stdout.splitlines()
-    )
+    paths = set(tracked.stdout.splitlines()) | set(untracked.stdout.splitlines())
     return sorted(
         path
         for path in paths
-        if path.endswith(AUTHORED)
-        and not path.startswith(EXCLUDED)
-        and (root / path).is_file()
+        if path.endswith(AUTHORED) and not path.startswith(EXCLUDED) and (root / path).is_file()
     )
 
 
@@ -123,9 +115,7 @@ class ProvenanceTests(unittest.TestCase):
         """A header in the first lines is accepted."""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "example.py"
-            path.write_text(
-                f"#!/usr/bin/env python3\n# {SPDX}\n", encoding="utf-8"
-            )
+            path.write_text(f"#!/usr/bin/env python3\n# {SPDX}\n", encoding="utf-8")
             self.assertEqual(check_spdx("example.py", Path(directory)), [])
 
     def test_spdx_missing(self) -> None:
@@ -145,12 +135,8 @@ class ProvenanceTests(unittest.TestCase):
         """Notice content is mandatory."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "LICENSE").write_text(
-                "Apache License\nVersion 2.0\n", encoding="utf-8"
-            )
-            (root / "NOTICE").write_text(
-                "Copyright 2026 Someone\n", encoding="utf-8"
-            )
+            (root / "LICENSE").write_text("Apache License\nVersion 2.0\n", encoding="utf-8")
+            (root / "NOTICE").write_text("Copyright 2026 Someone\n", encoding="utf-8")
             errors = check_notice(root)
             self.assertTrue(any("author email" in error for error in errors))
 
@@ -158,9 +144,7 @@ class ProvenanceTests(unittest.TestCase):
 def main() -> int:
     """Print findings and return a process exit status."""
     if "--self-test" in sys.argv[1:]:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
-            ProvenanceTests
-        )
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(ProvenanceTests)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1
     findings = validate()

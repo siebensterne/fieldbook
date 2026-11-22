@@ -17,11 +17,7 @@ EVIDENCE_PREFIXES = ("measurements/", "captures/")
 def tracked_paths(root: Path) -> list[str]:
     """Return every path recorded in the Git index."""
     raw = subprocess.check_output(["git", "-C", str(root), "ls-files", "-z"])
-    return [
-        part.decode("utf-8", "surrogateescape")
-        for part in raw.split(b"\0")
-        if part
-    ]
+    return [part.decode("utf-8", "surrogateescape") for part in raw.split(b"\0") if part]
 
 
 def phase_label_findings(paths: list[str]) -> list[str]:

@@ -1,16 +1,32 @@
 # Repository task entry point.
 #
-# The Makefile is a thin, deterministic façade over `cargo xtask`, which owns
+# The Makefile is a thin, deterministic facade over `cargo xtask`, which owns
 # the authoritative gate definitions. Style rules follow the Linux kernel
 # coding guidelines and the Google Python, Shell, Markdown, JSON and Rust
 # style guides; see docs/style-guide.md.
 #
+# Command surface (`make help` prints the same list):
+#   check        full gate: style plus CI parity
+#   check-static fmt, lint, docs and style; no tests
+#   ci           full CI parity task
+#   assure       full assurance superset
+#   fmt          non-mutating rustfmt check
+#   format-fix   apply the mutating Python and Markdown style fixes
+#   lint         clippy with warnings denied
+#   test         all-target and doc tests
+#   docs         rustdoc with broken links denied
+#   style        every non-Rust language and policy gate
+#   e2e          curated end-to-end suites
+#   verify       matrix, architecture and generated-path gates
+#   tools        install the pinned Python tools
+#
 # Recipe lines use tabs (required by make). Every target is phony: there is no
 # file produced by any target name, so `.PHONY` prevents stale-file skips.
 
-.PHONY: all check ci style style-fix fmt lint test docs e2e verify \
-	python-check ruff-check q-check standards-check python-fmt shell-check \
-	json-check markdown-check makefile-check rust-check tools
+.PHONY: all help check check-static ci assure style format-fix fmt lint test \
+	docs e2e verify python-check ruff-check q-check standards-check \
+	python-fmt shell-check json-check markdown-check makefile-check \
+	rust-check tools
 
 .DEFAULT_GOAL := check
 
@@ -18,18 +34,43 @@ SHELL := /bin/bash
 
 all: check
 
+help:
+	@echo "check        full gate: style plus CI parity"
+	@echo "check-static fmt, lint, docs and style; no tests"
+	@echo "ci           full CI parity task"
+	@echo "assure       full assurance superset"
+	@echo "fmt          non-mutating rustfmt check"
+	@echo "format-fix   apply mutating Python and Markdown style fixes"
+	@echo "lint         clippy with warnings denied"
+	@echo "test         all-target and doc tests"
+	@echo "docs         rustdoc with broken links denied"
+	@echo "style        every non-Rust language and policy gate"
+	@echo "e2e          curated end-to-end suites"
+	@echo "verify       matrix, architecture and generated-path gates"
+	@echo "tools        install the pinned Python tools"
+
 check: style ci
 
 ci:
 	cargo xtask ci
 
-fmt: style-fix
+assure:
+	cargo xtask assure
+
+check-static:
+	cargo xtask fmt
+	cargo xtask lint
+	cargo xtask docs
+	cargo xtask style
+
+fmt:
+	cargo xtask fmt
+
+format-fix:
+	python3 scripts/check_style.py --fix
 
 style: python-check ruff-check q-check standards-check shell-check \
 	json-check markdown-check makefile-check
-
-style-fix:
-	python3 scripts/check_style.py --fix
 
 python-check:
 	python3 scripts/check_style.py --python
@@ -69,7 +110,8 @@ rust-check:
 	cargo xtask fmt
 	cargo xtask lint
 
-lint: rust-check python-check ruff-check q-check standards-check shell-check
+lint:
+	cargo xtask lint
 
 test:
 	cargo xtask test

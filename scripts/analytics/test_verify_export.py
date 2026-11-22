@@ -11,15 +11,11 @@ from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
 try:
-    SPEC = importlib.util.spec_from_file_location(
-        "export_parquet", BASE / "export_parquet.py"
-    )
+    SPEC = importlib.util.spec_from_file_location("export_parquet", BASE / "export_parquet.py")
     export_parquet = importlib.util.module_from_spec(SPEC)
     sys.modules[SPEC.name] = export_parquet
     SPEC.loader.exec_module(export_parquet)
-    SPEC2 = importlib.util.spec_from_file_location(
-        "verify_export", BASE / "verify_export.py"
-    )
+    SPEC2 = importlib.util.spec_from_file_location("verify_export", BASE / "verify_export.py")
     verify_export = importlib.util.module_from_spec(SPEC2)
     sys.modules[SPEC2.name] = verify_export
     SPEC2.loader.exec_module(verify_export)
@@ -62,9 +58,7 @@ class ExportVerifierTests(unittest.TestCase):
                 schema = export_parquet.SCHEMAS[name]
                 row = sample_row(schema)
                 rows[name] = row
-                (staging / f"{name}.ndjson").write_text(
-                    json.dumps(row) + "\n", encoding="utf-8"
-                )
+                (staging / f"{name}.ndjson").write_text(json.dumps(row) + "\n", encoding="utf-8")
             manifest = {
                 "schema_version": 1,
                 "capture_id": "a" * 64,
@@ -73,9 +67,7 @@ class ExportVerifierTests(unittest.TestCase):
                 "row_counts": dict.fromkeys(export_parquet.DATASETS, 1),
                 "verification_results": {"journal": True, "sbe": True},
             }
-            (staging / "export-manifest.json").write_text(
-                json.dumps(manifest), encoding="utf-8"
-            )
+            (staging / "export-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             exports = root / "exports"
             args = type(
                 "Args",
@@ -90,18 +82,14 @@ class ExportVerifierTests(unittest.TestCase):
             published = exports / manifest["export_id"]
             certificate = verify_export.verify_export(published)
             self.assertEqual(certificate["status"], "PASS")
-            self.assertEqual(
-                certificate["checks"]["journal_provenance_label"], "PASS"
-            )
+            self.assertEqual(certificate["checks"]["journal_provenance_label"], "PASS")
 
     def test_missing_artifact_is_incomplete(self) -> None:
         """Check that a missing artifact never certifies."""
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "export-manifest.json").write_text("{}", encoding="utf-8")
-            (root / "export-manifest.sha256").write_text(
-                "0" * 64, encoding="utf-8"
-            )
+            (root / "export-manifest.sha256").write_text("0" * 64, encoding="utf-8")
             certificate = verify_export.verify_export(root)
             self.assertEqual(certificate["status"], "FAIL")
 

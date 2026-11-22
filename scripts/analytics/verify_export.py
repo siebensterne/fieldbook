@@ -60,14 +60,10 @@ def verify_export(export_dir: Path) -> dict:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     details["export_id"] = manifest.get("export_id")
     details["capture_id"] = manifest.get("capture_id")
-    details["journal_provenance_status"] = manifest.get(
-        "journal_provenance_status", NOT_MEASURED
-    )
+    details["journal_provenance_status"] = manifest.get("journal_provenance_status", NOT_MEASURED)
 
     upstream = manifest.get("verification_results", {})
-    checks["upstream_verification"] = status(
-        bool(upstream) and all(upstream.values())
-    )
+    checks["upstream_verification"] = status(bool(upstream) and all(upstream.values()))
     checks["journal_provenance_label"] = status(
         manifest.get("journal_provenance_status") == "legacy_incomplete"
     )
@@ -91,9 +87,7 @@ def verify_export(export_dir: Path) -> dict:
         count = pq.read_table(parquet_path).num_rows
         row_counts[name] = count
         rows_match = rows_match and count == entry["rows"]
-        artifacts_match = artifacts_match and (
-            sha256_file(parquet_path) == entry["parquet_sha256"]
-        )
+        artifacts_match = artifacts_match and (sha256_file(parquet_path) == entry["parquet_sha256"])
         logical_match = logical_match and (
             ndjson_logical(source_path) == entry["logical_content_sha256"]
         )

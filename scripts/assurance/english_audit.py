@@ -101,20 +101,14 @@ def git(repo: Path, *args: str) -> bytes:
     )
     if proc.returncode != 0:
         detail = proc.stderr.decode("utf-8", "replace").strip()
-        raise RuntimeError(
-            f"git {' '.join(args)} failed ({proc.returncode}): {detail}"
-        )
+        raise RuntimeError(f"git {' '.join(args)} failed ({proc.returncode}): {detail}")
     return proc.stdout
 
 
 def tracked_paths(repo: Path) -> list[Path]:
     """Exercise tracked paths."""
     raw = git(repo, "ls-files", "-z", "--cached")
-    return [
-        Path(p.decode("utf-8", "surrogateescape"))
-        for p in raw.split(b"\0")
-        if p
-    ]
+    return [Path(p.decode("utf-8", "surrogateescape")) for p in raw.split(b"\0") if p]
 
 
 def _prose_lines(text: str, source: str) -> list[tuple[int, str]]:
@@ -180,12 +174,8 @@ def _prose_lines(text: str, source: str) -> list[tuple[int, str]]:
             # Inline code is a literal value or identifier, not prose.
             clean = re.sub(r"`[^`]*`", "", clean)
             # Mermaid node identifiers such as `Source --> Target` are diagram symbols.  # english-audit-ignore: literal diagram identifier example
-            clean = re.sub(
-                r"(?<!\w)I(?=\s*(?:-->|---|==>|-.->|\[|\{))", "NODE", clean
-            )
-            clean = re.sub(
-                r"(?<=-->)\s*I(?=\s*(?:-->|---|==>|-.->|\[|\{))", "NODE", clean
-            )
+            clean = re.sub(r"(?<!\w)I(?=\s*(?:-->|---|==>|-.->|\[|\{))", "NODE", clean)
+            clean = re.sub(r"(?<=-->)\s*I(?=\s*(?:-->|---|==>|-.->|\[|\{))", "NODE", clean)
             visible.append((n, clean))
         return visible
 
@@ -226,9 +216,7 @@ def is_excluded(path: str, excludes: Iterable[str]) -> bool:
     return any(fnmatch.fnmatch(path, rule) for rule in excludes)
 
 
-def scan_tracked_tree(
-    repo: Path, excludes: Iterable[str] = ()
-) -> tuple[list[Finding], dict]:
+def scan_tracked_tree(repo: Path, excludes: Iterable[str] = ()) -> tuple[list[Finding], dict]:
     """Exercise scan tracked tree."""
     findings: list[Finding] = []
     stats = {
@@ -256,18 +244,14 @@ def scan_tracked_tree(
         try:
             text = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
-            stats["unreadable_files"].append(
-                {"path": path, "reason": f"not UTF-8: {exc}"}
-            )
+            stats["unreadable_files"].append({"path": path, "reason": f"not UTF-8: {exc}"})
             continue
         stats["scanned_text_files"] += 1
         findings.extend(scan_text(text, path))
     return findings, stats
 
 
-def scan_commit_history(
-    repo: Path, revision_range: str | None = None
-) -> list[Finding]:
+def scan_commit_history(repo: Path, revision_range: str | None = None) -> list[Finding]:
     # Record delimiter and field delimiter are control bytes that cannot occur in Git subjects.
     """Exercise scan commit history."""
     args = ["log", "--format=%H%x1f%s%x1f%b%x1e"]
@@ -338,9 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         default=[],
         help="Git path glob to exclude; repeat as needed",
     )
-    parser.add_argument(
-        "--json-out", type=Path, help="Write machine-readable report"
-    )
+    parser.add_argument("--json-out", type=Path, help="Write machine-readable report")
     args = parser.parse_args(argv)
 
     repo = args.repo.resolve()
@@ -348,9 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         top = Path(git(repo, "rev-parse", "--show-toplevel").decode().strip())
         findings, stats = scan_tracked_tree(top, args.exclude)
         if args.include_history and args.history_range:
-            raise RuntimeError(
-                "choose either --include-history or --history-range"
-            )
+            raise RuntimeError("choose either --include-history or --history-range")
         if args.include_history:
             findings.extend(scan_commit_history(top))
         elif args.history_range:
@@ -368,11 +348,7 @@ def main(argv: list[str] | None = None) -> int:
         + (
             " plus all reachable commit subjects and bodies"
             if args.include_history
-            else (
-                f" plus commit range {args.history_range}"
-                if args.history_range
-                else ""
-            )
+            else (f" plus commit range {args.history_range}" if args.history_range else "")
         ),
         "stats": stats,
         "summary": summarize(findings),
@@ -383,20 +359,14 @@ def main(argv: list[str] | None = None) -> int:
             "automatic_rewrites": False,
         },
     }
-    print(
-        json.dumps(
-            {k: v for k, v in payload.items() if k != "findings"}, indent=2
-        )
-    )
+    print(json.dumps({k: v for k, v in payload.items() if k != "findings"}, indent=2))
     for f in findings:
         print(
             f"{f.severity.upper():6} {f.source}:{f.line}: [{f.category}] {f.phrase!r} :: {f.context}"
         )
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(
-            json.dumps(payload, indent=2) + "\n", encoding="utf-8"
-        )
+        args.json_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     if args.fail_on_review and findings:
         return 1
     if args.strict and any(f.category == "tautology" for f in findings):

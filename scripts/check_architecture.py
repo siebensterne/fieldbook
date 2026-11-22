@@ -92,9 +92,7 @@ def mask_rust(source: str) -> str:
 # Anchors that are legitimately string literals: venue wire field names and an
 # explicit fail-closed error message. They describe data/contracts, not calls,
 # so matching them against raw source is intentional and narrowly allowed.
-LITERAL_ANCHORS = frozenset(
-    {"tickSz", "lotSz", "network discovery is not implemented"}
-)
+LITERAL_ANCHORS = frozenset({"tickSz", "lotSz", "network discovery is not implemented"})
 
 # Every tracked Rust source module must have an assigned responsibility.
 SOURCE_RESPONSIBILITIES = {
@@ -309,9 +307,7 @@ REQUIRED_ANCHORS = {
         "parse_reference_document",
         "parse_spot_meta",
     ],
-    "src/acquisition/exchange/hyperliquid/discovery.rs": [
-        "discover_with_stats"
-    ],
+    "src/acquisition/exchange/hyperliquid/discovery.rs": ["discover_with_stats"],
     "src/acquisition/exchange/hyperliquid/books.rs": [
         "CHANNEL_L2_BOOK",
         "CHANNEL_TRADES",
@@ -533,12 +529,8 @@ REFERENCE_APP_FORBIDDEN_TOKENS = (
 )
 
 MERMAID_RE = re.compile(r"```mermaid\s*\n(.*?)\n```", re.DOTALL)
-NODE_RE = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\n]*\]|\([^\n]*\)|\{[^\n]*\})\s*$"
-)
-EDGE_RE = re.compile(
-    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+-->\s+([A-Za-z_][A-Za-z0-9_]*)\s*$"
-)
+NODE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\n]*\]|\([^\n]*\)|\{[^\n]*\})\s*$")
+EDGE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+-->\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
 
 
 MODULE_DECL_RE = re.compile(
@@ -581,9 +573,7 @@ def collect_module_reachability(root: Path = ROOT) -> set[str]:
                 module_dir / f"{name}.rs",
                 module_dir / name / "mod.rs",
             ]
-            found = [
-                candidate for candidate in candidates if candidate.exists()
-            ]
+            found = [candidate for candidate in candidates if candidate.exists()]
             if len(found) == 1:
                 pending.append(found[0])
     return reachable
@@ -594,9 +584,7 @@ def module_integration_errors(root: Path = ROOT) -> list[str]:
     errors: list[str] = []
 
     # Check active source files reference missing dependencies
-    config = mask_rust(
-        (root / "src/governance/config.rs").read_text(encoding="utf-8")
-    )
+    config = mask_rust((root / "src/governance/config.rs").read_text(encoding="utf-8"))
     capacity_path = root / "src/storage/capacity.rs"
     if capacity_path.exists():
         capacity = mask_rust(capacity_path.read_text(encoding="utf-8"))
@@ -614,11 +602,7 @@ def module_integration_errors(root: Path = ROOT) -> list[str]:
                 f"src/storage/capacity.rs references CollectorSettings.{field}, absent from src/governance/config.rs"
             )
     catalog_path = root / "src/storage/catalog.rs"
-    catalog = (
-        mask_rust(catalog_path.read_text(encoding="utf-8"))
-        if catalog_path.exists()
-        else ""
-    )
+    catalog = mask_rust(catalog_path.read_text(encoding="utf-8")) if catalog_path.exists() else ""
     if catalog_path.exists() and "util::sha256_hex" in catalog:
         util_text = "\n".join(
             mask_rust(path.read_text(encoding="utf-8"))
@@ -629,9 +613,7 @@ def module_integration_errors(root: Path = ROOT) -> list[str]:
                 "src/storage/catalog.rs references util::sha256_hex, but no such function exists under src/util/"
             )
 
-    coordinator = mask_rust(
-        (root / "src/distribution/coordinator.rs").read_text(encoding="utf-8")
-    )
+    coordinator = mask_rust((root / "src/distribution/coordinator.rs").read_text(encoding="utf-8"))
     required = {
         "capacity startup": "capacity::plan(&settings, &initial_markets)",
         "capacity refresh admission": "capacity::plan_fixed_topology(&settings, &markets, &loads)",
@@ -643,9 +625,7 @@ def module_integration_errors(root: Path = ROOT) -> list[str]:
     }
     for name, anchor in required.items():
         if anchor not in coordinator:
-            errors.append(
-                f"runtime integration missing: {name} anchor `{anchor}`"
-            )
+            errors.append(f"runtime integration missing: {name} anchor `{anchor}`")
     return errors
 
 
@@ -660,18 +640,13 @@ def reference_app_independence_errors(root: Path = ROOT) -> list[str]:
         source = mask_rust(path.read_text(encoding="utf-8"))
         for token in REFERENCE_APP_FORBIDDEN_TOKENS:
             if token in source:
-                errors.append(
-                    f"{rel} contains market-data dependency token {token!r}"
-                )
+                errors.append(f"{rel} contains market-data dependency token {token!r}")
     return errors
 
 
 def collect_sources() -> list[str]:
     """Exercise collect sources."""
-    return sorted(
-        p.relative_to(ROOT).as_posix()
-        for p in sorted((ROOT / "src").rglob("*.rs"))
-    )
+    return sorted(p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "src").rglob("*.rs")))
 
 
 def check_mermaid_structure(document: str) -> list[str]:
@@ -679,31 +654,21 @@ def check_mermaid_structure(document: str) -> list[str]:
     errors: list[str] = []
     blocks = MERMAID_RE.findall(document)
     if len(blocks) < 3:
-        errors.append(
-            f"expected at least 3 Mermaid diagrams, found {len(blocks)}"
-        )
+        errors.append(f"expected at least 3 Mermaid diagrams, found {len(blocks)}")
     # Mermaid edge variants used here: --> and -->|edge label|. Keep each edge on one line.
     arrow_re = re.compile(r"-->(?:\|[^|]+\|)?")
     side_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)(.*)$")
     shaped_re = re.compile(r"^\s*(?:\[[^\n]*\]|\([^\n]*\)|\{[^\n]*\})")
     for index, body in enumerate(blocks, start=1):
         lines = body.splitlines()
-        if not lines or not re.match(
-            r"^\s*flowchart\s+(?:LR|RL|TB|TD|BT)\s*$", lines[0]
-        ):
-            errors.append(
-                f"diagram {index}: first line must be a supported flowchart direction"
-            )
+        if not lines or not re.match(r"^\s*flowchart\s+(?:LR|RL|TB|TD|BT)\s*$", lines[0]):
+            errors.append(f"diagram {index}: first line must be a supported flowchart direction")
             continue
         declared: set[str] = set()
         edges: list[tuple[str, str, int]] = []
         for line_number, line in enumerate(lines[1:], start=2):
             stripped = line.strip()
-            if (
-                not stripped
-                or stripped.startswith(("%%", "subgraph "))
-                or stripped == "end"
-            ):
+            if not stripped or stripped.startswith(("%%", "subgraph ")) or stripped == "end":
                 continue
             if arrow_re.search(line):
                 parts = arrow_re.split(line, maxsplit=1)
@@ -755,9 +720,7 @@ def main() -> int:
     )
     args = parser.parse_args()
     if not args.check:
-        parser.error(
-            "this repository only supports read-only architecture checks; use --check"
-        )
+        parser.error("this repository only supports read-only architecture checks; use --check")
 
     errors: list[str] = []
     errors.extend(module_integration_errors())
@@ -770,13 +733,11 @@ def main() -> int:
     unreachable = sorted(actual_sources - reachable)
     if missing_docs:
         errors.append(
-            "source files need reviewed responsibility mappings: "
-            + ", ".join(missing_docs)
+            "source files need reviewed responsibility mappings: " + ", ".join(missing_docs)
         )
     if stale_docs:
         errors.append(
-            "source responsibility mappings point to removed files: "
-            + ", ".join(stale_docs)
+            "source responsibility mappings point to removed files: " + ", ".join(stale_docs)
         )
     if unreachable:
         errors.append("unreachable source files: " + ", ".join(unreachable))
@@ -788,18 +749,14 @@ def main() -> int:
     for anchor_path, anchors in REQUIRED_ANCHORS.items():
         file_path = ROOT / anchor_path
         if not file_path.exists():
-            errors.append(
-                f"required source anchor file is missing: {anchor_path}"
-            )
+            errors.append(f"required source anchor file is missing: {anchor_path}")
             continue
         raw_source = file_path.read_text(encoding="utf-8")
         source = mask_rust(raw_source)
         for anchor in anchors:
             literal_match = anchor in LITERAL_ANCHORS and anchor in raw_source
             if anchor not in source and not literal_match:
-                errors.append(
-                    f"source anchor `{anchor}` not found in `{anchor_path}`"
-                )
+                errors.append(f"source anchor `{anchor}` not found in `{anchor_path}`")
     for required_text in [
         "docs/requirement-test-matrix.md",
         "docs/canonical-event-model.md",

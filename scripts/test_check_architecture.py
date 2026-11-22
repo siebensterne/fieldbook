@@ -13,9 +13,7 @@ class AnchorMaskingTests(unittest.TestCase):
     def test_comment_and_string_text_is_masked(self) -> None:
         """Remove commentary and literals but keep executable anchors."""
         source = (
-            "// pub fn commented() {}\n"
-            'let text = "pub fn literal() {}";\n'
-            "pub fn real() {}\n"
+            "// pub fn commented() {}\n" 'let text = "pub fn literal() {}";\n' "pub fn real() {}\n"
         )
         masked = gate.mask_rust(source)
         self.assertNotIn("commented", masked)
@@ -24,9 +22,7 @@ class AnchorMaskingTests(unittest.TestCase):
 
     def test_raw_string_and_block_comment_are_masked(self) -> None:
         """Handle nested block comments and raw string literals."""
-        source = (
-            '/* /* pub fn nested() {} */ */\nlet r = r#"pub fn raw() {}"#;\n'
-        )
+        source = '/* /* pub fn nested() {} */ */\nlet r = r#"pub fn raw() {}"#;\n'
         masked = gate.mask_rust(source)
         self.assertNotIn("nested", masked)
         self.assertNotIn("raw", masked)
@@ -39,9 +35,7 @@ class ArchitectureGateTests(unittest.TestCase):
         self,
     ) -> None:
         """Check that every Rust source has a reviewed responsibility."""
-        self.assertEqual(
-            set(gate.collect_sources()), set(gate.SOURCE_RESPONSIBILITIES)
-        )
+        self.assertEqual(set(gate.collect_sources()), set(gate.SOURCE_RESPONSIBILITIES))
 
     def test_architecture_has_at_least_three_structurally_valid_diagrams(
         self,
@@ -76,30 +70,20 @@ class ArchitectureGateTests(unittest.TestCase):
             ):
                 (root / "src" / path).write_text("", encoding="utf-8")
             errors = gate.module_integration_errors(root)
-            self.assertTrue(
-                any("capacity startup" in error for error in errors), errors
-            )
+            self.assertTrue(any("capacity startup" in error for error in errors), errors)
 
     def test_structural_checker_rejects_undeclared_nodes(self) -> None:
         """Exercise test structural checker rejects undeclared nodes."""
         invalid = '```mermaid\nflowchart LR\nA["Declared"] --> B\n```'
         errors = gate.check_mermaid_structure(invalid)
-        self.assertTrue(
-            any("undeclared node B" in error for error in errors), errors
-        )
+        self.assertTrue(any("undeclared node B" in error for error in errors), errors)
 
     def test_structural_checker_rejects_unparsed_statements(self) -> None:
         """Exercise test structural checker rejects unparsed statements."""
-        invalid = (
-            "```mermaid\nflowchart LR\n"
-            'A["Declared"]\nnot a Mermaid statement\n```'
-        )
+        invalid = "```mermaid\nflowchart LR\n" 'A["Declared"]\nnot a Mermaid statement\n```'
         errors = gate.check_mermaid_structure(invalid)
         self.assertTrue(
-            any(
-                "unsupported/unparsed Mermaid statement" in error
-                for error in errors
-            ),
+            any("unsupported/unparsed Mermaid statement" in error for error in errors),
             errors,
         )
 

@@ -4,7 +4,7 @@
 This checker implements the mechanical rules of the Google Python, Shell,
 Markdown and JSON style guides that are not covered by an external formatter:
 
-* 80-column lines with the guides' documented exceptions;
+* 100-column lines with the guides' documented exceptions;
 * no tabs, no trailing whitespace, no CRLF, a final newline;
 * shell scripts use ``#!/bin/bash``, two-space indentation and no ``eval``;
 * every Makefile target is phony and recipes use tabs;
@@ -31,7 +31,7 @@ import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_LINE = 80
+MAX_LINE = 100
 SKIP_DIRS = frozenset(
     {
         ".git",
@@ -105,26 +105,16 @@ def exempt_long(line: str, kind: str) -> bool:
         # Google's long-string exception: messages, regexes and here-doc
         # redirections are data, not wrap-able shell control flow.
         return True
-    if (
-        kind == "python"
-        and stripped.startswith("#")
-        and LONG_TOKEN_RE.search(stripped)
-    ):
+    if kind == "python" and stripped.startswith("#") and LONG_TOKEN_RE.search(stripped):
         return True
     if kind == "markdown" and (
-        stripped.startswith(("#", "|"))
-        or "`" in stripped
-        or MD_LINK_RE.search(stripped)
+        stripped.startswith(("#", "|")) or "`" in stripped or MD_LINK_RE.search(stripped)
     ):
         return True
     # The Google JSON guide has no line-length rule; JSON is data, not prose.
     if kind == "json":
         return True
-    if (
-        kind == "makefile"
-        and stripped.startswith("#")
-        and LONG_TOKEN_RE.search(stripped)
-    ):
+    if kind == "makefile" and stripped.startswith("#") and LONG_TOKEN_RE.search(stripped):
         return True
     # A single unbreakable token (URL, path, base64 payload) cannot be wrapped.
     return len(stripped.split()) == 1
@@ -136,17 +126,14 @@ def is_evidence(path: Path) -> bool:
         relative = path.relative_to(ROOT)
     except ValueError:
         return False
-    return bool(EVIDENCE_DIRS.intersection(relative.parts)) or (
-        relative.as_posix() in RAW_FIXTURES
-    )
+    return bool(EVIDENCE_DIRS.intersection(relative.parts)) or (relative.as_posix() in RAW_FIXTURES)
 
 
 def basic_lines(path: Path, kind: str, errors: list[str]) -> list[str]:
     """Check the universal whitespace rules and return the file's lines."""
     evidence = is_evidence(path)
     long_allowed = evidence or (
-        kind == "python"
-        and path.relative_to(ROOT).as_posix() in LONG_STRING_FILES
+        kind == "python" and path.relative_to(ROOT).as_posix() in LONG_STRING_FILES
     )
     raw = path.read_bytes()
     if b"\r\n" in raw:
@@ -169,9 +156,7 @@ def basic_lines(path: Path, kind: str, errors: list[str]) -> list[str]:
             and not (kind == "markdown" and in_fence)
             and not exempt_long(line, kind)
         ):
-            errors.append(
-                f"{path}:{number}: line is {len(line)} columns (max {MAX_LINE})"
-            )
+            errors.append(f"{path}:{number}: line is {len(line)} columns (max {MAX_LINE})")
     return lines
 
 
@@ -184,9 +169,7 @@ def check_python(path: Path, errors: list[str]) -> None:
 
     for token in tokenize.generate_tokens(io.StringIO(source).readline):
         if token.type == tokenize.OP and token.string == ";":
-            errors.append(
-                f"{path}:{token.start[0]}: semicolon statement separator"
-            )
+            errors.append(f"{path}:{token.start[0]}: semicolon statement separator")
     try:
         tree = ast.parse(source)
     except SyntaxError as error:
@@ -199,10 +182,7 @@ def check_python(path: Path, errors: list[str]) -> None:
         for node in tree.body
         if isinstance(node, ast.ImportFrom) and node.module == "__future__"
     ]
-    if not any(
-        any(alias.name == "annotations" for alias in node.names)
-        for node in imports
-    ):
+    if not any(any(alias.name == "annotations" for alias in node.names) for node in imports):
         errors.append(f"{path}: missing `from __future__ import annotations`")
 
 
@@ -235,9 +215,7 @@ def check_shell(path: Path, errors: list[str]) -> None:
             continue
         leading = len(line) - len(line.lstrip(" "))
         if leading % 2 != 0:
-            errors.append(
-                f"{path}:{number}: indentation is not a multiple of two"
-            )
+            errors.append(f"{path}:{number}: indentation is not a multiple of two")
         if not line.lstrip().startswith("#") and re.search(r"(^|[^\\])`", line):
             errors.append(f"{path}:{number}: backtick command substitution")
         if re.search(r"\beval\b", line):
@@ -266,9 +244,7 @@ def check_json(path: Path, errors: list[str]) -> None:
     for number, line in enumerate(lines, 1):
         leading = len(line) - len(line.lstrip(" "))
         if leading % 2 != 0:
-            errors.append(
-                f"{path}:{number}: indentation is not a multiple of two"
-            )
+            errors.append(f"{path}:{number}: indentation is not a multiple of two")
 
 
 def check_markdown(path: Path, errors: list[str]) -> None:
@@ -296,11 +272,7 @@ def check_markdown(path: Path, errors: list[str]) -> None:
             continue
         if re.match(r"^#{1,6}[^#\s]", line):
             errors.append(f"{path}:{number}: heading needs a space after `#`")
-        if (
-            re.match(r"^[=-]{3,}\s*$", line)
-            and number > 1
-            and lines[number - 2].strip()
-        ):
+        if re.match(r"^[=-]{3,}\s*$", line) and number > 1 and lines[number - 2].strip():
             errors.append(f"{path}:{number}: underlined heading is not ATX")
         if re.search(r"(?<!\.)\.\./", MD_LINK_RE.sub("", line)):
             errors.append(f"{path}:{number}: relative parent path in link")
@@ -409,18 +381,14 @@ def reflow_markdown(path: Path) -> bool:
             paragraph[0] = body[len(prefix) :]
         joined = " ".join(part.strip() for part in paragraph)
         if "`" in joined or "[" in joined:
-            # Links and code spans are Google's 80-column exceptions. Wrap the
+            # Links and code spans are Google's 100-column exceptions. Wrap the
             # other lines of the paragraph individually so one link does not
             # prevent ordinary prose from being brought under the limit.
             for part in paragraph:
                 part_match = re.match(r"^(\s*)(?:> |[-*+] |\d+\.\s)", part)
                 part_prefix = part_match.group(0) if part_match else ""
                 part_body = part[len(part_prefix) :]
-                if (
-                    "`" in part_body
-                    or "[" in part_body
-                    or len(part) <= MAX_LINE
-                ):
+                if "`" in part_body or "[" in part_body or len(part) <= MAX_LINE:
                     output.append(part)
                     continue
                 part_hanging = " " * len(part_prefix)
@@ -480,14 +448,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fix", action="store_true", help="apply safe fixes")
     for name in ("python", "shell", "json", "markdown", "makefile"):
-        parser.add_argument(
-            f"--{name}", action="store_true", help=f"check {name}"
-        )
+        parser.add_argument(f"--{name}", action="store_true", help=f"check {name}")
     args = parser.parse_args()
     selected = {
-        name
-        for name in ("python", "shell", "json", "markdown", "makefile")
-        if getattr(args, name)
+        name for name in ("python", "shell", "json", "markdown", "makefile") if getattr(args, name)
     }
     if not selected:
         selected = {"python", "shell", "json", "markdown", "makefile"}
@@ -513,9 +477,7 @@ def main() -> int:
         "shell": [path for pattern in SHELLS for path in collect(pattern)],
         "json": all_files("*.json"),
         "markdown": all_files("*.md"),
-        "makefile": [ROOT / "Makefile"]
-        if (ROOT / "Makefile").is_file()
-        else [],
+        "makefile": [ROOT / "Makefile"] if (ROOT / "Makefile").is_file() else [],
     }
     for kind in sorted(selected):
         for path in sources[kind]:

@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Verify the shared quality contract against this repository's configs.
 
-The contract is byte-identical in the sibling workspaces. This gate fails
-closed when a pinned linter version, rule family, formatter option, shell
-check, editor baseline or Rust lint denial drifts from that contract, so the
-two repositories cannot silently diverge.
+The tool pins and listed settings are shared with the sibling workspace. Files
+under ``shared_files`` carry those settings; files under ``repo_local_files``
+diverge by design and are not compared byte for byte. This gate fails closed
+when a pinned linter version, rule family, formatter option, shell check,
+editor baseline or Rust lint denial drifts from that contract, so the two
+repositories cannot silently diverge on policy.
 
 Run from the repository root. Use ``--self-test`` for adversarial unit tests.
 """
@@ -41,9 +43,7 @@ def check_files(root: Path, contract: dict[str, Any]) -> list[str]:
     ]
 
 
-def check_ruff_settings(
-    contract: dict[str, Any], config: dict[str, Any]
-) -> list[str]:
+def check_ruff_settings(contract: dict[str, Any], config: dict[str, Any]) -> list[str]:
     """Compare Ruff settings against the contract."""
     expected = contract["ruff"]
     errors: list[str] = []
@@ -84,16 +84,10 @@ def check_shellcheck_text(contract: dict[str, Any], text: str) -> list[str]:
         errors.append("shell dialect drifted")
     if values.get("external-sources") != "true":
         errors.append("shellcheck external-sources drifted")
-    enabled = {
-        item.strip()
-        for item in values.get("enable", "").split(",")
-        if item.strip()
-    }
+    enabled = {item.strip() for item in values.get("enable", "").split(",") if item.strip()}
     # .shellcheckrc permits one `enable=` per check; collect all of them.
     enabled |= {
-        line.split("=", 1)[1].strip()
-        for line in text.splitlines()
-        if line.startswith("enable=")
+        line.split("=", 1)[1].strip() for line in text.splitlines() if line.startswith("enable=")
     }
     for name in expected["optional_checks"]:
         if name not in enabled:
@@ -146,9 +140,7 @@ def check_rust_text(contract: dict[str, Any], text: str) -> list[str]:
 def check_xtask_text(contract: dict[str, Any], files: list[Path]) -> list[str]:
     """Verify the task runner is typed, discoverable and self-tested."""
     expected = contract["xtask"]
-    text = "\n".join(
-        path.read_text(encoding="utf-8") for path in files if path.is_file()
-    )
+    text = "\n".join(path.read_text(encoding="utf-8") for path in files if path.is_file())
     errors: list[str] = []
     for name in expected["required_tasks"]:
         if f'"{name}"' not in text:
@@ -209,11 +201,7 @@ class ContractTests(unittest.TestCase):
         """Deleting an optional check fails the gate."""
         contract = load_contract()
         text = (ROOT / ".shellcheckrc").read_text()
-        lines = [
-            line
-            for line in text.splitlines()
-            if "useless-use-of-cat" not in line
-        ]
+        lines = [line for line in text.splitlines() if "useless-use-of-cat" not in line]
         self.assertTrue(check_shellcheck_text(contract, "\n".join(lines)))
 
     def test_xtask_task_drift_is_detected(self) -> None:

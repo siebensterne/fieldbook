@@ -45,12 +45,8 @@ def matrix(*rows: tuple[str, tuple[str, ...]]) -> str:
         "|---|---|---|---|",
     ]
     for requirement, references in rows:
-        evidence = (
-            ", ".join(f"`{reference}`" for reference in references) or "none"
-        )
-        lines.append(
-            f"| {requirement} | Example requirement | {evidence} | ok |"
-        )
+        evidence = ", ".join(f"`{reference}`" for reference in references) or "none"
+        lines.append(f"| {requirement} | Example requirement | {evidence} | ok |")
     return "\n".join(lines) + "\n"
 
 
@@ -87,9 +83,7 @@ class DiscoveryTests(MatrixFixture):
 
     def test_test_attributes_are_discovered_in_the_named_file(self) -> None:
         """Exercise test test attributes are discovered in the named file."""
-        self.assertEqual(
-            {"present_test", "async_test"}, self.tests["src/alpha.rs"]
-        )
+        self.assertEqual({"present_test", "async_test"}, self.tests["src/alpha.rs"])
         self.assertEqual({"other_test"}, self.tests["src/beta.rs"])
         self.assertEqual({"e2e_test"}, self.tests["tests/e2e.rs"])
 
@@ -172,9 +166,7 @@ class MatrixReferenceTests(MatrixFixture):
                 ("E1", ("src/beta.rs::other_test",)),
             )
         )
-        self.assertTrue(
-            any("wildcards are not allowed" in error for error in errors)
-        )
+        self.assertTrue(any("wildcards are not allowed" in error for error in errors))
 
     def test_grouped_reference_is_rejected(self) -> None:
         """Exercise test grouped reference is rejected."""
@@ -184,12 +176,7 @@ class MatrixReferenceTests(MatrixFixture):
                 ("E1", ("src/beta.rs::other_test",)),
             )
         )
-        self.assertTrue(
-            any(
-                "grouped references are not allowed" in error
-                for error in errors
-            )
-        )
+        self.assertTrue(any("grouped references are not allowed" in error for error in errors))
 
     def test_bare_snake_case_name_is_rejected(self) -> None:
         """Exercise test bare snake case name is rejected."""
@@ -199,9 +186,7 @@ class MatrixReferenceTests(MatrixFixture):
                 ("E1", ("src/beta.rs::other_test",)),
             )
         )
-        self.assertTrue(
-            any("bare test name is ambiguous" in error for error in errors)
-        )
+        self.assertTrue(any("bare test name is ambiguous" in error for error in errors))
 
     def test_bare_single_word_test_name_is_rejected(self) -> None:
         """Exercise test bare single word test name is rejected."""
@@ -211,9 +196,7 @@ class MatrixReferenceTests(MatrixFixture):
                 ("E1", ("src/beta.rs::other_test",)),
             )
         )
-        self.assertTrue(
-            any("bare test name is ambiguous" in error for error in errors)
-        )
+        self.assertTrue(any("bare test name is ambiguous" in error for error in errors))
 
     def test_module_qualified_rust_path_is_rejected(self) -> None:
         """Exercise test module qualified rust path is rejected."""
@@ -223,9 +206,7 @@ class MatrixReferenceTests(MatrixFixture):
                 ("E1", ("src/beta.rs::other_test",)),
             )
         )
-        self.assertTrue(
-            any("must be file-qualified" in error for error in errors)
-        )
+        self.assertTrue(any("must be file-qualified" in error for error in errors))
 
 
 class RequirementSetTests(MatrixFixture):
@@ -246,9 +227,7 @@ class RequirementSetTests(MatrixFixture):
                 ("E1", ("src/beta.rs::other_test",)),
             )
         )
-        self.assertTrue(
-            any("duplicate requirement ID M1" in error for error in errors)
-        )
+        self.assertTrue(any("duplicate requirement ID M1" in error for error in errors))
 
     def test_requirement_without_a_reference_is_rejected(self) -> None:
         """Exercise test requirement without a reference is rejected."""
@@ -269,9 +248,7 @@ class RequirementSetTests(MatrixFixture):
                 ("M10", ("src/gamma.rs::foo",)),
             )
         )
-        self.assertTrue(
-            any("unexpected requirement ID M10" in error for error in errors)
-        )
+        self.assertTrue(any("unexpected requirement ID M10" in error for error in errors))
 
     def test_missing_mandatory_evidence_test_is_rejected(self) -> None:
         """Exercise test missing mandatory evidence test is rejected."""
@@ -318,13 +295,10 @@ class RepositoryMatrixTest(unittest.TestCase):
             gate.discover_tests(gate.ROOT),
         )
         self.assertEqual([], errors)
-        self.assertGreaterEqual(
-            len(references), len(gate.REQUIRED_EVIDENCE_TESTS)
-        )
+        self.assertGreaterEqual(len(references), len(gate.REQUIRED_EVIDENCE_TESTS))
         self.assertEqual(
             gate.REQUIRED_EVIDENCE_TESTS,
-            gate.REQUIRED_EVIDENCE_TESTS
-            & {reference.test for reference in references},
+            gate.REQUIRED_EVIDENCE_TESTS & {reference.test for reference in references},
         )
 
 
