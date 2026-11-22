@@ -1934,6 +1934,9 @@ mod tests {
             crate::config::Settings::for_exchange(crate::config::ExchangeKind::Polymarket);
         settings.polymarket.ws_url = format!("ws://{address}");
         settings.network.connect_timeout_secs = 1;
+        // This is an offline loopback test: use the loopback transport identity
+        // so no provider rights are needed for the local HTTP client or socket.
+        settings.network.venue = "loopback".to_owned();
         let exchange = std::sync::Arc::new(
             crate::exchange::polymarket::PolymarketExchange::new(
                 settings.polymarket.clone(),

@@ -43,6 +43,7 @@ is not checked in. Reproduce the run with:
 ```bash
 cargo run --release -- \
   --exchange polymarket --max-markets 4 --shards 1 --replicas 2 \
+  --rights-file /absolute/path/to/rights.toml \
   --duration-secs 20 \
   --output /tmp/ec-smoke/polymarket.sbe \
   --metadata /tmp/ec-smoke/polymarket-markets.json \

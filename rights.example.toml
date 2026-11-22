@@ -1,0 +1,42 @@
+# Runtime authorization source for provider-facing commands.
+#
+# This file is the ONLY authorization input: set [governance].rights_file or
+# --rights-file to its path. Environment variables, operator attestations and
+# command flags cannot grant a right. Point CLAIM to a config file with real
+# records via --rights-file (or [governance].rights_file) before running
+# collect, discover, latency, network-probe or analytics-export. Missing,
+# malformed or expired records deny.
+#
+# Identifiers below are abstract placeholders. The example decision is
+# `contract_required`, which denies. Change it to `permitted` only after the
+# contract has been reviewed: the venue, provider, source, operation and
+# purpose must all match the intended use, and the licence reference must
+# name the actual document.
+
+schema_version = 1
+territory = "US"
+recipient_class = "internal"
+
+[[rights]]
+decision = "contract_required"
+
+[rights.identity]
+venue = "venue-a"
+provider_id = "provider-a"
+source_id = "reference-data-source"
+dataset_id = "market-reference"
+product_id = "collect"
+territory = "US"
+operation = "collect"
+usage_right = "real_time_access"
+recipient_class = "internal"
+purpose = "internal_analysis"
+valid_from = 0
+valid_until = 4102444800000000
+
+[rights.audit]
+licence_reference = "REPLACE_WITH_CONTRACT_REFERENCE"
+licence_document_hash = "0000000000000000000000000000000000000000000000000000000000000000"
+contract_revision = 1
+recorded_at_us = 0
+authority = "contract-registry"

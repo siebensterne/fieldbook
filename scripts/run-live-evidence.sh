@@ -8,6 +8,11 @@
 # (max_shards, max_total_connections, max_estimated_book_memory_mb) is a
 # reviewed, checked-in file rather than ad-hoc CLI flags. Explicit CLI flags
 # below still win over the file.
+#
+# LIVE_RIGHTS_FILE (required) names the contract-derived authorization file
+# passed via --rights-file. Operator attestations in the environment are not
+# authorization: the collector denies every venue without a live, venue-scoped
+# right from that file.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -16,6 +21,8 @@ cd "$ROOT"
 DURATION_SECS="${LIVE_DURATION_SECS:-120}"
 MAX_MARKETS="${LIVE_MAX_MARKETS:-5}"
 SCOPE="${LIVE_EVIDENCE_SCOPE:-smoke}"
+RIGHTS_FILE="${LIVE_RIGHTS_FILE:-}"
+RIGHTS_AUDIT_DIR="${LIVE_RIGHTS_AUDIT_DIR:-}"
 SHARDS="${LIVE_SHARDS:-}"
 REPLICAS="${LIVE_REPLICAS:-1}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -37,6 +44,15 @@ if ! command -v git >/dev/null 2>&1; then
 fi
 if [[ ! "$DURATION_SECS" =~ ^[0-9]+$ ]] || (( DURATION_SECS < 30 )); then
   echo "ERROR: LIVE_DURATION_SECS must be an integer >= 30." >&2
+  exit 2
+fi
+if [[ -z "$RIGHTS_FILE" ]]; then
+  echo \
+    "ERROR: LIVE_RIGHTS_FILE is required and must name a contract-derived rights TOML file." >&2
+  exit 2
+fi
+if [[ ! -r "$RIGHTS_FILE" ]]; then
+  echo "ERROR: LIVE_RIGHTS_FILE is not readable: $RIGHTS_FILE" >&2
   exit 2
 fi
 case "$SCOPE" in
@@ -131,6 +147,10 @@ run_venue() {
       return 1
     fi
     config_args=(--config "$LIVE_CONFIG")
+  fi
+  config_args+=(--rights-file "$RIGHTS_FILE")
+  if [[ -n "$RIGHTS_AUDIT_DIR" ]]; then
+    config_args+=(--rights-audit-dir "$RIGHTS_AUDIT_DIR")
   fi
 
   mkdir -p "$directory" || { echo "[$venue] cannot create $directory" >&2; \
@@ -338,37 +358,27 @@ POLYMARKET_STATUS="not_run"
 KALSHI_STATUS="not_run"
 FAILURES=0
 
-if [[ "${POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED:-0}" == "1" ]]; then
-  if run_venue polymarket; then POLYMARKET_STATUS="verified"; else \
-    POLYMARKET_STATUS="failed"; FAILURES=$((FAILURES + 1)); fi
-else
-  POLYMARKET_STATUS="skipped_permission_not_confirmed"
-  echo "[polymarket] skipped: set POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED=1 only after checking current venue terms and local law"
-fi
+if run_venue polymarket; then POLYMARKET_STATUS="verified"; else \
+  POLYMARKET_STATUS="failed"; FAILURES=$((FAILURES + 1)); fi
 
-if [[ "${KALSHI_READ_ONLY_ACCESS_CONFIRMED:-0}" == "1" ]]; then
-  if [[ -z "${KALSHI_API_KEY_ID:-}" ]]; then
-    KALSHI_STATUS="blocked_missing_api_key_id"
-    echo "[kalshi] blocked: KALSHI_API_KEY_ID is not set" >&2
-    FAILURES=$((FAILURES + 1))
-  elif [[ -z "${KALSHI_PRIVATE_KEY_PATH:-}" && -z \
-    "${KALSHI_PRIVATE_KEY_PEM:-}" ]]; then
-    KALSHI_STATUS="blocked_missing_private_key"
-    echo \
-      "[kalshi] blocked: set KALSHI_PRIVATE_KEY_PATH or KALSHI_PRIVATE_KEY_PEM" >&2
-    FAILURES=$((FAILURES + 1))
-  elif [[ -n "${KALSHI_PRIVATE_KEY_PATH:-}" && ! -r \
-    "$KALSHI_PRIVATE_KEY_PATH" ]]; then
-    KALSHI_STATUS="blocked_unreadable_private_key"
-    echo "[kalshi] blocked: KALSHI_PRIVATE_KEY_PATH is not readable" >&2
-    FAILURES=$((FAILURES + 1))
-  else
-    if run_venue kalshi; then KALSHI_STATUS="verified"; else \
-      KALSHI_STATUS="failed"; FAILURES=$((FAILURES + 1)); fi
-  fi
+if [[ -z "${KALSHI_API_KEY_ID:-}" ]]; then
+  KALSHI_STATUS="blocked_missing_api_key_id"
+  echo "[kalshi] blocked: KALSHI_API_KEY_ID is not set" >&2
+  FAILURES=$((FAILURES + 1))
+elif [[ -z "${KALSHI_PRIVATE_KEY_PATH:-}" && -z \
+  "${KALSHI_PRIVATE_KEY_PEM:-}" ]]; then
+  KALSHI_STATUS="blocked_missing_private_key"
+  echo \
+    "[kalshi] blocked: set KALSHI_PRIVATE_KEY_PATH or KALSHI_PRIVATE_KEY_PEM" >&2
+  FAILURES=$((FAILURES + 1))
+elif [[ -n "${KALSHI_PRIVATE_KEY_PATH:-}" && ! -r \
+  "$KALSHI_PRIVATE_KEY_PATH" ]]; then
+  KALSHI_STATUS="blocked_unreadable_private_key"
+  echo "[kalshi] blocked: KALSHI_PRIVATE_KEY_PATH is not readable" >&2
+  FAILURES=$((FAILURES + 1))
 else
-  KALSHI_STATUS="skipped_permission_not_confirmed"
-  echo "[kalshi] skipped: set KALSHI_READ_ONLY_ACCESS_CONFIRMED=1 only after confirming read-only API access is allowed for this location/account"
+  if run_venue kalshi; then KALSHI_STATUS="verified"; else \
+    KALSHI_STATUS="failed"; FAILURES=$((FAILURES + 1)); fi
 fi
 
 COMPLETED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"

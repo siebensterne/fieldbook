@@ -969,10 +969,12 @@ async fn network_probe_reports_proxy_tcp_connect_failure() {
     use fieldbook::probe;
 
     let settings = Settings::default();
+    // A loopback venue keeps this offline lab on the test-only identity; the
+    // proxy is unreachable, so the failure is still the proxy TCP stage.
     let report = probe::run_with_route(
         &settings,
         route_for("http://127.0.0.1:1"),
-        Some("ws://venue.invalid:99/feed"),
+        Some("ws://127.0.0.1:99/feed"),
     )
     .await
     .expect("probe must run");

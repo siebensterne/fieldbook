@@ -1,8 +1,10 @@
 //! Opt-in public Polymarket integration test.
 //!
 //! This is ignored by default so offline CI never depends on a
-//! third-party network. Run it with:
-//! `RUN_LIVE_TESTS=1 cargo test --test live_polymarket -- --ignored --nocapture`
+//! third-party network. A runtime authorization file is required; an
+//! environment attestation cannot grant a right. Run it with:
+//! `RUN_LIVE_TESTS=1 LIVE_RIGHTS_FILE=/path/to/rights.toml \
+//!  cargo test --test live_polymarket -- --ignored --nocapture`
 
 #![allow(
     clippy::unwrap_used,
@@ -16,14 +18,36 @@
     reason = "test crates relax the production lint set wholesale; `expect` cannot express lints that may not fire"
 )]
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use fieldbook::{
-    config::PolymarketSettings,
+    config::{ExchangeKind, NetworkSettings, PolymarketSettings, Settings},
     exchange::{Exchange, PolymarketExchange},
     model::{ExchangeEvent, SourceId},
+    rights::{Operation, authorize_command},
 };
 use tokio::time::{Instant, timeout, timeout_at};
+
+static NETWORK: OnceLock<NetworkSettings> = OnceLock::new();
+
+/// Install one venue-scoped authorization for this test process. The rights
+/// file is configuration, never a self-attested environment flag.
+fn network() -> &'static NetworkSettings {
+    NETWORK.get_or_init(|| {
+        let path = std::env::var("LIVE_RIGHTS_FILE")
+            .expect("LIVE_RIGHTS_FILE must name a contract-derived rights TOML file");
+        let mut settings = Settings::for_exchange(ExchangeKind::Polymarket);
+        settings.governance.rights_file = Some(PathBuf::from(path));
+        authorize_command(&settings, Operation::Collect)
+            .expect("rights must authorize this venue and operation");
+        settings.network
+    })
+}
 
 #[tokio::test]
 #[ignore = "requires RUN_LIVE_TESTS=1 and public network access"]
@@ -35,11 +59,7 @@ async fn discovers_and_subscribes_to_public_polymarket_books() {
     );
 
     let exchange = Arc::new(
-        PolymarketExchange::new(
-            PolymarketSettings::default(),
-            fieldbook::config::NetworkSettings::default(),
-        )
-        .unwrap(),
+        PolymarketExchange::new(PolymarketSettings::default(), network().clone()).unwrap(),
     );
     let markets = timeout(Duration::from_secs(30), exchange.discover_markets(5))
         .await
@@ -102,11 +122,7 @@ async fn resubscribing_an_asset_returns_a_fresh_book() {
     );
 
     let exchange = Arc::new(
-        PolymarketExchange::new(
-            PolymarketSettings::default(),
-            fieldbook::config::NetworkSettings::default(),
-        )
-        .unwrap(),
+        PolymarketExchange::new(PolymarketSettings::default(), network().clone()).unwrap(),
     );
     let markets = timeout(Duration::from_secs(30), exchange.discover_markets(5))
         .await

@@ -26,8 +26,11 @@ scheduled work, not an implicit capability of this implementation.
 
 ## Runtime composition
 
-`src/main.rs` parses the CLI and dispatches `collect`, `discover`, `replay`,
-`inspect`, `verify`, `latency`, and `journal` subcommands. Live collection
+`src/main.rs` parses the CLI and requires an explicit subcommand; no command
+starts no provider activity. Before dispatching any provider-facing command it
+loads the runtime rights file through `src/governance/rights.rs` and denies when
+no live, venue-scoped right covers the operation. Offline commands (replay,
+inspect, verify, journal, analytics-verify) need no rights. Live collection
 enters `src/distribution/coordinator.rs`, which constructs the exchange adapter, performs
 discovery, plans capacity, loads a catalog, starts session workers (plus the
 dedicated Kalshi lifecycle control plane), the writer, the journal, and the

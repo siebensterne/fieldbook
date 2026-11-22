@@ -2,14 +2,13 @@
 //!
 //! Required environment:
 //! - `RUN_LIVE_KALSHI_TESTS=1`
-//! - `KALSHI_READ_ONLY_ACCESS_CONFIRMED=1` after confirming that this
-//!   account/location is permitted to access the market-data API without
-//!   placing event-contract orders.
+//! - `LIVE_RIGHTS_FILE` naming a contract-derived authorization file for this
+//!   venue and operation. An environment attestation cannot grant a right.
 //! - `KALSHI_API_KEY_ID`
 //! - `KALSHI_PRIVATE_KEY_PATH` or `KALSHI_PRIVATE_KEY_PEM`
 //!
 //! Run with:
-//! `RUN_LIVE_KALSHI_TESTS=1 KALSHI_READ_ONLY_ACCESS_CONFIRMED=1 \
+//! `RUN_LIVE_KALSHI_TESTS=1 LIVE_RIGHTS_FILE=/path/to/rights.toml \
 //!  cargo test --test live_kalshi --locked -- --ignored --nocapture`
 
 #![allow(
@@ -24,14 +23,36 @@
     reason = "test crates relax the production lint set wholesale; `expect` cannot express lints that may not fire"
 )]
 
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use fieldbook::{
-    config::{KalshiSettings, NetworkSettings},
+    config::{ExchangeKind, KalshiSettings, Settings},
     exchange::{Exchange, KalshiExchange},
     model::{ExchangeEvent, SourceId},
+    rights::{Operation, authorize_command},
 };
 use tokio::time::{Instant, timeout, timeout_at};
+
+static NETWORK: OnceLock<fieldbook::config::NetworkSettings> = OnceLock::new();
+
+/// Install one venue-scoped authorization for this test process. The rights
+/// file is configuration, never a self-attested environment flag.
+fn network() -> &'static fieldbook::config::NetworkSettings {
+    NETWORK.get_or_init(|| {
+        let path = std::env::var("LIVE_RIGHTS_FILE")
+            .expect("LIVE_RIGHTS_FILE must name a contract-derived rights TOML file");
+        let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
+        settings.governance.rights_file = Some(PathBuf::from(path));
+        authorize_command(&settings, Operation::Collect)
+            .expect("rights must authorize this venue and operation");
+        settings.network
+    })
+}
 
 #[tokio::test]
 #[ignore = "requires authorized Kalshi read-only market-data access and production API credentials"]
@@ -41,12 +62,6 @@ async fn discovers_and_receives_live_production_orderbook_snapshots() {
         Ok("1"),
         "set RUN_LIVE_KALSHI_TESTS=1 to opt in"
     );
-    assert_eq!(
-        std::env::var("KALSHI_READ_ONLY_ACCESS_CONFIRMED").as_deref(),
-        Ok("1"),
-        "confirm read-only Kalshi market-data access is permitted for this account and location"
-    );
-
     let mut settings = KalshiSettings {
         key_id: std::env::var("KALSHI_API_KEY_ID")
             .expect("KALSHI_API_KEY_ID must be set for the authenticated websocket handshake"),
@@ -62,7 +77,7 @@ async fn discovers_and_receives_live_production_orderbook_snapshots() {
     );
 
     let exchange = Arc::new(
-        KalshiExchange::new(settings, NetworkSettings::default(), true)
+        KalshiExchange::new(settings, network().clone(), true)
             .expect("constructing authenticated Kalshi production adapter"),
     );
     assert_eq!(exchange.environment(), "production");

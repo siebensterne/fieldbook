@@ -2,6 +2,12 @@
 # KALSHI_PRIVATE_KEY_PATH, or KALSHI_PRIVATE_KEY_PEM.
 exchange = "kalshi"
 
+[governance]
+# Required for collect, discover, latency, network-probe and analytics-export.
+# Without a rights file these commands deny before any provider contact.
+# rights_file = "rights.toml"
+# audit_dir = "captures/authorization-audit"
+
 [kalshi]
 # Production is the built-in default because the challenge targets live
 # markets. Use "demo" with demo credentials for a simulated exchange.

@@ -18,7 +18,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 
 use crate::{
-    config::{CoinbaseSettings, ExchangeKind},
+    config::{CoinbaseSettings, ExchangeKind, NetworkSettings},
     exchange::{DiscoveryResult, Exchange, ExchangeCapabilities},
     model::MarketInfo,
     products::{
@@ -37,13 +37,13 @@ pub struct CoinbaseExchange {
 }
 
 impl CoinbaseExchange {
-    pub fn new(settings: CoinbaseSettings) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(
-                settings.request_timeout_secs.max(1),
-            ))
-            .build()
-            .context("building Coinbase HTTP client")?;
+    pub fn new(settings: CoinbaseSettings, network: NetworkSettings) -> anyhow::Result<Self> {
+        let client = crate::egress::http_client(
+            concat!("fieldbook-collector/", env!("CARGO_PKG_VERSION")),
+            std::time::Duration::from_secs(settings.request_timeout_secs.max(1)),
+            &network,
+        )
+        .context("building Coinbase HTTP client")?;
         Ok(Self { settings, client })
     }
 
@@ -163,7 +163,8 @@ mod tests {
 
     #[tokio::test]
     async fn h0_discovery_is_offline_and_reconciles_stats() {
-        let exchange = CoinbaseExchange::new(fixture_settings()).unwrap();
+        let exchange =
+            CoinbaseExchange::new(fixture_settings(), NetworkSettings::default()).unwrap();
         let result = exchange.discover_markets_with_stats(0).await.unwrap();
         assert_eq!(result.markets.len(), 5);
         assert_eq!(result.stats.pages, 1);
@@ -181,13 +182,16 @@ mod tests {
 
     #[test]
     fn h0_uses_clockless_capabilities_and_no_lifecycle_plane() {
-        let exchange = CoinbaseExchange::new(CoinbaseSettings::default()).unwrap();
+        let exchange =
+            CoinbaseExchange::new(CoinbaseSettings::default(), NetworkSettings::default()).unwrap();
         assert_eq!(exchange.name(), "coinbase");
         assert_eq!(exchange.environment(), "public");
         assert!(!exchange.capabilities().has_sequence_clock);
         assert_eq!(capabilities(), exchange.capabilities());
         assert_eq!(kind(), ExchangeKind::Coinbase);
-        let shared = Arc::new(CoinbaseExchange::new(CoinbaseSettings::default()).unwrap());
+        let shared = Arc::new(
+            CoinbaseExchange::new(CoinbaseSettings::default(), NetworkSettings::default()).unwrap(),
+        );
         assert!(Exchange::lifecycle_session_factory(shared).is_none());
         let settings = Settings::for_exchange(ExchangeKind::Coinbase);
         assert_eq!(settings.exchange, ExchangeKind::Coinbase);

@@ -1,6 +1,11 @@
 # Credential-free public fallback example.
 exchange = "polymarket"
 
+[governance]
+# Required for collect, discover, latency, network-probe and analytics-export.
+# rights_file = "rights.toml"
+# audit_dir = "captures/authorization-audit"
+
 [polymarket]
 gamma_url = "https://gamma-api.polymarket.com"
 ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"

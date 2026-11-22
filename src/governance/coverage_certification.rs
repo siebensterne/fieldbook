@@ -487,6 +487,8 @@ impl CoverageRecord {
     #[must_use]
     pub fn rights_query(&self, right: UsageRight) -> crate::rights::AuthorizationQuery {
         crate::rights::AuthorizationQuery {
+            venue: self.provider_id.clone(),
+            operation: crate::rights::Operation::Collect,
             provider_id: self.provider_id.clone(),
             source_id: self.source_id.clone(),
             dataset_id: self.dataset.clone(),
@@ -835,8 +837,8 @@ mod tests {
     use crate::{
         quality::Reconciliation,
         rights::{
-            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, Purpose, RecipientClass,
-            RightDecision,
+            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, Operation, Purpose,
+            RecipientClass, RightDecision,
         },
     };
     use std::collections::BTreeMap;
@@ -902,6 +904,8 @@ mod tests {
         registry
             .register(AuthorizationRecord {
                 identity: AuthorizationIdentity {
+                    venue: "source".to_owned(),
+                    operation: Operation::Collect,
                     provider_id: "source".to_owned(),
                     source_id: "source".to_owned(),
                     dataset_id: "quotes".to_owned(),
@@ -1259,6 +1263,8 @@ mod tests {
         matching_rights
             .register(AuthorizationRecord {
                 identity: AuthorizationIdentity {
+                    venue: "other-provider".to_owned(),
+                    operation: Operation::Collect,
                     provider_id: "other-provider".to_owned(),
                     source_id: "source".to_owned(),
                     dataset_id: "quotes".to_owned(),

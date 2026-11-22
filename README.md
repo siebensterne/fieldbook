@@ -94,8 +94,15 @@ Format contracts: [replay format](docs/replay-format.md),
 
 ## Quick start (Polymarket, no credentials)
 
+An explicit subcommand is required: running the binary with no command starts
+nothing. Live commands (`collect`, `discover`, `latency`, `network-probe`,
+`analytics-export`) also need a runtime authorization file; there is no
+environment or self-attestation shortcut. Copy `rights.example.toml`, fill in
+the contract-derived values, and pass it as `--rights-file`:
+
 ```bash
 cargo run --release -- --exchange polymarket --max-markets 20 \
+  --rights-file /absolute/path/to/rights.toml \
   --output captures/polymarket.sbe \
   --metadata captures/polymarket-markets.json \
   --report captures/polymarket-report.json \
@@ -178,14 +185,18 @@ To produce actual SBE and raw-frame evidence for both venues from the local
 machine:
 
 ```bash
-export POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED=1
-export KALSHI_READ_ONLY_ACCESS_CONFIRMED=1
 export KALSHI_API_KEY_ID='…'
 export KALSHI_PRIVATE_KEY_PATH="$HOME/.config/kalshi/private-key.pem"
+LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml \
 LIVE_DURATION_SECS=120 LIVE_MAX_MARKETS=5 scripts/run-live-evidence.sh
 ```
 
-The script refuses to claim a dual-venue success if either venue is skipped or a capture/journal verification fails. It certifies per-symbol coverage: every expected symbol in `markets.json` must appear in the run report's acknowledged subscription set and must have its own snapshot in the capture. A five-market run emits `LIVE_SMOKE_OK`, never `LIVE_UNIVERSE_OK`. To claim the universe tier, run `LIVE_EVIDENCE_SCOPE=universe LIVE_MAX_MARKETS=0 LIVE_DURATION_SECS=900 scripts/run-live-evidence.sh` — pass `LIVE_CONFIG=config.live-universe.toml` for the reviewed full-universe capacity envelope (capacity planning uses 548,942 discovered outcome tokens; the failed 2026-11-14 live capture expected 385,604 symbols. These are different runs and different evidence stages, not interchangeable counts; the default envelope is refused fail-closed by the capacity planner). The script then requires the expected set to equal the full discovered universe. `LIVE_SOAK_OK` is reserved for a full-universe run held for the stated soak duration and is not emitted by this script. The manual live workflow runs the same script on the protected runner and uploads the complete `captures/` bundle as a retained artifact.
+`LIVE_RIGHTS_FILE` only names a contract-derived authorization file; it is not
+an attestation. The collector denies before any provider contact when the file
+is missing, malformed, expired or out of scope, and records each decision in
+the directory named by `--rights-audit-dir` / `LIVE_RIGHTS_AUDIT_DIR`.
+
+The script refuses to claim a dual-venue success if either venue is skipped or a capture/journal verification fails. It certifies per-symbol coverage: every expected symbol in `markets.json` must appear in the run report's acknowledged subscription set and must have its own snapshot in the capture. A five-market run emits `LIVE_SMOKE_OK`, never `LIVE_UNIVERSE_OK`. To claim the universe tier, run `LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml LIVE_EVIDENCE_SCOPE=universe LIVE_MAX_MARKETS=0 LIVE_DURATION_SECS=900 scripts/run-live-evidence.sh` — pass `LIVE_CONFIG=config.live-universe.toml` for the reviewed full-universe capacity envelope (capacity planning uses 548,942 discovered outcome tokens; the failed 2026-11-14 live capture expected 385,604 symbols. These are different runs and different evidence stages, not interchangeable counts; the default envelope is refused fail-closed by the capacity planner). The script then requires the expected set to equal the full discovered universe. `LIVE_SOAK_OK` is reserved for a full-universe run held for the stated soak duration and is not emitted by this script. The manual live workflow runs the same script on the protected runner and uploads the complete `captures/` bundle as a retained artifact.
 
 Evidence discipline: a failed run is preserved as a failure — raw captures are
 deleted only after hashing, with the hashes, reduced reports and logs checked

@@ -633,6 +633,11 @@ pub struct NetworkSettings {
     /// the name of the approved egress path. Recorded verbatim; credentials
     /// must never be placed here.
     pub proxy_label: Option<String>,
+    /// Venue this transport serves. Derived from `exchange` at settings load
+    /// time; never read from a file or environment. A standalone transport
+    /// uses a loopback-only test identity; an empty venue denies.
+    #[serde(skip)]
+    pub venue: String,
 }
 
 impl Default for NetworkSettings {
@@ -649,6 +654,9 @@ impl Default for NetworkSettings {
             proxy_auth_password_env: "MARKETDATA_PROXY_PASSWORD".to_owned(),
             proxy_remote_dns: true,
             proxy_label: None,
+            // A standalone transport default is a loopback test transport.
+            // Settings derived from an exchange replace it with that venue.
+            venue: "loopback".to_owned(),
         }
     }
 }
@@ -671,6 +679,7 @@ impl NetworkSettings {
             connect_timeout: std::time::Duration::from_secs(self.connect_timeout_secs.max(1)),
             egress,
             trace: None,
+            venue: self.venue.clone(),
         })
     }
 }
@@ -721,10 +730,25 @@ impl Default for JournalSettings {
     }
 }
 
+/// Runtime authorization source and decision audit trail.
+///
+/// Rights live in a separate, operator-supplied config file. An absent path
+/// denies every provider-egress command; no environment variable can grant a
+/// right.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct GovernanceSettings {
+    /// Path to the TOML file of effective-dated authorization records.
+    pub rights_file: Option<PathBuf>,
+    /// Directory for one machine-readable JSON decision event per check.
+    pub audit_dir: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
     pub exchange: ExchangeKind,
+    pub governance: GovernanceSettings,
     pub kalshi: KalshiSettings,
     pub polymarket: PolymarketSettings,
     pub hyperliquid: HyperliquidSettings,
@@ -742,6 +766,7 @@ pub struct FileConfig {
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
     pub exchange: ExchangeKind,
+    pub governance: GovernanceSettings,
     pub kalshi: KalshiSettings,
     pub polymarket: PolymarketSettings,
     pub hyperliquid: HyperliquidSettings,
@@ -766,8 +791,9 @@ impl Settings {
             exchange,
             ..FileConfig::default()
         };
-        Self {
+        let mut settings = Self {
             exchange: file.exchange,
+            governance: file.governance,
             kalshi: file.kalshi,
             polymarket: file.polymarket,
             hyperliquid: file.hyperliquid,
@@ -780,7 +806,9 @@ impl Settings {
             output: file.output,
             metrics: file.metrics,
             journal: file.journal,
-        }
+        };
+        settings.sync_venue();
+        settings
     }
 
     pub fn load(path: Option<&Path>) -> anyhow::Result<Self> {
@@ -795,6 +823,7 @@ impl Settings {
         };
         let mut settings = Self {
             exchange: file.exchange,
+            governance: file.governance,
             kalshi: file.kalshi,
             polymarket: file.polymarket,
             hyperliquid: file.hyperliquid,
@@ -809,8 +838,14 @@ impl Settings {
             journal: file.journal,
         };
         settings.apply_environment()?;
+        settings.sync_venue();
         settings.validate()?;
         Ok(settings)
+    }
+
+    /// Keep the egress venue derived from the effective exchange selection.
+    pub fn sync_venue(&mut self) {
+        self.network.venue = self.exchange.to_string();
     }
 
     fn apply_environment(&mut self) -> anyhow::Result<()> {

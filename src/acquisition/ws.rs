@@ -76,6 +76,10 @@ pub struct ConnectOptions {
     pub egress: EgressRoute,
     /// Optional stage recorder used by `network-probe`. Zero-cost when unset.
     pub trace: Option<ProbeTrace>,
+    /// Venue-scoped authorization identity for this connection. The library
+    /// default is the `loopback` test identity, which never permits a provider
+    /// host; production options are built from the effective venue in settings.
+    pub venue: String,
 }
 
 /// One recorded phase of a connection attempt.
@@ -146,6 +150,7 @@ impl std::fmt::Debug for ConnectOptions {
             .field("attempts", &self.attempts)
             .field("connect_timeout", &self.connect_timeout)
             .field("egress", &self.egress)
+            .field("venue", &self.venue)
             .finish()
     }
 }
@@ -160,6 +165,7 @@ impl Default for ConnectOptions {
             connect_timeout: Duration::from_secs(30),
             egress: EgressRoute::Direct,
             trace: None,
+            venue: "loopback".to_owned(),
         }
     }
 }
@@ -209,6 +215,7 @@ pub async fn connect(
     headers: &[(http::HeaderName, http::HeaderValue)],
     options: &ConnectOptions,
 ) -> anyhow::Result<WsStream> {
+    authorize_connect(&options.venue, url)?;
     match tokio::time::timeout(
         options.connect_timeout,
         connect_inner(url, headers, options),
@@ -221,6 +228,33 @@ pub async fn connect(
             options.connect_timeout
         ),
     }
+}
+
+/// Deny the connection before resolution or socket creation unless a live,
+/// venue-scoped right covers it. The `loopback` identity is the library's test
+/// default and is accepted only for a loopback target, so it can never be used
+/// to reach a provider.
+fn authorize_connect(venue: &str, url: &str) -> anyhow::Result<()> {
+    if venue.eq_ignore_ascii_case("loopback") {
+        let host = Url::parse(url).ok().and_then(|parsed| {
+            parsed
+                .host_str()
+                .map(|host| egress::strip_brackets(host).to_owned())
+        });
+        anyhow::ensure!(
+            host.as_deref().is_some_and(is_loopback_host),
+            "loopback authorization cannot open a websocket to a provider host"
+        );
+        return Ok(());
+    }
+    crate::rights::require_provider_egress(venue, "websocket_connect")
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 async fn connect_inner(

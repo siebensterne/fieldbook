@@ -8,8 +8,11 @@
 # hosted runner. The collector's configured direct egress is required.
 #
 # Usage:
-#   HYPERLIQUID_READ_ONLY_ACCESS_CONFIRMED=1 \
+#   HL_RIGHTS_FILE=/absolute/path/to/rights.toml \
 #     HL_DURATION_SECS=300 scripts/run-hyperliquid-evidence.sh
+#
+# HL_RIGHTS_FILE is required: the collector denies every provider-facing
+# command without a live, venue-scoped right from that config file.
 set -Eeuo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -21,6 +24,8 @@ SHARDS="${HL_SHARDS:-1}"
 REPLICAS="${HL_REPLICAS:-1}"
 CONFIG="${HL_CONFIG:-}"
 RECOVERY="${HL_RECOVERY_DRILL:-0}"
+RIGHTS_FILE="${HL_RIGHTS_FILE:-}"
+RIGHTS_AUDIT_DIR="${HL_RIGHTS_AUDIT_DIR:-}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 if [[ "$RECOVERY" == 1 ]]; then
   OUT="${HL_EVIDENCE_DIR:-$ROOT/captures/live-hyperliquid-recovery-$STAMP}"
@@ -37,10 +42,8 @@ for tool in cargo python3 git; do
   fi
 done
 
-if [[ "${HYPERLIQUID_READ_ONLY_ACCESS_CONFIRMED:-0}" != "1" ]]; then
-  echo "ERROR: set HYPERLIQUID_READ_ONLY_ACCESS_CONFIRMED=1 after checking the" >&2
-  echo "       current venue terms and applicable local requirements." >&2
-  echo "       This script only uses public, direct, read-only market data." >&2
+if [[ -z "$RIGHTS_FILE" || ! -r "$RIGHTS_FILE" ]]; then
+  echo "ERROR: HL_RIGHTS_FILE must name a readable contract-derived rights TOML file." >&2
   exit 2
 fi
 PROXY_ENV="${HTTPS_PROXY:-}${https_proxy:-}${HTTP_PROXY:-}"
@@ -93,6 +96,10 @@ if [[ -n "$CONFIG" ]]; then
     exit 2
   fi
   config_args=(--config "$CONFIG")
+fi
+config_args+=(--rights-file "$RIGHTS_FILE")
+if [[ -n "$RIGHTS_AUDIT_DIR" ]]; then
+  config_args+=(--rights-audit-dir "$RIGHTS_AUDIT_DIR")
 fi
 
 mkdir -p "$OUT" || { echo "ERROR: cannot create $OUT" >&2; exit 1; }
