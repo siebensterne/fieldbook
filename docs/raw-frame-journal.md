@@ -38,9 +38,14 @@ sync_mode = "interval"   # or "always"
 or use the environment or command line:
 
 ```bash
-COLLECTOR_JOURNAL_DIR=captures/journal cargo run --release -- collect
-cargo run --release -- --journal-dir captures/journal collect
+COLLECTOR_JOURNAL_DIR=captures/journal \
+  cargo run --release -- --rights-file /absolute/path/to/rights.toml collect
+cargo run --release -- --journal-dir captures/journal \
+  --rights-file /absolute/path/to/rights.toml collect
 ```
+
+Collection requires a runtime authorization file; the explicit `collect`
+subcommand never starts implicitly.
 
 `sync_mode = "always"` flushes and fsyncs each record. The default `interval`
 mode flushes on `flush_interval_ms`, syncs on `sync_interval_ms`, and performs a

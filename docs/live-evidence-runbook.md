@@ -5,6 +5,12 @@ place orders. It connects directly to each venue, discovers a small set of open
 markets, subscribes to one websocket source, records an SBE capture and a
 raw-frame journal, and verifies both outputs.
 
+Running the binary with no subcommand starts nothing. Every provider-facing
+command (`collect`, `discover`, `latency`, `network-probe`, `analytics-export`)
+requires a runtime authorization file and denies before any client, socket or
+published file when that file is missing, malformed, expired, or out of scope.
+Environment variables and self-attested permission flags are not authorization.
+
 ## Access conditions
 
 Run only from the machine and network on which you are physically located, and
@@ -42,17 +48,19 @@ The [Kalshi Member Agreement](https://kalshi.com/docs/kalshi-member-agreement.pd
 
 Rust toolchain pinned by `rust-toolchain.toml` (1.99.1).
 `cargo`, `git`, `python3`, Bash, and a direct network path to each venue.
+- A contract-derived authorization file for each venue and operation. Copy
+  `rights.example.toml`, fill in the venue, provider, source, operation,
+  purpose, effective interval and licence reference, and set `decision` to
+  `permitted` only after the right has been verified. The file is passed as
+  `LIVE_RIGHTS_FILE` below.
 - For Kalshi: a valid API key ID and private key, plus confirmation that
   authenticated read-only market-data API use is permitted for the account and
   the machine's location.
 
-Set the two explicit operator attestations only after checking the current venue
-terms and applicable law:
-
-```bash
-export POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED=1
-export KALSHI_READ_ONLY_ACCESS_CONFIRMED=1
-```
+No environment variable can grant a right. `LIVE_RIGHTS_FILE` only names the
+configuration file; the collector reads and validates its records at startup,
+records every decision in the audit directory, and fails closed if the file is
+missing, malformed, expired, or lacks a venue.
 
 Kalshi credentials are read from environment variables. Prefer a protected PEM
 file path; a PEM environment variable is also supported:
@@ -71,12 +79,14 @@ an evidence artifact. Do not paste secrets into logs or issue reports.
 From the repository root, for a small smoke run:
 
 ```bash
+LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml \
 LIVE_DURATION_SECS=120 LIVE_MAX_MARKETS=5 scripts/run-live-evidence.sh
 ```
 
 For the full discovered universe (operator and venue limits permitting):
 
 ```bash
+LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml \
 LIVE_EVIDENCE_SCOPE=universe LIVE_MAX_MARKETS=0 \
 LIVE_DURATION_SECS=900 scripts/run-live-evidence.sh
 ```
@@ -102,6 +112,11 @@ directory under `captures/` containing, per venue:
 The root `run-manifest.json` records the source commit, run times, evidence
 tier, scope, venue statuses, and hashes of the two evidence manifests. It
 contains no API keys, private keys, or proxy credentials.
+
+Set `LIVE_RIGHTS_AUDIT_DIR` to retain one machine-readable JSON event per
+authorization and egress decision: operation, venue and provider identity,
+decision, licence reference and timestamp. The audit trail contains no market
+data and no secrets.
 
 Kalshi collection uses a dedicated lifecycle control plane: book shards carry
 only order-book subscriptions, and `collector.lifecycle_replicas` supervised
@@ -183,10 +198,14 @@ smoke capture can therefore pass `coverage` while still being only
 
 The test suite has separate venue tests:
 
+Both tests require `LIVE_RIGHTS_FILE` naming a rights file with a `permitted`
+decision for the selected venue and `collect` operation. They refuse to start
+without it; an environment attestation is not a right.
+
 ```bash
-RUN_LIVE_TESTS=1 cargo test --test live_polymarket --locked -- --ignored --nocapture
-RUN_LIVE_KALSHI_TESTS=1 \
-KALSHI_READ_ONLY_ACCESS_CONFIRMED=1 \
+RUN_LIVE_TESTS=1 LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml \
+cargo test --test live_polymarket --locked -- --ignored --nocapture
+RUN_LIVE_KALSHI_TESTS=1 LIVE_RIGHTS_FILE=/absolute/path/to/rights.toml \
 cargo test --test live_kalshi --locked -- --ignored --nocapture
 ```
 
@@ -202,13 +221,13 @@ requires `refs/heads/main` and targets the protected GitHub Environment
 environment to allow only `main` and require reviewer approval. Store these as
 environment-scoped secrets/variables rather than general repository secrets:
 
-Variable `POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED=1`, set only after checking
-  current Polymarket terms and applicable local law.
+Variable `LIVE_RIGHTS_FILE`, the path to a contract-derived rights file
+  provisioned on the runner for the selected venue and `collect` operation.
+  The variable names the file; it is not itself an authorization. The collector
+  validates the file and denies if it is missing, malformed, expired or out of
+  scope.
 Secret `KALSHI_API_KEY_ID`.
 Secret `KALSHI_PRIVATE_KEY_PEM`.
-Variable `KALSHI_READ_ONLY_ACCESS_CONFIRMED=1`, set only after confirming
-  that Kalshi permits read-only market-data access for the account and runner
-  location.
 
 A self-hosted runner label is an operator control, not a geographic verification
 service. Environment branch restrictions and required reviewers must be
@@ -229,11 +248,11 @@ compressed telemetry channel. `scripts/run-live-evidence.sh` does
 not cover it; do not claim that it certifies this adapter.
 
 ```bash
-HYPERLIQUID_READ_ONLY_ACCESS_CONFIRMED=1 \
+HL_RIGHTS_FILE=/absolute/path/to/rights.toml \
   HL_DURATION_SECS=300 scripts/run-hyperliquid-evidence.sh
 ```
 
-The script refuses to run without the explicit read-only attestation, with any
+The script refuses to run without a readable rights file, with any
 proxy environment variable set, or with a dirty working tree. It builds the
 release binary, discovers the venue universe and narrows it to the configured
 selected perpetuals, collects from the direct public mainnet websocket, and
@@ -250,7 +269,7 @@ A controlled reconnect drill uses a reviewed config with a short refresh
 interval and changes the evidence tier to `HL_LIVE_RECOVERY_OK`:
 
 ```bash
-HYPERLIQUID_READ_ONLY_ACCESS_CONFIRMED=1 \
+HL_RIGHTS_FILE=/absolute/path/to/rights.toml \
   HL_RECOVERY_DRILL=1 HL_CONFIG=config.hyperliquid-recovery.example.toml \
   HL_DURATION_SECS=300 scripts/run-hyperliquid-evidence.sh
 ```

@@ -42,6 +42,7 @@ use fieldbook::rights::{
     AuthorizationRecord,   //
     DecisionAudit,         //
     LicensingRegistry,     //
+    Operation,             //
     Purpose,               //
     RecipientClass,        //
     RightDecision,         //
@@ -182,6 +183,8 @@ fn licensing() -> LicensingRegistry {
     registry
         .register(AuthorizationRecord {
             identity: AuthorizationIdentity {
+                venue: "fixture-provider".to_owned(),
+                operation: Operation::Collect,
                 provider_id: "fixture-provider".to_owned(),
                 source_id: "fixture-source".to_owned(),
                 dataset_id: "trades".to_owned(),

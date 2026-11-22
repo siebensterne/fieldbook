@@ -7,5 +7,10 @@
 # no credentials, no proxy and no synthetic injection into the venue feed.
 exchange = "hyperliquid"
 
+[governance]
+# Required for collect and the other provider-facing commands.
+# rights_file = "rights.toml"
+# audit_dir = "captures/authorization-audit"
+
 [collector]
 reconnect_after_secs = 60

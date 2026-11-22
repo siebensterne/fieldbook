@@ -15,16 +15,29 @@ use crate::config::Settings;
 #[command(
     name = "fieldbook",
     version,
+    arg_required_else_help = true,
     about = "Low-latency prediction-market order-book collector",
-    long_about = "Collect live Kalshi (or public Polymarket) order books into the \
-                  supplied FIX SBE schema, replay normalized fixtures, inspect \
-                  captures, or measure live discovery and timestamp latency."
+    long_about = "An explicit subcommand is required; running with no command \
+                  starts no provider activity. Live commands (collect, discover, \
+                  latency, network-probe, analytics-export) also require a \
+                  runtime authorization file. Offline commands (replay, inspect, \
+                  verify, completeness, coverage, journal, analytics-verify) are \
+                  inspect-only and need no rights."
 )]
 pub struct Cli {
     /// TOML configuration file. Built-in defaults, file, environment, then CLI
     /// flags are applied in that order.
     #[arg(long, global = true, value_name = "FILE")]
     pub config: Option<PathBuf>,
+
+    /// Runtime authorization records (TOML). Overrides `[governance].rights_file`.
+    #[arg(long = "rights-file", global = true, value_name = "FILE")]
+    pub rights_file: Option<PathBuf>,
+
+    /// Directory for machine-readable authorization decision events. Overrides
+    /// `[governance].audit_dir`.
+    #[arg(long = "rights-audit-dir", global = true, value_name = "DIR")]
+    pub rights_audit_dir: Option<PathBuf>,
 
     #[arg(long, global = true, value_enum)]
     pub exchange: Option<ExchangeKind>,
@@ -153,7 +166,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Collect live order books (default command).
+    /// Collect live order books. Requires a runtime authorization for this venue.
     Collect,
     /// Replay a normalized JSONL fixture through the collector core.
     Replay {
@@ -290,10 +303,37 @@ pub enum JournalCommand {
     },
 }
 
+/// Commands that would contact a provider or publish derived provider data.
+/// Every one of them is gated before its library implementation is called.
+#[must_use]
+pub fn gated_operation(command: &Command) -> Option<crate::rights::Operation> {
+    use crate::rights::Operation;
+    match command {
+        Command::Collect => Some(Operation::Collect),
+        Command::Discover { .. } => Some(Operation::Discover),
+        Command::Latency { .. } => Some(Operation::Latency),
+        Command::NetworkProbe { .. } => Some(Operation::NetworkProbe),
+        Command::AnalyticsExport { .. } => Some(Operation::AnalyticsExport),
+        Command::Replay { .. }
+        | Command::Inspect { .. }
+        | Command::Verify { .. }
+        | Command::Completeness { .. }
+        | Command::Coverage { .. }
+        | Command::AnalyticsVerify { .. }
+        | Command::Journal { .. } => None,
+    }
+}
+
 impl Cli {
     pub fn apply_settings(&self, settings: &mut Settings) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange {
             settings.exchange = exchange;
+        }
+        if let Some(path) = &self.rights_file {
+            settings.governance.rights_file = Some(path.clone());
+        }
+        if let Some(path) = &self.rights_audit_dir {
+            settings.governance.audit_dir = Some(path.clone());
         }
         if let Some(environment) = self.kalshi_environment {
             settings.kalshi.environment = environment;
@@ -382,6 +422,7 @@ impl Cli {
         if let Some(duration_secs) = self.duration_secs {
             settings.collector.duration_secs = duration_secs;
         }
+        settings.sync_venue();
         settings
             .validate()
             .context("validating command-line overrides")?;
@@ -391,9 +432,43 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, JournalCommand};
+    use super::{Cli, Command, JournalCommand, gated_operation};
+    use crate::rights::Operation;
     use clap::Parser;
     use std::path::Path;
+
+    #[test]
+    fn no_command_is_not_a_live_recipe() {
+        let error = Cli::try_parse_from(["fieldbook"]).expect_err("no command must not parse");
+        assert!(
+            error.to_string().contains("subcommand") || error.to_string().contains("required"),
+            "the missing subcommand must be reported: {error}"
+        );
+    }
+
+    #[test]
+    fn only_provider_facing_commands_are_gated() {
+        let expectations = [
+            ("collect", Some(Operation::Collect)),
+            ("discover", Some(Operation::Discover)),
+            ("latency", Some(Operation::Latency)),
+            ("network-probe", Some(Operation::NetworkProbe)),
+            ("inspect", None),
+            ("verify", None),
+        ];
+        for (name, expected) in expectations {
+            let mut argv = vec!["fieldbook", name];
+            if matches!(name, "inspect" | "verify") {
+                argv.push("unused.sbe");
+            }
+            let cli = Cli::try_parse_from(argv).expect("parse command");
+            assert_eq!(
+                gated_operation(cli.command.as_ref().expect("command")),
+                expected,
+                "gate classification for {name}"
+            );
+        }
+    }
 
     #[test]
     fn journal_recover_command_requires_a_run_directory() {

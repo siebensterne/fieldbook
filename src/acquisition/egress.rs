@@ -8,6 +8,9 @@
 //!
 //! Properties enforced here:
 //!
+//! - **Rights before routes.** No HTTP client is built until the runtime
+//!   authorization source has granted a live, venue-scoped right. A proxy is a
+//!   route, never an entitlement.
 //! - **Fail closed.** In `explicit_proxy` mode, a proxy that cannot be
 //!   reached or negotiated fails the connection. There is never a silent
 //!   fallback to direct egress.
@@ -386,6 +389,9 @@ pub fn http_client_with(
     network: &NetworkSettings,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<reqwest::Client> {
+    // Fail closed before a client exists: no provider HTTP client is built
+    // without a live, venue-scoped authorization for this process.
+    crate::rights::require_provider_egress(&network.venue, "http_client")?;
     let route = EgressRoute::from_network_with(network, lookup)?;
     let mut builder = reqwest::Client::builder()
         .user_agent(user_agent.to_owned())

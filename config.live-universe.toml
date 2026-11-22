@@ -18,6 +18,12 @@
 
 exchange = "polymarket"
 
+[governance]
+# The run script supplies --rights-file; the path must hold a reviewed grant
+# for this venue and operation. No environment variable can substitute for it.
+# rights_file = "rights.toml"
+# audit_dir = "captures/authorization-audit"
+
 [collector]
 # 0 derives the shard count from the discovered symbol count.
 shards = 0

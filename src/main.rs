@@ -3,17 +3,18 @@
 use std::io::Write;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{CommandFactory as _, Parser};
 use tracing_subscriber::EnvFilter;
 
 use fieldbook::{
     completeness, config::Settings, coordinator, coverage, inspect, journal, latency, probe,
-    replay, report::write_json_atomic, verify,
+    replay, report::write_json_atomic, rights, verify,
 };
 
 use fieldbook::distribution::cli::Cli;
 use fieldbook::distribution::cli::Command;
 use fieldbook::distribution::cli::JournalCommand;
+use fieldbook::distribution::cli::gated_operation;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -21,7 +22,16 @@ async fn main() -> anyhow::Result<()> {
     init_tracing(cli.log_json)?;
     let mut settings = Settings::load(cli.config.as_deref())?;
     cli.apply_settings(&mut settings)?;
-    match cli.command.unwrap_or(Command::Collect) {
+    let Some(command) = cli.command else {
+        Cli::command().print_help().context("printing CLI help")?;
+        anyhow::bail!("an explicit subcommand is required; no provider activity was started");
+    };
+    // Gate before dispatch: a denied decision must stop the command before a
+    // client is built, a socket is opened, or a file is published.
+    if let Some(operation) = gated_operation(&command) {
+        rights::authorize_command(&settings, operation)?;
+    }
+    match command {
         Command::Collect => {
             let report = coordinator::run(settings).await?;
             eprintln!(

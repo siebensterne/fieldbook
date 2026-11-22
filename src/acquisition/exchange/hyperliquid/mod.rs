@@ -42,12 +42,12 @@ pub struct HyperliquidExchange {
 
 impl HyperliquidExchange {
     pub fn new(settings: HyperliquidSettings, network: NetworkSettings) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(
-                settings.request_timeout_secs.max(1),
-            ))
-            .build()
-            .context("building Hyperliquid HTTP client")?;
+        let client = crate::egress::http_client(
+            concat!("fieldbook-collector/", env!("CARGO_PKG_VERSION")),
+            std::time::Duration::from_secs(settings.request_timeout_secs.max(1)),
+            &network,
+        )
+        .context("building Hyperliquid HTTP client")?;
         Ok(Self {
             settings,
             network,

@@ -20,10 +20,11 @@ jobs:
     env:
       RUN_LIVE_TESTS: "1"
       RUN_LIVE_KALSHI_TESTS: "1"
-      POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED: ${{ vars.POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED }}
+      # Path to a contract-derived rights file provisioned on the runner.
+      # Environment variables never grant a right; this only names the config.
+      LIVE_RIGHTS_FILE: ${{ vars.LIVE_RIGHTS_FILE }}
       KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
       KALSHI_PRIVATE_KEY_PEM: ${{ secrets.KALSHI_PRIVATE_KEY_PEM }}
-      KALSHI_READ_ONLY_ACCESS_CONFIRMED: ${{ vars.KALSHI_READ_ONLY_ACCESS_CONFIRMED }}
     steps:
       - name: Require the protected main branch
         shell: bash
@@ -47,20 +48,20 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
 
-      - name: Confirm Kalshi read-only credentials and permission gate
+      - name: Confirm runtime rights file and Kalshi credentials
         shell: bash
         run: |
           set -euo pipefail
-          test "$POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED" = "1" || {
-            echo "Set POLYMARKET_MARKET_DATA_ACCESS_CONFIRMED=1 only after checking current terms and local law." >&2
+          test -n "$LIVE_RIGHTS_FILE" || {
+            echo "LIVE_RIGHTS_FILE must name a contract-derived rights file." >&2
+            exit 1
+          }
+          test -r "$LIVE_RIGHTS_FILE" || {
+            echo "LIVE_RIGHTS_FILE is not readable: $LIVE_RIGHTS_FILE" >&2
             exit 1
           }
           test -n "$KALSHI_API_KEY_ID" || { echo "KALSHI_API_KEY_ID secret is required" >&2; exit 1; }
           test -n "$KALSHI_PRIVATE_KEY_PEM" || { echo "KALSHI_PRIVATE_KEY_PEM secret is required" >&2; exit 1; }
-          test "$KALSHI_READ_ONLY_ACCESS_CONFIRMED" = "1" || {
-            echo "Set the KALSHI_READ_ONLY_ACCESS_CONFIRMED Actions variable to 1 only after confirming market-data-only access is allowed for this account and runner location." >&2
-            exit 1
-          }
 
       - name: Run Polymarket public-feed discovery and websocket tests
         run: cargo test --test live_polymarket --locked -- --ignored --nocapture

@@ -27,7 +27,9 @@ use crate::{
         adapter::SourceCapabilityManifest,
         coverage_certification::ExpectedUniverse,
         modality::validate_modalities,
-        rights::{AuthorizationQuery, LicensingRegistry, Purpose, RecipientClass, UsageRight},
+        rights::{
+            AuthorizationQuery, LicensingRegistry, Operation, Purpose, RecipientClass, UsageRight,
+        },
     },
     taxonomy::CountryCode,
 };
@@ -563,6 +565,8 @@ pub fn run_conformance(
     }
     for right in &declaration.rights_required {
         let query = AuthorizationQuery {
+            venue: declaration.provider_id.clone(),
+            operation: Operation::Collect,
             provider_id: declaration.provider_id.clone(),
             source_id: declaration.source_id.clone(),
             dataset_id: declaration.dataset.clone(),
@@ -911,6 +915,8 @@ mod tests {
         licensing
             .register(AuthorizationRecord {
                 identity: AuthorizationIdentity {
+                    venue: "provider".to_owned(),
+                    operation: Operation::Collect,
                     provider_id: "provider".to_owned(),
                     source_id: "source".to_owned(),
                     dataset_id: "quotes".to_owned(),
@@ -993,6 +999,8 @@ mod tests {
         licensing
             .register(AuthorizationRecord {
                 identity: AuthorizationIdentity {
+                    venue: "provider".to_owned(),
+                    operation: Operation::Collect,
                     provider_id: "provider".to_owned(),
                     source_id: "source".to_owned(),
                     dataset_id: "quotes".to_owned(),

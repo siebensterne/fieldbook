@@ -132,6 +132,7 @@ pub async fn run_with_route(
         ),
         egress: route,
         trace: Some(ProbeTrace::begin()),
+        venue: settings.network.venue.clone(),
     };
 
     let started = Instant::now();
