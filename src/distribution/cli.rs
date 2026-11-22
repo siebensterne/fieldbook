@@ -432,7 +432,10 @@ impl Cli {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, JournalCommand, gated_operation};
+    use super::Cli;
+    use super::Command;
+    use super::JournalCommand;
+    use super::gated_operation;
     use crate::rights::Operation;
     use clap::Parser;
     use std::path::Path;

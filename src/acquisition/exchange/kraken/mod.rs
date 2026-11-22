@@ -15,7 +15,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 
 use crate::{
-    config::{ExchangeKind, KrakenSettings},
+    config::{ExchangeKind, KrakenSettings, NetworkSettings},
     exchange::{DiscoveryResult, Exchange, ExchangeCapabilities},
     model::MarketInfo,
     products::{
@@ -34,13 +34,13 @@ pub struct KrakenExchange {
 }
 
 impl KrakenExchange {
-    pub fn new(settings: KrakenSettings) -> anyhow::Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(
-                settings.request_timeout_secs.max(1),
-            ))
-            .build()
-            .context("building Kraken HTTP client")?;
+    pub fn new(settings: KrakenSettings, network: NetworkSettings) -> anyhow::Result<Self> {
+        let client = crate::egress::http_client(
+            concat!("fieldbook-collector/", env!("CARGO_PKG_VERSION")),
+            std::time::Duration::from_secs(settings.request_timeout_secs.max(1)),
+            &network,
+        )
+        .context("building Kraken HTTP client")?;
         Ok(Self { settings, client })
     }
 
@@ -158,7 +158,7 @@ mod tests {
             ),
             ..KrakenSettings::default()
         };
-        let exchange = KrakenExchange::new(settings).unwrap();
+        let exchange = KrakenExchange::new(settings, NetworkSettings::default()).unwrap();
         let result = exchange.discover_markets_with_stats(0).await.unwrap();
         assert_eq!(result.markets.len(), 5);
         assert_eq!(result.stats.selected_markets, 5);
@@ -170,7 +170,8 @@ mod tests {
 
     #[test]
     fn h0_uses_clockless_capabilities_and_no_lifecycle_plane() {
-        let exchange = KrakenExchange::new(KrakenSettings::default()).unwrap();
+        let exchange =
+            KrakenExchange::new(KrakenSettings::default(), NetworkSettings::default()).unwrap();
         assert_eq!(exchange.name(), "kraken");
         assert!(!exchange.capabilities().has_sequence_clock);
         assert_eq!(capabilities(), exchange.capabilities());

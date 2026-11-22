@@ -1438,9 +1438,16 @@ mod tests {
         let context = RightsContext::load(&path, Some(&audit)).expect("rights file loads");
         let request = collect_request();
         let proof = context.authorize(&request, 2).expect("decision granted");
-        assert_eq!(proof.venue, "venue-a");
-        assert_eq!(proof.operation, Operation::Collect);
-        assert_eq!(proof.licence_reference, "contract-1");
+        assert_eq!(proof.venue, "venue-a", "the proof carries the venue");
+        assert_eq!(
+            proof.operation,
+            Operation::Collect,
+            "the proof carries the operation"
+        );
+        assert_eq!(
+            proof.licence_reference, "contract-1",
+            "the proof carries the licence reference"
+        );
         let entries: Vec<_> = std::fs::read_dir(&audit)
             .expect("audit directory")
             .map(|entry| entry.expect("audit entry").path())
@@ -1448,14 +1455,23 @@ mod tests {
         assert!(entries.len() >= 2, "load and decision are both recorded");
         let text = std::fs::read_to_string(&entries[1]).expect("audit event");
         let event: DecisionAuditEvent = serde_json::from_str(&text).expect("valid audit event");
-        assert_eq!(event.operation, "collect");
-        assert_eq!(event.venue, "venue-a");
-        assert_eq!(event.decision, "permitted");
-        assert_eq!(event.dataset_id, "market-reference");
-        assert_eq!(event.product_id, "collect");
-        assert_eq!(event.usage_right, "real_time_access");
-        assert_eq!(event.purpose, "internal_analysis");
-        assert_eq!(event.recorded_at_us, 2);
+        assert_eq!(event.operation, "collect", "the operation is recorded");
+        assert_eq!(event.venue, "venue-a", "the venue is recorded");
+        assert_eq!(event.decision, "permitted", "the decision is recorded");
+        assert_eq!(
+            event.dataset_id, "market-reference",
+            "the dataset is recorded"
+        );
+        assert_eq!(event.product_id, "collect", "the product is recorded");
+        assert_eq!(
+            event.usage_right, "real_time_access",
+            "the right is recorded"
+        );
+        assert_eq!(
+            event.purpose, "internal_analysis",
+            "the purpose is recorded"
+        );
+        assert_eq!(event.recorded_at_us, 2, "the timestamp is recorded");
         assert!(
             event
                 .reference

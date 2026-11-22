@@ -3,7 +3,8 @@
 use std::io::Write;
 
 use anyhow::Context;
-use clap::{CommandFactory as _, Parser};
+use clap::CommandFactory as _;
+use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use fieldbook::{

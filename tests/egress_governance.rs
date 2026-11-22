@@ -22,9 +22,10 @@ use clap::CommandFactory as _;
 use clap::Parser as _;
 
 use fieldbook::{
-    config::{ExchangeKind, NetworkSettings, Settings},
+    config::{CoinbaseSettings, ExchangeKind, KrakenSettings, NetworkSettings, Settings},
     distribution::cli::Cli,
     egress::http_client,
+    exchange::{CoinbaseExchange, KrakenExchange},
     rights::{Operation, authorize_command, has_active_authorization, require_provider_egress},
     ws::{self, ConnectOptions},
 };
@@ -85,13 +86,22 @@ fn no_subcommand_is_not_a_live_recipe() {
 
 #[test]
 fn collect_without_rights_file_denies_before_egress() {
-    assert!(!has_active_authorization());
+    assert!(
+        !has_active_authorization(),
+        "the test process starts ungated"
+    );
     let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
     settings.governance.rights_file = None;
     let error = authorize_command(&settings, Operation::Collect)
         .expect_err("collection without a rights file must deny");
-    assert!(error.to_string().contains("runtime authorization file"));
-    assert!(!has_active_authorization());
+    assert!(
+        error.to_string().contains("runtime authorization file"),
+        "the denial names the missing rights file: {error}"
+    );
+    assert!(
+        !has_active_authorization(),
+        "a denied command installs no authorization"
+    );
     assert!(
         require_provider_egress("kalshi", "http_client").is_err(),
         "no proof means no HTTP client"
@@ -124,7 +134,10 @@ fn expired_and_unknown_rights_deny_every_gated_command() {
         authorize_command(&unknown, Operation::NetworkProbe).is_err(),
         "an UNKNOWN right denies a network probe"
     );
-    assert!(!has_active_authorization());
+    assert!(
+        !has_active_authorization(),
+        "a denied command installs no authorization"
+    );
 }
 
 #[test]
@@ -134,12 +147,18 @@ fn right_without_a_venue_is_refused_at_load() {
         authorize_command(&settings, Operation::Collect).is_err(),
         "a record without a venue is never a grant"
     );
-    assert!(!has_active_authorization());
+    assert!(
+        !has_active_authorization(),
+        "a denied command installs no authorization"
+    );
 }
 
 #[tokio::test]
 async fn websocket_connect_denies_before_resolution_without_a_right() {
-    assert!(!has_active_authorization());
+    assert!(
+        !has_active_authorization(),
+        "a denied command installs no authorization"
+    );
     let options = ConnectOptions {
         venue: "venue-a".to_owned(),
         connect_timeout: Duration::from_millis(100),
@@ -189,15 +208,47 @@ fn analytics_export_denial_publishes_nothing() {
 }
 
 #[test]
+fn coinbase_and_kraken_adapter_clients_deny_without_rights() {
+    assert!(
+        !has_active_authorization(),
+        "the test process starts ungated"
+    );
+    let coinbase_network = Settings::for_exchange(ExchangeKind::Coinbase).network;
+    assert_eq!(
+        coinbase_network.venue, "coinbase",
+        "adapter transport carries the Coinbase venue"
+    );
+    assert!(
+        CoinbaseExchange::new(CoinbaseSettings::default(), coinbase_network).is_err(),
+        "Coinbase client construction is gated"
+    );
+    let kraken_network = Settings::for_exchange(ExchangeKind::Kraken).network;
+    assert_eq!(
+        kraken_network.venue, "kraken",
+        "adapter transport carries the Kraken venue"
+    );
+    assert!(
+        KrakenExchange::new(KrakenSettings::default(), kraken_network).is_err(),
+        "Kraken client construction is gated"
+    );
+}
+
+#[test]
 fn unconfigured_transport_default_is_not_a_provider_venue() {
     let network = NetworkSettings::default();
-    assert_eq!(network.venue, "loopback");
+    assert_eq!(
+        network.venue, "loopback",
+        "a standalone transport is loopback-only"
+    );
     assert!(
         http_client("governance-test/1", Duration::from_secs(1), &network).is_ok(),
         "a standalone loopback transport may build a client without rights"
     );
     let live = Settings::for_exchange(ExchangeKind::Kalshi).network;
-    assert_eq!(live.venue, "kalshi");
+    assert_eq!(
+        live.venue, "kalshi",
+        "settings derive the venue from the exchange"
+    );
     assert!(
         http_client("governance-test/1", Duration::from_secs(1), &live).is_err(),
         "a venue transport needs a right even to build a client"
