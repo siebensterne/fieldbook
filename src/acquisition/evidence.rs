@@ -911,8 +911,14 @@ mod tests {
 
     #[test]
     fn replicated_profiles_are_refused_locally() {
-        assert!(!DurabilityProfile::D4.locally_achievable());
-        assert!(!DurabilityProfile::D5.locally_achievable());
-        assert!(DurabilityProfile::D3.locally_achievable());
+        assert!(
+            !DurabilityProfile::D4.locally_achievable(),
+            "D4 needs replication"
+        );
+        assert!(
+            !DurabilityProfile::D5.locally_achievable(),
+            "D5 needs replication"
+        );
+        assert!(DurabilityProfile::D3.locally_achievable(), "D3 is local");
     }
 }
