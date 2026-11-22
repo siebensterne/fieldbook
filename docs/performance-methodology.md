@@ -161,3 +161,36 @@ cargo test --test full_universe_stress stage_timing_cell_records_real_writer_wri
 python3 scripts/check_matrix_tests.py
 python3 scripts/check_architecture.py --check
 ```
+
+## Acquisition stage benchmark
+
+`cargo bench --bench pipeline_stages` measures stages separately. The matrix
+covers three payload sizes (64, 1,024 and 16,384 bytes), one and four events
+per packet, and trade, equity-quote and economic-observation payloads. Each
+stage has a warm-up phase and timed trials. The report contains median nanos,
+the spread between slowest and fastest sample, allocation counts and peak
+live bytes from a counting allocator. Environment variables
+`STAGE_BENCH_ITERATIONS` and `STAGE_BENCH_TRIALS` control repetition.
+
+A recorded run on this Apple Silicon development host with 200 iterations and
+one trial produced these medians for the small, one-event trade case:
+
+| Stage | Median ns | Allocations | Peak live bytes |
+|---|---:|---:|---:|
+| input framing | 42 | 201 | 4,864 |
+| protocol decode | 291 | 1,401 | 5,961 |
+| typed conversion | 1,250 | 2,401 | 5,505 |
+| identity stamping | 750 | 2,601 | 4,836 |
+| raw digest | 750 | 201 | 4,864 |
+| arbitration | 1,792 | 2,201 | 6,445 |
+| canonical persist | 84 | 1,001 | 4,891 |
+| evidence journaling | 3,999,042 | 8,001 | 6,640 |
+
+Evidence journaling includes an fsync-bounded journal acknowledgement and is
+not comparable with in-memory stages. These numbers are observations of one
+workload on one host. They are not latency targets or production results.
+
+The earlier two-path comparison remains in `benches/codec_normalization.rs`.
+Its recorded 50,000-iteration result was 171 ns per operation for the JSON
+interchange path and 1,263 ns per operation for typed normalization. The two
+paths do different work, so that ratio is not a performance conclusion.

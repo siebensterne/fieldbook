@@ -55,6 +55,10 @@ harness = false
 name = "codec_normalization"
 harness = false
 
+[[bench]]
+name = "pipeline_stages"
+harness = false
+
 # Debug information is only needed for workspace frames. Dependencies never
 # need DWARF here, and line tables keep backtraces usable for workspace code.
 # This cuts both compile time and the size of the target directory.
