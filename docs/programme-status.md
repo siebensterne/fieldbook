@@ -130,7 +130,17 @@ stops arbitration and is recorded. Every submitted packet produces a durable
 disposition, including duplicates, conflicts and stale packets. The Retain
 fault now fires before retention.
 
-M3.1.6-C through F remain open work from the independent review.
+M3.1.6-C closes evidence fidelity and acknowledgement findings. Packet
+evidence now carries the original frame kind, and both the journal record and
+the extension retain it. The extension also persists source protocol, codec
+schema identity and version, sequence domain and receive sequence. The journal
+returns a per-record acknowledgement tied to a concrete writer counter fence;
+D1 waits for write, D2 for flush and D3 for sync, and the stored extension
+carries that acknowledgement. D4 and D5 remain refused. Post-run binding uses
+an indexed lookup with a fixed entry ceiling instead of nested full scans, and
+extension rewrites stream through a bounded writer.
+
+M3.1.6-D through F remain open work from the independent review.
 
 ## Domain reorganisation
 

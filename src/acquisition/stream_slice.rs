@@ -216,7 +216,13 @@ pub fn run_stream_slice(
     let mut dispositions: BTreeMap<String, u64> = BTreeMap::new();
     let mut quality = Vec::new();
 
-    for packet in packets {
+    for (receive_sequence, packet) in packets.into_iter().enumerate() {
+        let context = crate::acquisition::evidence::EvidenceContext {
+            sequence_domain_id: config.source_id.clone(),
+            source_schema_id: "fixture-schema".to_owned(),
+            source_schema_version: config.schema_version,
+            receive_sequence: receive_sequence as u64 + 1,
+        };
         let evidence = PacketEvidence::new(
             &config.source_id,
             packet.channel,
@@ -228,7 +234,7 @@ pub fn run_stream_slice(
             "lab",
             "fixture-decoder",
         );
-        let receipt = pipeline.ingest(&evidence, config.source, config.schema_version);
+        let receipt = pipeline.ingest(&evidence, config.source, &context);
         *dispositions
             .entry(receipt.disposition.as_str().to_owned())
             .or_default() += 1;

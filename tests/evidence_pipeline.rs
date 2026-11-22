@@ -23,14 +23,17 @@ use fieldbook::{
         arbiter::FeedChannel,
         codec::{CodecRegistry, DecodeStatus, DecodedObservation, FeedCodec},
         evidence::{
-            CanonicalEvidenceRecord, CanonicalSink, DurabilityProfile, EvidenceDisposition,
-            EvidenceExtension, EvidenceLedger, EvidencePipeline, EvidenceReceipt, EvidenceStore,
-            FailurePoint, ProcessingStages, bind_and_verify,
+            CanonicalEvidenceRecord, CanonicalSink, DurabilityProfile, EvidenceContext,
+            EvidenceDisposition, EvidenceExtension, EvidenceLedger, EvidencePipeline,
+            EvidenceReceipt, EvidenceStore, FailurePoint, ProcessingStages, bind_and_verify,
         },
         packet::PacketEvidence,
     },
-    integrity::journal::{JournalConfig, JournalHandle, JournalMeta, SyncMode},
+    integrity::journal::{
+        JournalAckLevel, JournalConfig, JournalHandle, JournalMeta, SyncMode, read_observations,
+    },
     model::SourceId,
+    protocol::{FrameClassification, FrameKind},
 };
 
 struct FixtureCodec;
@@ -102,6 +105,15 @@ fn packet(sequence: u64) -> PacketEvidence {
     )
 }
 
+fn context() -> EvidenceContext {
+    EvidenceContext {
+        sequence_domain_id: "fixture-domain".to_owned(),
+        source_schema_id: "fixture-schema".to_owned(),
+        source_schema_version: 1,
+        receive_sequence: 1,
+    }
+}
+
 fn stages(sink: RecordingSink) -> ProcessingStages {
     let mut codecs = CodecRegistry::new();
     codecs
@@ -126,7 +138,7 @@ fn ingest_one(
     if let Some(point) = failure {
         pipeline = pipeline.with_injected_failure(point);
     }
-    let receipt = pipeline.ingest(&packet(1), SourceId::new(1, 0), 1);
+    let receipt = pipeline.ingest(&packet(1), SourceId::new(1, 0), &context());
     let stored = store.load().expect("extensions load").len();
     let run_directory = directory.join(run_id);
     pipeline
@@ -195,7 +207,7 @@ fn real_decode_normalization_and_canonical_persist_succeed() {
     let pipeline = EvidencePipeline::new(journal, store.clone(), DurabilityProfile::D1)
         .expect("pipeline created")
         .with_stages(stages(sink));
-    let receipt = pipeline.ingest(&packet(1), SourceId::new(1, 0), 1);
+    let receipt = pipeline.ingest(&packet(1), SourceId::new(1, 0), &context());
     assert_eq!(
         receipt.disposition,
         EvidenceDisposition::EvidencePersisted,
@@ -222,7 +234,7 @@ fn duplicate_extension_binding_is_reported_as_conflict() {
     let store = EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
     let pipeline = EvidencePipeline::new(journal, store.clone(), DurabilityProfile::D1)
         .expect("pipeline created");
-    pipeline.ingest(&packet(1), SourceId::new(1, 0), 1);
+    pipeline.ingest(&packet(1), SourceId::new(1, 0), &context());
     let stored = store.load().expect("extensions load");
     store.append(&stored[0]).expect("duplicate appended");
     let run_directory = directory.path().join("duplicate");
@@ -235,6 +247,98 @@ fn duplicate_extension_binding_is_reported_as_conflict() {
         "two extensions for one journal record must conflict"
     );
     assert!(!report.reconciled(), "conflict blocks reconciliation");
+}
+
+#[test]
+fn frame_kind_and_source_schema_survive_journal_and_extension() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let journal =
+        JournalHandle::start(config(directory.path()), meta("fidelity")).expect("journal started");
+    let store = EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+    let pipeline = EvidencePipeline::new(journal, store.clone(), DurabilityProfile::D2)
+        .expect("pipeline created");
+    let packet = packet(1).with_frame_kind(FrameKind::Text);
+    let context = EvidenceContext {
+        sequence_domain_id: "chain-a:1".to_owned(),
+        source_schema_id: "itch-5.0".to_owned(),
+        source_schema_version: 7,
+        receive_sequence: 41,
+    };
+    pipeline.ingest(&packet, SourceId::new(1, 0), &context);
+    let status = pipeline.status();
+    pipeline
+        .shutdown(Duration::from_secs(10))
+        .expect("journal closed");
+    let extension = store.load().expect("extensions load");
+    assert_eq!(extension.len(), 1, "one extension stored");
+    assert_eq!(extension[0].frame_kind, "text", "text frame kind survives");
+    assert_eq!(
+        extension[0].source_schema_id, "itch-5.0",
+        "schema id survives"
+    );
+    assert_eq!(
+        extension[0].source_schema_version, 7,
+        "schema version survives"
+    );
+    assert_eq!(
+        extension[0].sequence_domain_id, "chain-a:1",
+        "sequence domain survives"
+    );
+    assert_eq!(
+        extension[0].receive_sequence, 41,
+        "receive sequence survives"
+    );
+    let ack = extension[0]
+        .journal_ack
+        .as_ref()
+        .expect("journal ack stored");
+    assert_eq!(ack.level, JournalAckLevel::Flushed, "D2 waits for flush");
+    assert!(status.counters.flushed >= ack.fence, "ack fence is real");
+    let observations = read_observations(&directory.path().join("fidelity")).expect("journal read");
+    assert_eq!(observations.len(), 1, "journal has one raw record");
+    assert!(
+        matches!(
+            observations[0].classification,
+            FrameClassification::Data {
+                frame_kind: FrameKind::Text
+            }
+        ),
+        "journal preserves the original frame kind"
+    );
+}
+
+#[test]
+fn acknowledgement_matches_the_declared_durability_boundary() {
+    for (profile, expected) in [
+        (DurabilityProfile::D1, JournalAckLevel::Written),
+        (DurabilityProfile::D2, JournalAckLevel::Flushed),
+        (DurabilityProfile::D3, JournalAckLevel::Synced),
+    ] {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let journal =
+            JournalHandle::start(config(directory.path()), meta("ack")).expect("journal started");
+        let store = EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+        let pipeline = EvidencePipeline::new(journal, store.clone(), profile).expect("pipeline");
+        let receipt = pipeline.ingest(&packet(1), SourceId::new(1, 0), &context());
+        let status = pipeline.status();
+        let extension = store.load().expect("extensions load");
+        let ack = extension[0].journal_ack.as_ref().expect("ack stored");
+        assert_eq!(ack.level, expected, "profile waits for the real boundary");
+        let reached = match expected {
+            JournalAckLevel::Written => status.counters.written,
+            JournalAckLevel::Flushed => status.counters.flushed,
+            JournalAckLevel::Synced => status.counters.synced,
+            JournalAckLevel::Queued => status.counters.queued,
+        };
+        assert!(reached >= ack.fence, "acknowledgement matches writer state");
+        assert!(
+            receipt.ack != fieldbook::acquisition::evidence::DurabilityAck::Received,
+            "receipt reports a real journal boundary"
+        );
+        pipeline
+            .shutdown(Duration::from_secs(10))
+            .expect("journal closed");
+    }
 }
 
 #[test]

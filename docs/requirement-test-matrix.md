@@ -208,3 +208,11 @@ is explicitly
 | Duplicate digest window is bounded with the seen window | `src/acquisition/arbiter.rs::digest_window_is_pruned_with_the_seen_window` | Digest-map bytes are reported in memory snapshots. |
 | Restored state is validated and occupancy is recalculated | `src/acquisition/arbiter.rs::restore_rejects_snapshots_outside_limits`, `src/acquisition/arbiter.rs::restore_recalculates_occupancy_from_content` | Duplicate keys, inconsistent digests and oversized collections are refused. |
 | Evidence retention failure stops arbitration and is recorded | `src/acquisition/arbiter.rs::evidence_retention_failure_stops_arbitration`, `src/acquisition/arbiter.rs::retain_fault_precedes_the_evidence_sink`, `src/acquisition/arbiter.rs::conflicts_and_stale_packets_have_dispositions` | The evidence sink is required and fallible; in-memory sinks are not durability claims. |
+
+## M3.1.6-C evidence fidelity and acknowledgement
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Original frame kind, codec schema and sequence domain survive | `tests/evidence_pipeline.rs::frame_kind_and_source_schema_survive_journal_and_extension` | V1 journal observation contract is unchanged; the extension carries new fields. |
+| D1-D3 acknowledgements match real writer boundaries | `tests/evidence_pipeline.rs::acknowledgement_matches_the_declared_durability_boundary` | D4/D5 remain refused; replication does not exist. |
+| Post-run binding is indexed and bounded | `src/acquisition/evidence.rs::bind_and_verify`, `src/acquisition/evidence.rs::MAX_BINDING_ENTRIES` | Binding is linear in journal and extension counts with a fixed entry ceiling. |

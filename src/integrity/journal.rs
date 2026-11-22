@@ -324,6 +324,42 @@ pub struct DurabilityPolicy {
     pub enqueue_timeout_ms: u64,
 }
 
+/// Durability boundary a producer waits for after queueing a record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalAckLevel {
+    /// Record accepted into the writer queue.
+    Queued,
+    /// Record appended to the segment file.
+    Written,
+    /// Record included in a completed flush.
+    Flushed,
+    /// Record included in a completed `sync_all`.
+    Synced,
+}
+
+impl JournalAckLevel {
+    /// Return the stable contract string for this acknowledgement level.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Written => "written",
+            Self::Flushed => "flushed",
+            Self::Synced => "synced",
+        }
+    }
+}
+
+/// Acknowledgement tied to a concrete writer counter fence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalAck {
+    pub run_id: String,
+    pub level: JournalAckLevel,
+    /// Monotonic writer counter value the record reached.
+    pub fence: u64,
+    pub state: RunState,
+}
+
 /// Result of an orderly finalization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalSummary {
@@ -345,6 +381,8 @@ struct Inner {
     shutdown: Mutex<bool>,
     admission: Mutex<Admission>,
     admission_cv: Condvar,
+    /// Wakes producers waiting for a per-record durability boundary.
+    ack_cv: Condvar,
     /// Shared journal-append latency histogram, when instrumentation is
     /// requested by the caller. Read only by the writer thread.
     append_latency: Option<Arc<Histogram>>,
@@ -473,6 +511,7 @@ impl JournalHandle {
                 active: 0,
             }),
             admission_cv: Condvar::new(),
+            ack_cv: Condvar::new(),
             append_latency,
             #[cfg(test)]
             record_hook: Mutex::new(None),
@@ -516,6 +555,66 @@ impl JournalHandle {
             send_result: None,
         };
         self.enqueue(job)
+    }
+
+    /// Queue one record and wait for a concrete writer durability boundary.
+    ///
+    /// The returned acknowledgement carries the writer counter fence reached
+    /// by this record. It does not rely on a global status snapshot alone.
+    pub fn record_ack(
+        &self,
+        record: DataRecord,
+        level: JournalAckLevel,
+        timeout: Duration,
+    ) -> anyhow::Result<JournalAck> {
+        let fence = {
+            let status = self
+                .inner
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            status.counters.queued.saturating_add(1)
+        };
+        self.record(record)?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let status = self
+                .inner
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let reached = match level {
+                JournalAckLevel::Queued => status.counters.queued,
+                JournalAckLevel::Written => status.counters.written,
+                JournalAckLevel::Flushed => status.counters.flushed,
+                JournalAckLevel::Synced => status.counters.synced,
+            };
+            if reached >= fence {
+                return Ok(JournalAck {
+                    run_id: status.run_id.clone(),
+                    level,
+                    fence,
+                    state: status.state,
+                });
+            }
+            if status.last_error.is_some() || status.state == RunState::Failed {
+                let reason = status
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "journal failed".to_owned());
+                anyhow::bail!("journal failed before {}: {reason}", level.as_str());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("journal {} acknowledgement timed out", level.as_str());
+            }
+            let (guard, _) = self
+                .inner
+                .ack_cv
+                .wait_timeout(status, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(guard);
+        }
     }
 
     /// Enqueue one retained inbound or outbound observation (schema v2).
@@ -576,6 +675,8 @@ impl JournalHandle {
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 status.counters.queued = status.counters.queued.saturating_add(1);
                 status.counters.queue_depth = self.inner.queue.len() as u64;
+                drop(status);
+                self.inner.ack_cv.notify_all();
                 Ok(())
             }
             Err(error) => {
@@ -1458,6 +1559,7 @@ fn run_writer(
                                     status.counters.bytes.saturating_add(framed);
                                 status.counters.queue_depth = queue.len() as u64;
                             }
+                            inner.ack_cv.notify_all();
                             if let Err(error) =
                                 run_fault(fault.as_ref(), FaultPoint::AfterRecordWrite)
                             {
@@ -1569,6 +1671,8 @@ fn flush_only(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.counters.flushed = status.counters.written;
+    drop(status);
+    inner.ack_cv.notify_all();
     Ok(())
 }
 
@@ -1588,6 +1692,8 @@ fn sync_only(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     status.counters.synced = status.counters.written;
+    drop(status);
+    inner.ack_cv.notify_all();
     Ok(())
 }
 
@@ -1714,6 +1820,7 @@ fn fail_reason(inner: &Inner, manifest: &mut Manifest, message: &str) {
     manifest.failure = Some(message.to_owned());
     let _ = write_manifest(&inner.run_directory, manifest);
     set_state(inner, RunState::Failed, Some(message.to_owned()));
+    inner.ack_cv.notify_all();
 }
 
 fn write_manifest(directory: &Path, manifest: &Manifest) -> anyhow::Result<()> {

@@ -41,6 +41,9 @@ pub struct PacketEvidence {
     pub received_at_us: i64,
     pub capture_location: String,
     pub decoder_version: String,
+    /// Original transport frame representation.
+    #[serde(default)]
+    pub frame_kind: FrameKind,
 }
 
 /// Packet fields that the v1 journal observation has no slot for.
@@ -127,7 +130,15 @@ impl PacketEvidence {
             received_at_us,
             capture_location: capture_location.to_owned(),
             decoder_version: decoder_version.to_owned(),
+            frame_kind: FrameKind::Binary,
         }
+    }
+
+    /// Declare the original transport frame kind.
+    #[must_use]
+    pub const fn with_frame_kind(mut self, frame_kind: FrameKind) -> Self {
+        self.frame_kind = frame_kind;
+        self
     }
 
     /// Return the SHA-256 digest of the original payload bytes.
@@ -147,7 +158,7 @@ impl PacketEvidence {
             received_at_us: self.received_at_us,
             direction: FrameDirection::Inbound,
             classification: FrameClassification::Data {
-                frame_kind: FrameKind::Binary,
+                frame_kind: self.frame_kind,
             },
             signal: SessionSignal::MarketData,
             mechanism: HeartbeatMechanism::Disabled,
