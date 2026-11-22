@@ -79,6 +79,17 @@ refused rather than claimed without replication. Seven failure points are
 exercised with explicit dispositions and accounting. No historical capture or
 SBE wire contract changed.
 
+M3.1.3 replaces entry-count limits with byte and entry budgets for every
+retained arbiter collection. Arbiter state is private and exposed through
+snapshots and metrics. A sequence domain is explicit and arbitration is
+applied only to sources that declare compatible streaming sequence semantics.
+Identical and conflicting duplicates are distinct verdicts, and every
+submitted packet is offered to a raw-evidence sink before arbitration decides.
+Restart state is captured and restored with bounds revalidated. Deterministic
+reordering tests and injected faults exercise the budget and recovery paths.
+Memory figures describe retained payloads and a fixed bookkeeping estimate,
+not allocator occupancy or process RSS.
+
 ## Domain reorganisation
 
 The source tree is organised by the six architectural planes. Modules moved
