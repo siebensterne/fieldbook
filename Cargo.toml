@@ -10,7 +10,7 @@ edition = "2024"
 rust-version = "1.99"
 build = "src/util/build.rs"
 description = "Read-only multi-venue market-data collector with SBE capture and raw-frame journaling"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 anyhow = "1"
