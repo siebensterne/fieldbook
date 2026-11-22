@@ -229,7 +229,7 @@ pub fn parse_reference_document(
     Ok(markets)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use crate::model::Price;

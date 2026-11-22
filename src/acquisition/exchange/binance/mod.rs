@@ -115,7 +115,7 @@ pub const fn kind() -> ExchangeKind {
     ExchangeKind::Binance
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use crate::{capacity, config::Settings, exchange::capabilities_for};

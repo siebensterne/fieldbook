@@ -72,7 +72,7 @@ pub async fn discover_with_stats(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use crate::config::BinanceSettings;

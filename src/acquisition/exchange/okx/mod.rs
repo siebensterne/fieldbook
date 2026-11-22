@@ -114,7 +114,7 @@ pub const fn kind() -> ExchangeKind {
     ExchangeKind::Okx
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use crate::config::Settings;

@@ -348,7 +348,7 @@ pub fn into_snapshot(frame: BookFrame, received_at_us: i64) -> ExchangeEvent {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
 

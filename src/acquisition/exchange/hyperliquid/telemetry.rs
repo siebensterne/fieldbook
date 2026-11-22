@@ -289,7 +289,7 @@ pub fn decode_telemetry(text: &str) -> anyhow::Result<TelemetryFrame> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
 

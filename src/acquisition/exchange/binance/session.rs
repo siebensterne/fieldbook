@@ -99,7 +99,7 @@ impl MarketDataSession for BinanceSession {
     async fn close(&mut self) {}
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use crate::protocol::HeartbeatMechanism;

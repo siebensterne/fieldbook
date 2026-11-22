@@ -16,7 +16,7 @@ pub enum Task {
     Fmt,
     /// Run Clippy with warnings denied.
     Lint,
-    /// Run all-target and doc tests.
+    /// Run permitted all-target and doc tests.
     Test,
     /// Build rustdoc with warnings and broken links denied.
     Docs,
@@ -88,7 +88,7 @@ impl Task {
             Self::StyleFix => "apply the safe Python and Markdown style fixes",
             Self::Fmt => "check Rust formatting",
             Self::Lint => "run Clippy with warnings denied",
-            Self::Test => "run all-target and doc tests",
+            Self::Test => "run permitted all-target and doc tests",
             Self::Docs => "build rustdoc with warnings and broken links denied",
             Self::E2e => "run the curated end-to-end suites",
             Self::Verify => "run matrix, architecture and generated-path gates",

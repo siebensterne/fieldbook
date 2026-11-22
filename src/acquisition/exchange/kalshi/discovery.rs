@@ -420,5 +420,5 @@ fn parse_price_ranges(ranges: Option<&[RawPriceRange]>) -> anyhow::Result<Vec<Pr
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests;

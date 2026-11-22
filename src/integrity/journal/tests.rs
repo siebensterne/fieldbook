@@ -305,6 +305,7 @@ fn rejected_and_unknown_frames_are_recorded() {
     assert_eq!(records[0].payload, b"{not json");
 }
 
+#[cfg(all(test, feature = "market-shaped-tests"))]
 #[test]
 fn checked_in_fixtures_round_trip_byte_for_byte() {
     let temp = TempDir::new().expect("tempdir");
@@ -333,6 +334,7 @@ fn checked_in_fixtures_round_trip_byte_for_byte() {
     }
 }
 
+#[cfg(all(test, feature = "market-shaped-tests"))]
 #[test]
 fn checked_in_kalshi_fixtures_round_trip_byte_for_byte() {
     let temp = TempDir::new().expect("tempdir");

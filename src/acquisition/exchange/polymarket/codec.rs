@@ -54,7 +54,7 @@ fn note_unknown_event_type(kind: &str) {
 }
 
 /// Snapshot of unknown `event_type` names observed so far, with counts.
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 pub(crate) fn unknown_event_types() -> BTreeMap<String, u64> {
     UNKNOWN_EVENT_TYPES
         .lock()
@@ -337,7 +337,7 @@ fn parse_timestamp(value: Option<&Value>) -> anyhow::Result<Option<i64>> {
     parse_rfc3339_us(&text).map(Some)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
 

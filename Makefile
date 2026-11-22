@@ -13,7 +13,7 @@
 #   fmt          non-mutating rustfmt check
 #   format-fix   apply the mutating Python and Markdown style fixes
 #   lint         clippy with warnings denied
-#   test         all-target and doc tests
+#   test         permitted all-target and doc tests
 #   docs         rustdoc with broken links denied
 #   style        every non-Rust language and policy gate
 #   e2e          curated end-to-end suites
@@ -42,7 +42,7 @@ help:
 	@echo "fmt          non-mutating rustfmt check"
 	@echo "format-fix   apply mutating Python and Markdown style fixes"
 	@echo "lint         clippy with warnings denied"
-	@echo "test         all-target and doc tests"
+	@echo "test         permitted all-target and doc tests"
 	@echo "docs         rustdoc with broken links denied"
 	@echo "style        every non-Rust language and policy gate"
 	@echo "e2e          curated end-to-end suites"

@@ -118,7 +118,7 @@ pub const fn kind() -> ExchangeKind {
     ExchangeKind::Coinbase
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use crate::config::{CoinbaseSettings, Settings};

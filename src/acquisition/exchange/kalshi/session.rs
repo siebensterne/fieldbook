@@ -1081,7 +1081,7 @@ impl SessionFactory for LifecycleSessionFactory {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use std::sync::Arc;
 

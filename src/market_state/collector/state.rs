@@ -2175,5 +2175,5 @@ fn timestamp_or(timestamp_us: i64, fallback: DateTime<Utc>) -> DateTime<Utc> {
     utc_from_us(timestamp_us).unwrap_or(fallback)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests;

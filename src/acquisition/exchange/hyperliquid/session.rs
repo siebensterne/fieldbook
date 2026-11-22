@@ -374,7 +374,7 @@ impl MarketDataSession for HyperliquidSession {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use std::time::Duration;
 

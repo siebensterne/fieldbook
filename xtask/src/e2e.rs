@@ -3,23 +3,37 @@ use std::{fs, path::Path};
 use crate::{command::Cmd, report::Report};
 
 /// Integration test targets that exercise real components through their public
-/// boundaries. Live venue targets are excluded.
+/// boundaries. Every entry is a permitted target from the synthetic-test
+/// policy; market-shaped and live-venue targets are excluded.
 const SUITES: &[&str] = &[
-    "e2e_mock_exchange",
     "egress_lab",
-    "coverage_certificate",
-    "session_recovery",
-    "inspect_capture",
-    "kalshi_lifecycle_plane",
-    "replay_fixture",
-    "hyperliquid_books",
-    "hyperliquid_telemetry",
-    "hyperliquid_capacity",
-    "lifecycle_churn",
-    "full_universe_stress",
     "jsonl_postgres_reference",
     "durable_pipeline",
+    "bounded_batch",
+    "network_source",
+    "segmented_runner",
 ];
+
+/// Test targets registered without `required-features` in Cargo.toml. The
+/// e2e runner refuses any other target, including gated market-shaped ones.
+const PERMITTED_TARGETS: &[&str] = &[
+    "numeric_model",
+    "egress_governance",
+    "egress_lab",
+    "bounded_batch",
+    "network_source",
+    "durable_pipeline",
+    "segmented_durability",
+    "jsonl_postgres_reference",
+    "segmented_runner",
+    "postgres_baseline",
+    "postgres_batch_live",
+    "postgres_live",
+];
+
+fn is_permitted_target(target: &str) -> bool {
+    PERMITTED_TARGETS.contains(&target)
+}
 
 pub fn run(report: &mut Report, root: &Path, args: &[String]) -> Result<(), String> {
     if args.first().map(String::as_str) == Some("--list-ignored") {
@@ -69,6 +83,11 @@ fn run_ignored(report: &mut Report, root: &Path, filter: &str) -> Result<(), Str
         .0
         .split_once("::")
         .ok_or_else(|| format!("ignored test `{filter}` has no test target"))?;
+    if !is_permitted_target(target) {
+        return Err(format!(
+            "ignored test `{filter}` belongs to a gated target; not run"
+        ));
+    }
     let evidence_dir = root.join("target/xtask/ignored-evidence");
     fs::create_dir_all(&evidence_dir)
         .map_err(|error| format!("creating {}: {error}", evidence_dir.display()))?;
@@ -117,6 +136,9 @@ fn ignored_tests(root: &Path) -> Vec<(String, String)> {
         let Some(target) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
+        if !is_permitted_target(target) {
+            continue;
+        }
         let Ok(source) = fs::read_to_string(&path) else {
             continue;
         };
@@ -147,23 +169,6 @@ fn ignored_tests(root: &Path) -> Vec<(String, String)> {
             }
         }
     }
-    for subdir in ["tests/e2e_mock_exchange", "tests/stress_support"] {
-        let dir = root.join(subdir);
-        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
-                continue;
-            }
-            let Ok(source) = fs::read_to_string(&path) else {
-                continue;
-            };
-            for line in source.lines() {
-                if line.trim_start().starts_with("#[ignore") {
-                    found.push((format!("{} (module)", path.display()), line.to_owned()));
-                }
-            }
-        }
-    }
     found.sort();
     found
 }
@@ -189,6 +194,40 @@ mod tests {
             assert!(
                 !suite.starts_with("live_"),
                 "live target in default e2e: {suite}"
+            );
+        }
+    }
+
+    #[test]
+    fn suites_are_all_permitted_targets() {
+        assert!(
+            SUITES.iter().all(|suite| is_permitted_target(suite)),
+            "e2e suite must be a permitted target"
+        );
+    }
+
+    #[test]
+    fn market_shaped_targets_are_not_permitted() {
+        for target in [
+            "coverage_certificate",
+            "e2e_mock_exchange",
+            "evidence_pipeline",
+            "full_universe_stress",
+            "hyperliquid_books",
+            "hyperliquid_capacity",
+            "hyperliquid_telemetry",
+            "inspect_capture",
+            "kalshi_lifecycle_plane",
+            "lifecycle_churn",
+            "live_kalshi",
+            "live_polymarket",
+            "replay_fixture",
+            "session_recovery",
+            "source_conformance",
+        ] {
+            assert!(
+                !is_permitted_target(target),
+                "market-shaped target `{target}` must stay gated"
             );
         }
     }

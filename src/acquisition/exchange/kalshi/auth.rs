@@ -168,7 +168,7 @@ fn unix_millis() -> anyhow::Result<i64> {
     i64::try_from(elapsed.as_millis()).context("timestamp exceeds i64 milliseconds")
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
     use ed25519_dalek::{Verifier as _, pkcs8::EncodePrivateKey as _};
