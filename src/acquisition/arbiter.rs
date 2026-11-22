@@ -189,6 +189,18 @@ pub enum ArbiterVerdict {
     BudgetRejected { reason: String },
     /// Sequence space is exhausted.
     SequenceExhausted { sequence: u64 },
+    /// The raw-evidence boundary refused the packet.
+    EvidenceRetentionFailed { reason: String },
+}
+
+/// Durable disposition recorded for one submitted packet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArbiterDisposition {
+    pub sequence: u64,
+    pub channel: FeedChannel,
+    pub received_at_us: i64,
+    pub payload_sha256: String,
+    pub verdict: ArbiterVerdict,
 }
 
 /// One packet that was rejected, with its disposition and original evidence.
@@ -215,6 +227,8 @@ pub struct ArbiterMetrics {
     pub sequence_exhausted: u64,
     pub budget_rejections: u64,
     pub evidence_overflow: u64,
+    pub evidence_retention_failures: u64,
+    pub disposition_count: u64,
     pub buffered_bytes: u64,
     pub rejected_bytes: u64,
     pub total_payload_bytes: u64,
@@ -233,6 +247,8 @@ pub struct ArbiterMemory {
     pub total_payload_bytes: u64,
     /// Fixed-size estimate of map bookkeeping, not allocator occupancy.
     pub overhead_estimate_bytes: u64,
+    /// Estimated bytes held by the bounded duplicate-digest map.
+    pub digest_map_bytes: u64,
     pub high_water_buffered_bytes: u64,
     pub high_water_total_bytes: u64,
 }
@@ -256,13 +272,71 @@ pub struct ArbiterSnapshot {
     pub rejected: Vec<RejectedPacket>,
     pub gap_count: u64,
     pub metrics: ArbiterMetrics,
+    pub dispositions: Vec<ArbiterDisposition>,
     pub exhausted: bool,
 }
 
-/// Sink that retains raw evidence before arbitration decides.
+/// Fallible sink that retains raw evidence before arbitration decides.
 pub trait RawEvidenceSink: Send + Sync + fmt::Debug {
     /// Retain one submitted packet as raw evidence.
-    fn retain(&self, packet: &SequencedPacket);
+    fn retain(&self, packet: &SequencedPacket) -> anyhow::Result<()>;
+}
+
+/// In-memory evidence sink for diagnostics and tests.
+///
+/// This sink is explicit about its scope: it retains packets in bounded
+/// process memory and is not a durability boundary. Production paths must
+/// journal the packet before arbitration or install a durable sink.
+#[derive(Debug)]
+pub struct BoundedMemorySink {
+    packets: std::sync::Mutex<VecDeque<SequencedPacket>>,
+    dropped: std::sync::atomic::AtomicU64,
+    max_entries: usize,
+}
+
+impl BoundedMemorySink {
+    /// Construct a sink retaining at most `max_entries` packets.
+    #[must_use]
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            packets: std::sync::Mutex::new(VecDeque::new()),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+            max_entries,
+        }
+    }
+
+    /// Number of packets dropped by the retention bound.
+    #[must_use]
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Return a snapshot of retained packets.
+    #[must_use]
+    pub fn retained(&self) -> Vec<SequencedPacket> {
+        self.packets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+}
+
+impl RawEvidenceSink for BoundedMemorySink {
+    fn retain(&self, packet: &SequencedPacket) -> anyhow::Result<()> {
+        let mut packets = self
+            .packets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if packets.len() >= self.max_entries {
+            packets.pop_front();
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        packets.push_back(packet.clone());
+        Ok(())
+    }
 }
 
 /// Deterministic fault point for failure injection.
@@ -288,8 +362,9 @@ pub struct FeedArbiter {
     metrics: ArbiterMetrics,
     buffered: BTreeMap<u64, SequencedPacket>,
     rejected: VecDeque<RejectedPacket>,
+    dispositions: VecDeque<ArbiterDisposition>,
     exhausted: bool,
-    evidence_sink: Option<Box<dyn RawEvidenceSink>>,
+    evidence_sink: Box<dyn RawEvidenceSink>,
     injected_fault: Option<ArbiterFault>,
 }
 
@@ -299,6 +374,7 @@ impl FeedArbiter {
         domain: SequenceDomain,
         expected: u64,
         limits: ArbiterLimits,
+        evidence_sink: Box<dyn RawEvidenceSink>,
     ) -> anyhow::Result<Self> {
         limits.validate()?;
         Ok(Self {
@@ -311,21 +387,26 @@ impl FeedArbiter {
             metrics: ArbiterMetrics::default(),
             buffered: BTreeMap::new(),
             rejected: VecDeque::new(),
+            dispositions: VecDeque::new(),
             exhausted: false,
-            evidence_sink: None,
+            evidence_sink,
             injected_fault: None,
         })
     }
 
-    /// Construct an arbiter with default bounds.
-    pub fn with_defaults(domain: SequenceDomain, expected: u64) -> anyhow::Result<Self> {
-        Self::new(domain, expected, ArbiterLimits::default())
+    /// Construct an arbiter with default bounds and a required evidence sink.
+    pub fn with_defaults(
+        domain: SequenceDomain,
+        expected: u64,
+        evidence_sink: Box<dyn RawEvidenceSink>,
+    ) -> anyhow::Result<Self> {
+        Self::new(domain, expected, ArbiterLimits::default(), evidence_sink)
     }
 
-    /// Install a raw-evidence sink called for every submitted packet.
+    /// Replace the raw-evidence sink.
     #[must_use]
     pub fn with_evidence_sink(mut self, sink: Box<dyn RawEvidenceSink>) -> Self {
-        self.evidence_sink = Some(sink);
+        self.evidence_sink = sink;
         self
     }
 
@@ -384,6 +465,11 @@ impl FeedArbiter {
         self.rejected.iter()
     }
 
+    /// Return every recorded arbitration disposition under its bound.
+    pub fn dispositions(&self) -> impl Iterator<Item = &ArbiterDisposition> {
+        self.dispositions.iter()
+    }
+
     /// Whether the sequence space has been exhausted.
     #[must_use]
     pub const fn is_exhausted(&self) -> bool {
@@ -396,6 +482,7 @@ impl FeedArbiter {
         let overhead_estimate_bytes = (self.seen.len()
             * (size_of::<u64>() + size_of::<FeedChannel>() + size_of::<i64>()))
             as u64;
+        let digest_map_bytes = (self.seen_digest.len() * (size_of::<u64>() + 64)) as u64;
         ArbiterMemory {
             seen_entries: self.seen.len(),
             buffered_entries: self.buffered.len(),
@@ -403,7 +490,8 @@ impl FeedArbiter {
             buffered_bytes: self.metrics.buffered_bytes,
             rejected_bytes: self.metrics.rejected_bytes,
             total_payload_bytes: self.metrics.total_payload_bytes,
-            overhead_estimate_bytes,
+            overhead_estimate_bytes: overhead_estimate_bytes.saturating_add(digest_map_bytes),
+            digest_map_bytes,
             high_water_buffered_bytes: self.metrics.high_water_buffered_bytes,
             high_water_total_bytes: self.metrics.high_water_total_bytes,
         }
@@ -421,14 +509,79 @@ impl FeedArbiter {
             rejected: self.rejected.iter().cloned().collect(),
             gap_count: self.gap_count,
             metrics: self.metrics,
+            dispositions: self.dispositions.iter().cloned().collect(),
             exhausted: self.exhausted,
         }
     }
 
     /// Restore arbiter state captured by [`Self::snapshot`].
-    pub fn restore(snapshot: ArbiterSnapshot, limits: ArbiterLimits) -> anyhow::Result<Self> {
+    ///
+    /// # Errors
+    /// Returns an error when the snapshot exceeds configured limits, has
+    /// duplicate sequence keys, an inconsistent digest map, an invalid domain
+    /// or counters that disagree with the restored collections.
+    pub fn restore(
+        snapshot: ArbiterSnapshot,
+        limits: ArbiterLimits,
+        evidence_sink: Box<dyn RawEvidenceSink>,
+    ) -> anyhow::Result<Self> {
         limits.validate()?;
-        let mut restored = Self::new(snapshot.domain, snapshot.expected, limits)?;
+        anyhow::ensure!(
+            !snapshot.domain.domain_id.trim().is_empty(),
+            "snapshot has an empty sequence domain"
+        );
+        anyhow::ensure!(
+            snapshot.seen.len() <= limits.max_seen_entries,
+            "snapshot seen window exceeds its bound"
+        );
+        anyhow::ensure!(
+            snapshot.seen_digest.len() <= limits.max_seen_entries,
+            "snapshot digest window exceeds its bound"
+        );
+        anyhow::ensure!(
+            snapshot.buffered.len() <= limits.max_buffered_entries,
+            "snapshot buffer exceeds its entry bound"
+        );
+        anyhow::ensure!(
+            snapshot.rejected.len() <= limits.max_rejected_entries,
+            "snapshot evidence ledger exceeds its entry bound"
+        );
+        let buffered_bytes: u64 = snapshot
+            .buffered
+            .iter()
+            .map(|packet| packet.payload.len() as u64)
+            .sum();
+        let rejected_bytes: u64 = snapshot
+            .rejected
+            .iter()
+            .map(|item| item.packet.payload.len() as u64)
+            .sum();
+        anyhow::ensure!(
+            buffered_bytes <= limits.max_buffered_bytes,
+            "snapshot buffer exceeds its byte bound"
+        );
+        anyhow::ensure!(
+            rejected_bytes <= limits.max_rejected_bytes,
+            "snapshot evidence ledger exceeds its byte bound"
+        );
+        anyhow::ensure!(
+            buffered_bytes.saturating_add(rejected_bytes) <= limits.max_total_payload_bytes,
+            "snapshot total payload exceeds its byte bound"
+        );
+        let seen_sequences: std::collections::BTreeSet<u64> =
+            snapshot.seen.iter().map(|entry| entry.sequence).collect();
+        anyhow::ensure!(
+            seen_sequences.len() == snapshot.seen.len(),
+            "snapshot has duplicate seen sequences"
+        );
+        anyhow::ensure!(
+            snapshot
+                .seen_digest
+                .keys()
+                .all(|sequence| seen_sequences.contains(sequence)),
+            "snapshot digest map is inconsistent with the seen window"
+        );
+        let mut restored = Self::new(snapshot.domain, snapshot.expected, limits, evidence_sink)?;
         for entry in snapshot.seen {
             restored
                 .seen
@@ -437,21 +590,51 @@ impl FeedArbiter {
         restored.seen_digest = snapshot.seen_digest;
         for packet in snapshot.buffered {
             let sequence = packet.sequence;
+            anyhow::ensure!(
+                !restored.buffered.contains_key(&sequence),
+                "snapshot has duplicate buffered sequences"
+            );
             restored.buffered.insert(sequence, packet);
         }
         restored.rejected.extend(snapshot.rejected);
         restored.gap_count = snapshot.gap_count;
         restored.metrics = snapshot.metrics;
+        restored.metrics.buffered_bytes = buffered_bytes;
+        restored.metrics.rejected_bytes = rejected_bytes;
+        restored.metrics.total_payload_bytes = buffered_bytes.saturating_add(rejected_bytes);
+        restored.metrics.high_water_buffered_bytes = buffered_bytes;
+        restored.metrics.high_water_total_bytes = restored.metrics.total_payload_bytes;
+        restored.metrics.rejected = restored.rejected.len() as u64;
+        restored.metrics.disposition_count = snapshot.dispositions.len() as u64;
+        restored.dispositions.extend(snapshot.dispositions);
         restored.exhausted = snapshot.exhausted;
         Ok(restored)
     }
 
     fn record(&mut self, packet: &SequencedPacket) {
-        if self.seen.len() >= self.limits.max_seen_entries && self.seen.pop_first().is_some() {
-            self.metrics.pruned_seen = self.metrics.pruned_seen.saturating_add(1);
+        while self.seen.len() >= self.limits.max_seen_entries {
+            match self.seen.pop_first() {
+                Some((sequence, _)) => {
+                    self.seen_digest.remove(&sequence);
+                    self.metrics.pruned_seen = self.metrics.pruned_seen.saturating_add(1);
+                }
+                None => break,
+            }
         }
         self.seen
             .insert(packet.sequence, (packet.channel, packet.received_at_us));
+        self.trim_digest_window();
+    }
+
+    fn trim_digest_window(&mut self) {
+        while self.seen_digest.len() > self.limits.max_seen_entries {
+            if let Some(sequence) = self.seen_digest.keys().next().copied() {
+                self.seen_digest.remove(&sequence);
+                self.metrics.pruned_seen = self.metrics.pruned_seen.saturating_add(1);
+            } else {
+                break;
+            }
+        }
     }
 
     fn advance(&mut self) -> bool {
@@ -518,13 +701,37 @@ impl FeedArbiter {
         }
     }
 
-    /// Submit one packet for arbitration.
+    /// Submit one packet for arbitration and record its disposition.
     pub fn submit(&mut self, packet: SequencedPacket) -> ArbiterVerdict {
-        if let Some(sink) = &self.evidence_sink {
-            sink.retain(&packet);
+        let verdict = self.decide(&packet);
+        self.dispose(&packet, &verdict);
+        verdict
+    }
+
+    fn dispose(&mut self, packet: &SequencedPacket, verdict: &ArbiterVerdict) {
+        self.metrics.disposition_count = self.metrics.disposition_count.saturating_add(1);
+        if self.dispositions.len() >= self.limits.max_rejected_entries {
+            self.dispositions.pop_front();
         }
+        self.dispositions.push_back(ArbiterDisposition {
+            sequence: packet.sequence,
+            channel: packet.channel,
+            received_at_us: packet.received_at_us,
+            payload_sha256: sha256_hex(&packet.payload),
+            verdict: verdict.clone(),
+        });
+    }
+
+    fn decide(&mut self, packet: &SequencedPacket) -> ArbiterVerdict {
         if self.injected_fault == Some(ArbiterFault::Retain) {
             return self.budget_rejection("injected_before_retain");
+        }
+        if let Err(error) = self.evidence_sink.retain(packet) {
+            self.metrics.evidence_retention_failures =
+                self.metrics.evidence_retention_failures.saturating_add(1);
+            return ArbiterVerdict::EvidenceRetentionFailed {
+                reason: error.to_string(),
+            };
         }
         let bytes = packet.payload.len() as u64;
         if packet.payload.len() > self.limits.max_packet_bytes {
@@ -536,7 +743,10 @@ impl FeedArbiter {
         }
         if self.exhausted {
             let sequence = packet.sequence;
-            self.reject(packet, ArbiterVerdict::SequenceExhausted { sequence });
+            self.reject(
+                packet.clone(),
+                ArbiterVerdict::SequenceExhausted { sequence },
+            );
             return ArbiterVerdict::SequenceExhausted {
                 sequence: self.expected,
             };
@@ -583,7 +793,7 @@ impl FeedArbiter {
             if self.injected_fault == Some(ArbiterFault::Advance) {
                 return self.budget_rejection("injected_before_advance");
             }
-            self.record(&packet);
+            self.record(packet);
             self.seen_digest.insert(sequence, observed_sha256);
             self.metrics.accepted = self.metrics.accepted.saturating_add(1);
             if self.advance() {
@@ -598,14 +808,14 @@ impl FeedArbiter {
                 expected: self.expected,
                 observed: sequence,
             };
-            self.reject(packet, verdict.clone());
+            self.reject(packet.clone(), verdict.clone());
             return verdict;
         }
         if self.buffered.len() >= self.limits.max_buffered_entries
             || self.metrics.buffered_bytes.saturating_add(bytes) > self.limits.max_buffered_bytes
         {
             let verdict = ArbiterVerdict::BufferFull { sequence };
-            self.reject(packet, verdict.clone());
+            self.reject(packet.clone(), verdict.clone());
             return verdict;
         }
         if self.injected_fault == Some(ArbiterFault::Buffer) {
@@ -615,7 +825,7 @@ impl FeedArbiter {
         self.metrics.buffered_bytes = self.metrics.buffered_bytes.saturating_add(bytes);
         self.metrics.total_payload_bytes = self.metrics.total_payload_bytes.saturating_add(bytes);
         self.update_high_water();
-        self.buffered.insert(sequence, packet);
+        self.buffered.insert(sequence, packet.clone());
         if gap_opened {
             self.gap_count = self.gap_count.saturating_add(1);
             self.metrics.gaps = self.metrics.gaps.saturating_add(1);
@@ -659,8 +869,9 @@ mod tests {
     }
 
     impl RawEvidenceSink for CountingSink {
-        fn retain(&self, _packet: &SequencedPacket) {
+        fn retain(&self, _packet: &SequencedPacket) -> anyhow::Result<()> {
             self.count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -677,8 +888,14 @@ mod tests {
         }
     }
 
+    fn sink() -> CountingSink {
+        CountingSink {
+            count: std::sync::Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
     fn arbiter(expected: u64) -> FeedArbiter {
-        FeedArbiter::with_defaults(domain(), expected).expect("arbiter created")
+        FeedArbiter::with_defaults(domain(), expected, Box::new(sink())).expect("arbiter created")
     }
 
     #[test]
@@ -831,7 +1048,8 @@ mod tests {
             max_packet_bytes: 4,
             ..ArbiterLimits::default()
         };
-        let mut arbiter = FeedArbiter::new(domain(), 1, limits).expect("arbiter created");
+        let mut arbiter =
+            FeedArbiter::new(domain(), 1, limits, Box::new(sink())).expect("arbiter created");
         assert_eq!(
             arbiter.submit(packet(1, "toolong")),
             ArbiterVerdict::BudgetRejected {
@@ -854,7 +1072,8 @@ mod tests {
             max_total_payload_bytes: 64,
             ..ArbiterLimits::default()
         };
-        let mut arbiter = FeedArbiter::new(domain(), 1, limits).expect("arbiter created");
+        let mut arbiter =
+            FeedArbiter::new(domain(), 1, limits, Box::new(sink())).expect("arbiter created");
         assert_eq!(
             arbiter.submit(packet(2, "abcd")),
             ArbiterVerdict::Gap(1),
@@ -900,8 +1119,8 @@ mod tests {
         arbiter.submit(packet(1, "one"));
         arbiter.submit(packet(3, "three"));
         let snapshot = arbiter.snapshot();
-        let restored =
-            FeedArbiter::restore(snapshot, ArbiterLimits::default()).expect("state restored");
+        let restored = FeedArbiter::restore(snapshot, ArbiterLimits::default(), Box::new(sink()))
+            .expect("state restored");
         assert_eq!(restored.expected(), 2, "expected sequence restored");
         assert_eq!(
             restored.domain(),
@@ -958,6 +1177,141 @@ mod tests {
         assert!(
             arbiter.expected() >= 1,
             "expected sequence advances monotonically"
+        );
+    }
+
+    #[test]
+    fn digest_window_is_pruned_with_the_seen_window() {
+        let limits = ArbiterLimits {
+            max_seen_entries: 2,
+            ..ArbiterLimits::default()
+        };
+        let mut arbiter =
+            FeedArbiter::new(domain(), 1, limits, Box::new(sink())).expect("arbiter created");
+        for sequence in 1..=5 {
+            arbiter.submit(packet(sequence, "body"));
+        }
+        let snapshot = arbiter.snapshot();
+        assert_eq!(snapshot.seen.len(), 2, "seen window stays bounded");
+        assert_eq!(
+            snapshot.seen_digest.len(),
+            2,
+            "digest window is pruned with seen"
+        );
+        assert!(
+            arbiter.memory().digest_map_bytes > 0,
+            "digest map memory is reported"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_snapshots_outside_limits() {
+        let mut original = arbiter(1);
+        original.submit(packet(1, "one"));
+        let snapshot = original.snapshot();
+        let mut oversized = snapshot.clone();
+        oversized.seen_digest.insert(u64::MAX, "digest".to_owned());
+        let limits = ArbiterLimits {
+            max_seen_entries: 1,
+            ..ArbiterLimits::default()
+        };
+        assert!(
+            FeedArbiter::restore(oversized, limits, Box::new(sink())).is_err(),
+            "a snapshot with an unbounded digest map is refused"
+        );
+        let mut duplicate = snapshot;
+        duplicate.seen.push(duplicate.seen[0]);
+        assert!(
+            FeedArbiter::restore(duplicate, ArbiterLimits::default(), Box::new(sink())).is_err(),
+            "duplicate seen sequences are refused"
+        );
+    }
+
+    #[test]
+    fn restore_recalculates_occupancy_from_content() {
+        let mut original = arbiter(1);
+        original.submit(packet(1, "one"));
+        original.submit(packet(3, "three"));
+        let snapshot = original.snapshot();
+        let restored = FeedArbiter::restore(snapshot, ArbiterLimits::default(), Box::new(sink()))
+            .expect("state restored");
+        let memory = restored.memory();
+        assert_eq!(memory.buffered_entries, 1, "buffered entries restored");
+        assert_eq!(memory.buffered_bytes, 5, "buffered bytes recalculated");
+        assert_eq!(
+            memory.high_water_total_bytes, memory.total_payload_bytes,
+            "high water is derived from restored content"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingSink;
+
+    impl RawEvidenceSink for FailingSink {
+        fn retain(&self, _packet: &SequencedPacket) -> anyhow::Result<()> {
+            anyhow::bail!("evidence store unavailable")
+        }
+    }
+
+    #[test]
+    fn evidence_retention_failure_stops_arbitration() {
+        let arbiter = arbiter(1).with_evidence_sink(Box::new(FailingSink));
+        let mut arbiter = arbiter;
+        let verdict = arbiter.submit(packet(1, "one"));
+        assert!(
+            matches!(verdict, ArbiterVerdict::EvidenceRetentionFailed { .. }),
+            "retention failure is explicit"
+        );
+        assert_eq!(arbiter.expected(), 1, "no sequence advanced on failure");
+        assert_eq!(
+            arbiter.dispositions().count(),
+            1,
+            "the failure has a durable disposition"
+        );
+        assert_eq!(
+            arbiter.metrics().evidence_retention_failures,
+            1,
+            "retention failures counted"
+        );
+    }
+
+    #[test]
+    fn retain_fault_precedes_the_evidence_sink() {
+        let count = std::sync::Arc::new(AtomicUsize::new(0));
+        let counting = CountingSink {
+            count: count.clone(),
+        };
+        let arbiter = arbiter(1)
+            .with_evidence_sink(Box::new(counting))
+            .with_injected_fault(ArbiterFault::Retain);
+        let mut arbiter = arbiter;
+        arbiter.submit(packet(1, "one"));
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "the Retain fault fires before retention"
+        );
+    }
+
+    #[test]
+    fn conflicts_and_stale_packets_have_dispositions() {
+        let mut arbiter = arbiter(5);
+        arbiter.submit(packet(5, "five"));
+        arbiter.submit(packet(5, "different"));
+        arbiter.submit(packet(4, "stale"));
+        let dispositions: Vec<_> = arbiter.dispositions().collect();
+        assert_eq!(dispositions.len(), 3, "every packet has a disposition");
+        assert!(
+            dispositions
+                .iter()
+                .any(|item| matches!(item.verdict, ArbiterVerdict::DuplicateConflict { .. })),
+            "conflicting duplicates are recorded"
+        );
+        assert!(
+            dispositions
+                .iter()
+                .any(|item| item.verdict == ArbiterVerdict::Stale),
+            "stale packets are recorded"
         );
     }
 }

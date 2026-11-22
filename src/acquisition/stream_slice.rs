@@ -19,7 +19,10 @@ use serde::Serialize;
 
 use crate::{
     acquisition::{
-        arbiter::{ArbiterLimits, ArbiterVerdict, FeedArbiter, SequenceDomain, SequencedPacket},
+        arbiter::{
+            ArbiterLimits, ArbiterVerdict, BoundedMemorySink, FeedArbiter, SequenceDomain,
+            SequencedPacket,
+        },
         codec::CodecRegistry,
         evidence::{
             CanonicalEvidenceRecord, CanonicalSink, DurabilityProfile, EvidencePipeline,
@@ -199,7 +202,12 @@ pub fn run_stream_slice(
     let store = EvidenceStore::new(directory, "slice-evidence.jsonl")?;
     let pipeline = EvidencePipeline::new(journal, store.clone(), config.profile)?;
     let domain = SequenceDomain::new(&config.source_id, 1);
-    let mut arbiter = FeedArbiter::new(domain, 1, limits)?;
+    let mut arbiter = FeedArbiter::new(
+        domain,
+        1,
+        limits,
+        Box::new(BoundedMemorySink::new(limits.max_rejected_entries)),
+    )?;
     let submitted = packets.len();
     let mut accepted = 0;
     let mut duplicates = 0;

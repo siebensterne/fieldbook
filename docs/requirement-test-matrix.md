@@ -200,3 +200,11 @@ is explicitly
 | Authorization keys use the complete identity and effective intervals | `src/governance/rights.rs::revision_keys_include_full_identity`, `src/governance/rights.rs::non_overlapping_decisions_coexist`, `src/governance/rights.rs::reinstatement_supersedes_revocation` | Audit evidence shape is validated; external document contents are not fetched. |
 | Certification has one oracle shared by every query | `src/governance/coverage_certification.rs::single_evaluation_oracle_agrees_across_all_queries`, `src/governance/coverage_certification.rs::evidence_history_and_operations_prerequisites_cannot_be_bypassed` | Only `certify` produces an evaluation; legacy ordinal status cannot override it. |
 | Provider and source identities remain distinct | `src/governance/coverage_certification.rs::provider_identity_is_distinct_from_source_identity` | Source registry resolution is the caller's responsibility. |
+
+## M3.1.6-B arbiter bounded state
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Duplicate digest window is bounded with the seen window | `src/acquisition/arbiter.rs::digest_window_is_pruned_with_the_seen_window` | Digest-map bytes are reported in memory snapshots. |
+| Restored state is validated and occupancy is recalculated | `src/acquisition/arbiter.rs::restore_rejects_snapshots_outside_limits`, `src/acquisition/arbiter.rs::restore_recalculates_occupancy_from_content` | Duplicate keys, inconsistent digests and oversized collections are refused. |
+| Evidence retention failure stops arbitration and is recorded | `src/acquisition/arbiter.rs::evidence_retention_failure_stops_arbitration`, `src/acquisition/arbiter.rs::retain_fault_precedes_the_evidence_sink`, `src/acquisition/arbiter.rs::conflicts_and_stale_packets_have_dispositions` | The evidence sink is required and fallible; in-memory sinks are not durability claims. |

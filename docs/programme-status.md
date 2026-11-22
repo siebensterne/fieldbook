@@ -121,7 +121,16 @@ evaluation oracle; `certify` stores its result and all certification queries
 read that result. Evidence, history, operations, provider identity and universe
 requirements cannot be bypassed by a legacy ordinal status.
 
-M3.1.6-B through F remain open work from the independent review.
+M3.1.6-B closes arbiter bounded-state findings. The duplicate digest map is
+pruned with the seen window and its estimated bytes are reported. Snapshot
+restore validates collection sizes, byte totals, sequence uniqueness, digest
+consistency and domain identity, then recalculates occupancy from restored
+content. The raw-evidence sink is required and fallible; retention failure
+stops arbitration and is recorded. Every submitted packet produces a durable
+disposition, including duplicates, conflicts and stale packets. The Retain
+fault now fires before retention.
+
+M3.1.6-C through F remain open work from the independent review.
 
 ## Domain reorganisation
 
