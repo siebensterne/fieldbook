@@ -68,6 +68,17 @@ explicit enumerated or unmeasurable declaration, and use a complete structured
 identity key that rejects conflicting records. These are offline properties;
 no source onboarding or live entitlement is asserted.
 
+M3.1.2 connects packet capture to the raw-frame journal. A packet is written
+as a journal data record with a locally assigned receive sequence before its
+versioned extension is persisted. After finalization, extensions bind to the
+stable `JournalPosition` of their journal record and verification requires a
+one-to-one relationship with matching payload digests. Unknown extension
+versions, duplicate bindings and unmatched journal records fail closed.
+Durability profiles D1 through D3 are locally achievable; D4 and D5 are
+refused rather than claimed without replication. Seven failure points are
+exercised with explicit dispositions and accounting. No historical capture or
+SBE wire contract changed.
+
 ## Domain reorganisation
 
 The source tree is organised by the six architectural planes. Modules moved

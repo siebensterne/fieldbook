@@ -160,3 +160,11 @@ is explicitly
 | Authorization is provider-specific, effective-dated and revocable | `src/governance/rights.rs::effective_dated_grant_authorizes_only_inside_its_window`, `src/governance/rights.rs::provider_specific_decision_is_not_shared`, `src/governance/rights.rs::revocation_blocks_authorization`, `src/governance/rights.rs::conflicting_decisions_fail_closed` | Conflicting decisions are refused at registration. No live entitlement is asserted. |
 | Coverage universes are measured or explicitly unmeasurable | `src/governance/coverage_certification.rs::supported_outside_expected_cannot_measure_coverage`, `src/governance/coverage_certification.rs::empty_expected_universe_is_invalid`, `src/governance/coverage_certification.rs::missing_universe_declaration_blocks_certification` | An unmeasurable declaration carries a reason and no denominator. |
 | Coverage identities cannot silently overwrite one another | `src/governance/coverage_certification.rs::duplicate_coverage_scope_conflicts`, `src/governance/coverage_certification.rs::identical_coverage_scope_is_idempotent` | Matrix keys include the full structured scope. |
+
+## Raw evidence durability
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Extensions bind to stable journal positions and reconcile on restart | `src/acquisition/evidence.rs::extension_binds_to_stable_journal_position`, `tests/evidence_pipeline.rs::real_decode_normalization_and_canonical_persist_succeed` | Binding runs after journal finalization. No live journal throughput is claimed. |
+| Seven failure points produce explicit dispositions and accounting | `tests/evidence_pipeline.rs::every_failure_point_has_an_explicit_disposition` | Injection is deterministic; the local path reaches D1 through D3 only. |
+| Conflicting or unknown extensions fail closed | `tests/evidence_pipeline.rs::duplicate_extension_binding_is_reported_as_conflict`, `src/acquisition/evidence.rs::unsupported_extension_version_fails_closed` | No extension is silently rewritten or downgraded. |
