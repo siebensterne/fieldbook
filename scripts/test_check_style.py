@@ -46,7 +46,10 @@ class MarkdownTest(unittest.TestCase):
             self.assertTrue(style.reflow_markdown(path))
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("\x00", text)
-            self.assertTrue(all(len(line) <= 80 for line in text.splitlines()))
+            self.assertTrue(
+                all(len(line) <= 100 for line in text.splitlines()),
+                "reflow must respect the canonical 100-column line length",
+            )
 
     def test_reflow_preserves_links_and_code(self) -> None:
         """Never rewrite lines carrying links or code spans."""
