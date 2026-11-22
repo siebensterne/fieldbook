@@ -711,7 +711,7 @@ mod tests {
                 decision: RightDecision::Permitted,
                 audit: DecisionAudit {
                     licence_reference: "contract".to_owned(),
-                    licence_document_hash: "contract-hash".to_owned(),
+                    licence_document_hash: "a".repeat(64),
                     contract_revision: 1,
                     recorded_at_us: 0,
                     authority: "contract-registry".to_owned(),
@@ -793,7 +793,7 @@ mod tests {
                 decision: RightDecision::Permitted,
                 audit: DecisionAudit {
                     licence_reference: "contract".to_owned(),
-                    licence_document_hash: "hash".to_owned(),
+                    licence_document_hash: "b".repeat(64),
                     contract_revision: 1,
                     recorded_at_us: 0,
                     authority: "registry".to_owned(),

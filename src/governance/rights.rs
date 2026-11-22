@@ -204,6 +204,21 @@ impl AuthorizationIdentity {
             self.purpose as u8,
         )
     }
+
+    /// Reject an interval whose end precedes its start.
+    pub fn validate_interval(&self) -> Result<(), RightsError> {
+        match self.valid_until {
+            Some(end) if end < self.valid_from => Err(RightsError::InvalidInterval),
+            _ => Ok(()),
+        }
+    }
+
+    /// Whether two effective intervals overlap at any instant.
+    #[must_use]
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.valid_from <= other.valid_until.unwrap_or(i64::MAX)
+            && other.valid_from <= self.valid_until.unwrap_or(i64::MAX)
+    }
 }
 
 /// Audit record attached to one decision.
@@ -214,6 +229,24 @@ pub struct DecisionAudit {
     pub contract_revision: u32,
     pub recorded_at_us: i64,
     pub authority: String,
+}
+
+impl DecisionAudit {
+    /// Validate the audit evidence shape before a decision is trusted.
+    pub fn validate(&self) -> Result<(), RightsError> {
+        if self.licence_reference.trim().is_empty()
+            || self.authority.trim().is_empty()
+            || self.contract_revision == 0
+            || self.licence_document_hash.len() != 64
+            || !self
+                .licence_document_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(RightsError::InvalidAudit);
+        }
+        Ok(())
+    }
 }
 
 /// One contract-derived authorization record.
@@ -266,6 +299,12 @@ pub enum RightsError {
     /// The query itself is incomplete.
     #[error("authorization query is incomplete")]
     InvalidQuery,
+    /// The effective interval is malformed.
+    #[error("authorization interval is invalid")]
+    InvalidInterval,
+    /// The decision audit evidence is malformed.
+    #[error("decision audit evidence is invalid")]
+    InvalidAudit,
     /// No record covers the identity and territory.
     #[error("no licensing record for {dataset_id} in {territory}")]
     MissingRecord {
@@ -312,9 +351,11 @@ impl LicensingRegistry {
     /// revision already carry a different decision, or when an earlier
     /// revision of the same identity already carries a contradictory decision.
     pub fn register(&mut self, record: AuthorizationRecord) -> Result<(), RightsError> {
+        record.identity.validate_interval()?;
+        record.audit.validate()?;
         let revision_key = format!(
-            "{}|{}",
-            record.identity.decision_key().0,
+            "{:?}|{}",
+            record.identity.decision_key(),
             record.audit.contract_revision
         );
         if let Some(existing) = self.decisions.get(&revision_key)
@@ -326,14 +367,15 @@ impl LicensingRegistry {
             });
         }
         for existing in &self.records {
-            if existing.identity.decision_key() == record.identity.decision_key()
-                && existing.decision != record.decision
-                && !(record.decision == RightDecision::Revoked
-                    || existing.decision == RightDecision::Revoked)
-            {
+            let same_identity = existing.identity.decision_key() == record.identity.decision_key();
+            let overlapping = existing.identity.overlaps(&record.identity);
+            let contradictory = existing.decision != record.decision;
+            let neither_revocation = existing.decision != RightDecision::Revoked
+                && record.decision != RightDecision::Revoked;
+            if same_identity && overlapping && contradictory && neither_revocation {
                 return Err(RightsError::Conflict {
                     dataset_id: record.identity.dataset_id.clone(),
-                    reason: "same authorization identity carries different decisions",
+                    reason: "overlapping decisions contradict for the same identity",
                 });
             }
         }
@@ -349,7 +391,7 @@ impl LicensingRegistry {
         at_us: i64,
     ) -> Result<AuthorizationProof, RightsError> {
         query.validate()?;
-        let candidates: Vec<&AuthorizationRecord> = self
+        let mut candidates: Vec<&AuthorizationRecord> = self
             .records
             .iter()
             .filter(|record| record.identity.matches(query, at_us))
@@ -360,44 +402,34 @@ impl LicensingRegistry {
                 territory: query.territory.as_str().to_owned(),
             });
         }
-        if candidates
-            .iter()
-            .any(|record| record.decision == RightDecision::Revoked)
-        {
+        for record in &candidates {
+            record.audit.validate()?;
+        }
+        candidates.sort_by_key(|record| {
+            (
+                record.identity.valid_from,
+                record.audit.contract_revision,
+                record.audit.recorded_at_us,
+            )
+        });
+        let winning = candidates
+            .last()
+            .ok_or_else(|| RightsError::MissingRecord {
+                dataset_id: query.dataset_id.clone(),
+                territory: query.territory.as_str().to_owned(),
+            })?;
+        if winning.decision == RightDecision::Revoked {
             return Err(RightsError::Revoked {
                 dataset_id: query.dataset_id.clone(),
                 right: query.usage_right.as_str(),
             });
         }
-        let permitted = candidates.iter().any(|record| record.grants(at_us));
-        let denied = candidates.iter().any(|record| {
-            matches!(
-                record.decision,
-                RightDecision::Prohibited
-                    | RightDecision::ContractRequired
-                    | RightDecision::Unknown
-            )
-        });
-        if permitted && denied {
-            return Err(RightsError::Conflict {
-                dataset_id: query.dataset_id.clone(),
-                reason: "permitted and prohibited decisions overlap at this instant",
-            });
-        }
-        if !permitted {
+        if !winning.grants(at_us) {
             return Err(RightsError::RightNotGranted {
                 dataset_id: query.dataset_id.clone(),
                 right: query.usage_right.as_str(),
             });
         }
-        let winning = candidates
-            .iter()
-            .filter(|record| record.grants(at_us))
-            .max_by_key(|record| record.audit.contract_revision)
-            .ok_or_else(|| RightsError::RightNotGranted {
-                dataset_id: query.dataset_id.clone(),
-                right: query.usage_right.as_str(),
-            })?;
         Ok(AuthorizationProof {
             provider_id: query.provider_id.clone(),
             source_id: query.source_id.clone(),
@@ -456,7 +488,7 @@ mod tests {
             decision,
             audit: DecisionAudit {
                 licence_reference: format!("licence-{provider}-{revision}"),
-                licence_document_hash: format!("hash-{provider}-{revision}"),
+                licence_document_hash: format!("{:064x}", revision),
                 contract_revision: revision,
                 recorded_at_us: valid_from,
                 authority: "contract-registry".to_owned(),
@@ -643,5 +675,106 @@ mod tests {
         );
         assert_eq!(proof.contract_revision, 7, "revision retained");
         assert_eq!(proof.purpose, Purpose::HistoricalArchive, "purpose kept");
+    }
+
+    #[test]
+    fn non_overlapping_decisions_coexist() {
+        let mut registry = LicensingRegistry::new();
+        let mut grant = record(
+            RightDecision::Permitted,
+            "provider-a",
+            "US",
+            0,
+            Some(100),
+            1,
+        );
+        let mut ban = record(
+            RightDecision::Prohibited,
+            "provider-a",
+            "US",
+            101,
+            Some(200),
+            2,
+        );
+        grant.audit.licence_document_hash = "a".repeat(64);
+        ban.audit.licence_document_hash = "b".repeat(64);
+        registry.register(grant).expect("grant registered");
+        registry
+            .register(ban)
+            .expect("later prohibition registered");
+        assert!(
+            registry.authorize(&query(), 50).is_ok(),
+            "earlier window is granted"
+        );
+        assert!(
+            registry.authorize(&query(), 150).is_err(),
+            "later window is prohibited"
+        );
+    }
+
+    #[test]
+    fn revision_keys_include_full_identity() {
+        let mut registry = LicensingRegistry::new();
+        let mut first = record(RightDecision::Permitted, "provider-a", "US", 0, None, 1);
+        first.audit.licence_document_hash = "a".repeat(64);
+        let mut second = first.clone();
+        second.identity.product_id = "product-b".to_owned();
+        second.audit.licence_document_hash = "b".repeat(64);
+        let mut third = first.clone();
+        third.identity.source_id = "source-b".to_owned();
+        third.audit.licence_document_hash = "c".repeat(64);
+        registry.register(first).expect("first product registered");
+        registry
+            .register(second)
+            .expect("second product registered");
+        registry.register(third).expect("second source registered");
+        assert_eq!(
+            registry.records.len(),
+            3,
+            "unrelated identities never collide on one contract revision"
+        );
+    }
+
+    #[test]
+    fn reinstatement_supersedes_revocation() {
+        let mut registry = LicensingRegistry::new();
+        let mut grant = record(RightDecision::Permitted, "provider-a", "US", 0, None, 1);
+        grant.audit.licence_document_hash = "a".repeat(64);
+        let mut revoked = record(RightDecision::Revoked, "provider-a", "US", 50, None, 2);
+        revoked.audit.licence_document_hash = "b".repeat(64);
+        let mut reinstated = record(RightDecision::Permitted, "provider-a", "US", 100, None, 3);
+        reinstated.audit.licence_document_hash = "c".repeat(64);
+        registry.register(grant).expect("grant registered");
+        registry.register(revoked).expect("revocation registered");
+        registry
+            .register(reinstated)
+            .expect("reinstatement registered");
+        assert!(
+            matches!(
+                registry.authorize(&query(), 75),
+                Err(RightsError::Revoked { .. })
+            ),
+            "revocation applies before reinstatement"
+        );
+        assert!(
+            registry.authorize(&query(), 150).is_ok(),
+            "later approved contract reauthorizes the source"
+        );
+    }
+
+    #[test]
+    fn malformed_interval_and_audit_are_refused() {
+        let mut registry = LicensingRegistry::new();
+        let mut invalid_interval =
+            record(RightDecision::Permitted, "provider-a", "US", 10, Some(9), 1);
+        invalid_interval.audit.licence_document_hash = "a".repeat(64);
+        let interval_result = registry.register(invalid_interval);
+        let interval_invalid = matches!(interval_result, Err(RightsError::InvalidInterval));
+        assert!(interval_invalid, "invalid intervals are refused");
+        let mut invalid_audit = record(RightDecision::Permitted, "provider-a", "US", 0, None, 1);
+        invalid_audit.audit.licence_document_hash = "not-a-digest".to_owned();
+        let audit_result = registry.register(invalid_audit);
+        let audit_invalid = matches!(audit_result, Err(RightsError::InvalidAudit));
+        assert!(audit_invalid, "invalid audit evidence is refused");
     }
 }
