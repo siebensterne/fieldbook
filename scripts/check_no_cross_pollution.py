@@ -24,9 +24,7 @@ ABSOLUTE_PATH = re.compile(r"(?<![\w/])/(?:Users|home|opt|private|tmp)/")
 def scan() -> list[str]:
     """Return every project-local tooling file that references another repo."""
     errors: list[str] = []
-    targets = sorted((ROOT / "scripts").rglob("*.py")) + sorted(
-        (ROOT / "scripts").rglob("*.sh")
-    )
+    targets = sorted((ROOT / "scripts").rglob("*.py")) + sorted((ROOT / "scripts").rglob("*.sh"))
     targets += sorted((ROOT / ".github" / "workflows").glob("*.yml"))
     for path in targets:
         if path == Path(__file__).resolve():
@@ -37,9 +35,7 @@ def scan() -> list[str]:
             lowered = line.lower()
             for marker in FOREIGN_MARKERS:
                 if marker.lower() in lowered:
-                    errors.append(
-                        f"{relative}:{number}: foreign marker `{marker}`"
-                    )
+                    errors.append(f"{relative}:{number}: foreign marker `{marker}`")
             if ABSOLUTE_PATH.search(line):
                 errors.append(f"{relative}:{number}: absolute host path")
     return errors

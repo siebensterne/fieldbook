@@ -14,16 +14,8 @@ class ExemptionTest(unittest.TestCase):
 
     def test_links_and_code_spans_are_exempt(self) -> None:
         """Allow long lines carrying links or inline code."""
-        self.assertTrue(
-            style.exempt_long(
-                "See [a very long link](https://x) now", "markdown"
-            )
-        )
-        self.assertTrue(
-            style.exempt_long(
-                "Use `some_really_long_identifier` here", "markdown"
-            )
-        )
+        self.assertTrue(style.exempt_long("See [a very long link](https://x) now", "markdown"))
+        self.assertTrue(style.exempt_long("Use `some_really_long_identifier` here", "markdown"))
 
     def test_json_has_no_line_limit(self) -> None:
         """The Google JSON guide does not impose a line length."""
@@ -50,9 +42,7 @@ class MarkdownTest(unittest.TestCase):
         """Wrap prose and leave no NUL placeholder bytes in the output."""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "doc.md"
-            path.write_text(
-                "# Title\n\n" + "word " * 40 + "\n", encoding="utf-8"
-            )
+            path.write_text("# Title\n\n" + "word " * 40 + "\n", encoding="utf-8")
             self.assertTrue(style.reflow_markdown(path))
             text = path.read_text(encoding="utf-8")
             self.assertNotIn("\x00", text)
@@ -62,9 +52,7 @@ class MarkdownTest(unittest.TestCase):
         """Never rewrite lines carrying links or code spans."""
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "doc.md"
-            original = (
-                "# Title\n\nSee [long](https://example.invalid) `code`.\n"
-            )
+            original = "# Title\n\nSee [long](https://example.invalid) `code`.\n"
             path.write_text(original, encoding="utf-8")
             style.reflow_markdown(path)
             self.assertEqual(path.read_text(encoding="utf-8"), original)

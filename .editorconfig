@@ -9,7 +9,7 @@ insert_final_newline = true
 trim_trailing_whitespace = true
 indent_style = space
 indent_size = 4
-max_line_length = 80
+max_line_length = 100
 
 # Rust: rustfmt owns layout; 100 columns is the pinned rustfmt default.
 [*.rs]
@@ -18,11 +18,11 @@ max_line_length = 100
 
 [*.py]
 indent_size = 4
-max_line_length = 80
+max_line_length = 100
 
 [*.{toml,json,jsonl,yml,yaml}]
 indent_size = 2
-max_line_length = 80
+max_line_length = 100
 
 [*.{c,cc,cpp,cxx,h,hpp,hxx}]
 indent_size = 2
@@ -31,7 +31,7 @@ max_line_length = 80
 [*.md]
 indent_style = space
 indent_size = 2
-max_line_length = 80
+max_line_length = 100
 
 # q / kdb+ follows engineering/q-kdb-style.md in the sibling workspace.
 [*.q]

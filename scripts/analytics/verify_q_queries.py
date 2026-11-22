@@ -51,32 +51,16 @@ def reconcile(export_dir: Path, result_dir: Path) -> dict:
     instruments = load(result_dir / "q-instruments.json")
 
     checks["q_version"] = status(str(preflight["q_version"]) == "5")
-    checks["preflight_rows"] = status(
-        preflight["journal_rows"] == rows["journal_observation"]
-    )
+    checks["preflight_rows"] = status(preflight["journal_rows"] == rows["journal_observation"])
     checks["capture_rows"] = status(capture["rows"] == rows["capture_run"])
-    checks["journal_rows"] = status(
-        journal["rows"] == rows["journal_observation"]
-    )
-    checks["orderbook_messages"] = status(
-        orderbook["messages"] == rows["sbe_message"]
-    )
-    checks["orderbook_levels"] = status(
-        orderbook["levels"] == rows["sbe_book_level"]
-    )
-    checks["instrument_rows"] = status(
-        instruments["instruments"] == rows["capture_instrument"]
-    )
-    checks["instrument_ranges"] = status(
-        instruments["ranges"] == rows["capture_price_range"]
-    )
-    checks["instrument_bands"] = status(
-        instruments["bands"] == rows["capture_tick_band"]
-    )
+    checks["journal_rows"] = status(journal["rows"] == rows["journal_observation"])
+    checks["orderbook_messages"] = status(orderbook["messages"] == rows["sbe_message"])
+    checks["orderbook_levels"] = status(orderbook["levels"] == rows["sbe_book_level"])
+    checks["instrument_rows"] = status(instruments["instruments"] == rows["capture_instrument"])
+    checks["instrument_ranges"] = status(instruments["ranges"] == rows["capture_price_range"])
+    checks["instrument_bands"] = status(instruments["bands"] == rows["capture_tick_band"])
     checks["legacy_provenance"] = status(
-        capture["provenance"]
-        == manifest["journal_provenance_status"]
-        == "legacy_incomplete"
+        capture["provenance"] == manifest["journal_provenance_status"] == "legacy_incomplete"
     )
     checks["capture_declared_counts"] = status(
         capture["sbe_messages"] == rows["sbe_message"]
@@ -88,14 +72,11 @@ def reconcile(export_dir: Path, result_dir: Path) -> dict:
     return {
         "certificate": "analytics",
         "export_id": manifest["export_id"],
-        "status": (
-            PASS if all(value == PASS for value in checks.values()) else FAIL
-        ),
+        "status": (PASS if all(value == PASS for value in checks.values()) else FAIL),
         "checks": checks,
         "denominators": rows,
         "notes": [
-            "Sequence ranges without a source clock are NOT_MEASURED, "
-            "not zero.",
+            "Sequence ranges without a source clock are NOT_MEASURED, " "not zero.",
             "Snapshot-only feeds report delta continuity as NOT_APPLICABLE.",
         ],
     }

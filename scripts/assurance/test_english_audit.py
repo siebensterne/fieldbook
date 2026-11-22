@@ -142,10 +142,7 @@ class EnglishAuditTests(unittest.TestCase):
             )  # english-audit-ignore: commit-message detector fixture
             findings = english_audit.scan_commit_history(repo, f"{base}..HEAD")
             self.assertTrue(
-                any(
-                    f.category == "tautology" and f.source.endswith(":subject")
-                    for f in findings
-                )
+                any(f.category == "tautology" and f.source.endswith(":subject") for f in findings)
             )
 
     def test_exclusion_is_explicit_and_path_based(self) -> None:
@@ -156,9 +153,7 @@ class EnglishAuditTests(unittest.TestCase):
             (repo / "old.md").write_text(
                 "repeat again\n", encoding="utf-8"
             )  # english-audit-ignore: detector fixture
-            subprocess.run(
-                ["git", "-C", str(repo), "add", "old.md"], check=True
-            )
+            subprocess.run(["git", "-C", str(repo), "add", "old.md"], check=True)
             findings, stats = english_audit.scan_tracked_tree(repo, ["old.md"])
             self.assertEqual(findings, [])
             self.assertEqual(stats["excluded_files"], ["old.md"])
@@ -190,17 +185,11 @@ class EnglishAuditTests(unittest.TestCase):
             "<text>We require a review.</text></svg>"
         )
         findings = english_audit.scan_text(svg, "diagram.svg")
-        self.assertEqual(
-            [(f.phrase, f.category) for f in findings], [("We", "first_person")]
-        )
+        self.assertEqual([(f.phrase, f.category) for f in findings], [("We", "first_person")])
 
     def test_rust_code_identifiers_are_not_prose(self) -> None:
         """Exercise test rust code identifiers are not prose."""
-        code = (
-            "let value = Some(1);\n"
-            "fn ensure() -> bool { true }\n"
-            "let never = false;\n"
-        )
+        code = "let value = Some(1);\n" "fn ensure() -> bool { true }\n" "let never = false;\n"
         findings = english_audit.scan_text(code, "src/sample.rs")
         self.assertEqual(findings, [])
 
@@ -216,8 +205,7 @@ class EnglishAuditTests(unittest.TestCase):
     def test_svg_attributes_are_not_prose(self) -> None:
         """Exercise test svg attributes are not prose."""
         svg = (
-            '<svg xmlns="http://www.w3.org/2000/svg" font-size="small">'
-            "<text>small</text></svg>"
+            '<svg xmlns="http://www.w3.org/2000/svg" font-size="small">' "<text>small</text></svg>"
         )
         findings = english_audit.scan_text(svg, "diagram.svg")
         self.assertEqual(
@@ -234,9 +222,7 @@ class EnglishAuditTests(unittest.TestCase):
 
     def test_markdown_inline_code_is_not_prose(self) -> None:
         """Exercise test markdown inline code is not prose."""
-        findings = english_audit.scan_text(
-            "Use `Some` and `never` as identifiers.\n", "sample.md"
-        )
+        findings = english_audit.scan_text("Use `Some` and `never` as identifiers.\n", "sample.md")
         self.assertEqual(findings, [])
 
 

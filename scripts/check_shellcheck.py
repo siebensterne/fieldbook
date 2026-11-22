@@ -41,9 +41,7 @@ def main() -> int:
     if not scripts:
         print("shellcheck: no shell scripts in this repository")
         return 0
-    result = subprocess.run(
-        [binary, "-x", *(str(path) for path in scripts)], cwd=ROOT
-    )
+    result = subprocess.run([binary, "-x", *(str(path) for path in scripts)], cwd=ROOT)
     return result.returncode
 
 

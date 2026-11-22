@@ -19,17 +19,13 @@ except ImportError:
     export_parquet = None
 
 
-@unittest.skipIf(
-    export_parquet is None, "pyarrow is not installed in this environment"
-)
+@unittest.skipIf(export_parquet is None, "pyarrow is not installed in this environment")
 class ParquetPublisherTests(unittest.TestCase):
     """Model explicit schemas and rejected rows."""
 
     def test_schemas_cover_all_datasets(self) -> None:
         """Check that every contract dataset has an Arrow schema."""
-        self.assertEqual(
-            set(export_parquet.DATASETS), set(export_parquet.SCHEMAS)
-        )
+        self.assertEqual(set(export_parquet.DATASETS), set(export_parquet.SCHEMAS))
 
     def test_binary_fields_are_fixed_size(self) -> None:
         """Check that digests use a fixed-size binary representation."""

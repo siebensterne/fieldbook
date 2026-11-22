@@ -320,9 +320,7 @@ def publish(staging: Path, exports: Path, args: argparse.Namespace) -> dict:
         )
         expected_rows = manifest["row_counts"][name]
         if rows != expected_rows:
-            raise ValueError(
-                f"{name}: staged rows {rows} != manifest {expected_rows}"
-            )
+            raise ValueError(f"{name}: staged rows {rows} != manifest {expected_rows}")
         row_counts[name] = rows
         logical[name] = logical_digest
         readback[name] = readback_digest
@@ -355,12 +353,8 @@ def publish(staging: Path, exports: Path, args: argparse.Namespace) -> dict:
         logical[name] == readback[name] for name in DATASETS
     )
     manifest_path = staging / "export-manifest.json"
-    manifest_path.write_text(
-        json.dumps(result, indent=2, sort_keys=True) + "\n"
-    )
-    manifest_path.with_suffix(".sha256").write_text(
-        sha256_file(manifest_path) + "\n"
-    )
+    manifest_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    manifest_path.with_suffix(".sha256").write_text(sha256_file(manifest_path) + "\n")
 
     exports.mkdir(parents=True, exist_ok=True)
     destination = exports / export_id
@@ -377,9 +371,7 @@ def main() -> int:
     parser.add_argument("--exports", type=Path, required=True)
     parser.add_argument("--row-group-size", type=int, default=131072)
     parser.add_argument("--batch-rows", type=int, default=32768)
-    parser.add_argument(
-        "--compression", choices=("snappy", "zstd"), default="snappy"
-    )
+    parser.add_argument("--compression", choices=("snappy", "zstd"), default="snappy")
     args = parser.parse_args()
     try:
         result = publish(args.staging, args.exports, args)

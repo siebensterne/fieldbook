@@ -24,9 +24,7 @@ import subprocess
 import sys
 import unittest
 
-ASSERT_MACRO = re.compile(
-    r"\b(?P<name>(?:debug_)?assert(?:_eq|_ne|_matches)?)\s*!\s*\("
-)
+ASSERT_MACRO = re.compile(r"\b(?P<name>(?:debug_)?assert(?:_eq|_ne|_matches)?)\s*!\s*\(")
 FILE_HEADER = re.compile(r"^\+\+\+ b/")
 GLOB_IMPORT = re.compile(r"^use [A-Za-z0-9_:]+::\*;\s*$")
 FLAT_MULTI_IMPORT = re.compile(r"^use [A-Za-z0-9_:]+::\{[^}]*,[^}]*\};\s*$")
@@ -81,11 +79,7 @@ def collect_added_lines(base: str) -> dict[str, list[tuple[int, str]]]:
         text=True,
     )
     added = parse_added_lines(result.stdout)
-    return {
-        path: lines
-        for path, lines in added.items()
-        if not path.startswith(GENERATED_PREFIX)
-    }
+    return {path: lines for path, lines in added.items() if not path.startswith(GENERATED_PREFIX)}
 
 
 def _macro_invocation(text: str, start: int) -> str:
@@ -171,9 +165,7 @@ def assertion_context_errors(text: str) -> list[tuple[int, str]]:
         args = _top_level_arguments(invocation)
         name = match.group("name")
         minimum = 3 if name in TWO_VALUE_ASSERTS else 2
-        if len(args) < minimum or not _is_string_literal(
-            args[-1] if args else ""
-        ):
+        if len(args) < minimum or not _is_string_literal(args[-1] if args else ""):
             line = text.count("\n", 0, match.start()) + 1
             errors.append((line, invocation.splitlines()[0][:80]))
     return errors
@@ -189,20 +181,14 @@ def check_lines(by_file: dict[str, list[tuple[int, str]]]) -> list[str]:
                 errors.append(f"{path}:{number}: glob import ({stripped!r})")
             if FLAT_MULTI_IMPORT.match(stripped):
                 errors.append(
-                    f"{path}:{number}: multi-item import must be vertical "
-                    f"({stripped!r})"
+                    f"{path}:{number}: multi-item import must be vertical " f"({stripped!r})"
                 )
             if stripped.startswith("#[allow(") and "//" not in stripped:
-                errors.append(
-                    f"{path}:{number}: #[allow] without inline justification"
-                )
+                errors.append(f"{path}:{number}: #[allow] without inline justification")
         text = "\n".join(content for _, content in lines)
         for offset, invocation in assertion_context_errors(text):
             number = lines[min(offset - 1, len(lines) - 1)][0] if lines else 0
-            errors.append(
-                f"{path}:{number}: assertion without context string: "
-                f"{invocation}"
-            )
+            errors.append(f"{path}:{number}: assertion without context string: " f"{invocation}")
     return errors
 
 
@@ -233,10 +219,7 @@ class StyleCheckerTests(unittest.TestCase):
 
     def test_dev_null_marker_is_not_an_added_line(self) -> None:
         """Check test dev null marker is not an added line."""
-        diff = (
-            "+++ b/a.rs\n@@ -1,1 +1,1 @@\n+real\n"
-            "+++ /dev/null\n@@ -1,1 +0,0 @@\n-removed\n"
-        )
+        diff = "+++ b/a.rs\n@@ -1,1 +1,1 @@\n+real\n" "+++ /dev/null\n@@ -1,1 +0,0 @@\n-removed\n"
         self.assertEqual(parse_added_lines(diff), {"a.rs": [(1, "real")]})
 
     def test_added_line_beginning_with_double_plus_is_kept(self) -> None:
@@ -246,10 +229,7 @@ class StyleCheckerTests(unittest.TestCase):
 
     def test_assertion_last_argument_is_context(self) -> None:
         """Check test assertion last argument is context."""
-        good = (
-            'assert_eq!(left, right, "context");\n'
-            'assert!(matches!(x, Err(E)), "bad state");'
-        )
+        good = 'assert_eq!(left, right, "context");\n' 'assert!(matches!(x, Err(E)), "bad state");'
         self.assertEqual(assertion_context_errors(good), [])
 
     def test_expected_value_string_is_not_context(self) -> None:
@@ -313,9 +293,7 @@ class StyleCheckerTests(unittest.TestCase):
 def main() -> int:
     """Check main."""
     if "--self-test" in sys.argv[1:]:
-        suite = unittest.defaultTestLoader.loadTestsFromTestCase(
-            StyleCheckerTests
-        )
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(StyleCheckerTests)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1
 

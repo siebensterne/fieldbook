@@ -17,8 +17,8 @@ force-exclude = true
 fix = false
 unsafe-fixes = false
 
-line-length = 80
-target-version = "py311"
+line-length = 100
+target-version = "py312"
 src = ["scripts"]
 extend-exclude = [
   "target",
@@ -31,7 +31,7 @@ extend-exclude = [
 
 [lint]
 # No implicit suppression by underscore-prefixed names other than `_`, and
-# postponed annotations are mandatory on every Python 3.11+ target.
+# postponed annotations are mandatory on every Python 3.12+ target.
 dummy-variable-rgx = "^_$"
 future-annotations = true
 select = [

@@ -71,9 +71,7 @@ def measure(label: str, profile: str, keep: bool) -> dict:
             for unit in units[:12]
         ],
     }
-    (PERF / f"{label}.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
+    (PERF / f"{label}.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     if not keep:
         shutil.rmtree(target)
     return summary
@@ -84,19 +82,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--label", required=True)
     parser.add_argument("--profile", choices=("dev", "release"), default="dev")
-    parser.add_argument(
-        "--keep", action="store_true", help="keep the scratch target"
-    )
+    parser.add_argument("--keep", action="store_true", help="keep the scratch target")
     arguments = parser.parse_args()
     try:
         summary = measure(arguments.label, arguments.profile, arguments.keep)
     except (OSError, RuntimeError) as error:
         print(f"[FAIL] compile measurement failed: {error}")
         return 1
-    print(
-        f"{summary['label']}: {summary['seconds']}s "
-        f"across {summary['units']} units"
-    )
+    print(f"{summary['label']}: {summary['seconds']}s " f"across {summary['units']} units")
     for unit in summary["slowest"][:5]:
         print(f"  {unit['seconds']:6.2f}s  {unit['name']} {unit['version']}")
     return 0

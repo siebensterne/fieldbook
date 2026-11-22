@@ -1,22 +1,18 @@
-# Formatting rules for this workspace; enforced by `cargo fmt --check` in CI.
-# Unpinned options use rustfmt stable defaults, so rustfmt
-# has exactly one knob per decision and none to argue.
-
-# Pin line endings: CI runs on Linux, contributors on macOS; never CRLF.
-newline_style = "Unix"
-# Match the edition-2024 style applied by the pinned toolchain.
-style_edition = "2024"
-# Same layout contract as the sibling quant workspace: four spaces and the
-# 100-column rustfmt default, stated explicitly rather than left implicit.
+# Rust formatting policy. Stable rustfmt options only; the toolchain is pinned
+# in rust-toolchain.toml. Unstable options are excluded so
+# `cargo fmt --check` behaves identically on every supported host.
+edition = "2024"
 max_width = 100
 hard_tabs = false
 tab_spaces = 4
-# Only stable options are listed so the pinned stable toolchain applies all
-# of them without warnings. Unstable fail-closed knobs are not usable here.
+newline_style = "Unix"
+use_small_heuristics = "Default"
+
 reorder_imports = true
 reorder_modules = true
+
+remove_nested_parens = true
 merge_derives = true
 use_try_shorthand = true
 use_field_init_shorthand = true
 force_explicit_abi = true
-
