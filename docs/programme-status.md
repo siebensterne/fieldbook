@@ -103,6 +103,14 @@ iterations of one fixed trade payload, the interchange path measured 171 ns per
 operation and typed normalization measured 1,263 ns per operation. These are
 measurements of one workload, not latency targets or production results.
 
+M3.1.5 separates conformance into code-present, fixture-conformant,
+integration-conformant, rights-approved, network-validated, live-verified,
+history-reconciled and certified states. The harness runs the integrated
+fixture path, validates rights and declarations, and reconciles replay against
+the journal. External references are recorded as declarations, not passes, so
+a fixture run, a successful connection or a successful writer cannot certify a
+live dataset. No live collection or rights approval was added.
+
 ## Domain reorganisation
 
 The source tree is organised by the six architectural planes. Modules moved

@@ -142,6 +142,8 @@ fn declaration() -> ConformanceDeclaration {
         }),
         declared_kinds: vec!["trade".to_owned()],
         rights_required: vec![UsageRight::InternalProcessing],
+        integration: None,
+        external: fieldbook::conformance::ExternalEvidence::default(),
     }
 }
 
@@ -208,7 +210,15 @@ fn fixture_declared_source_is_certified() {
         100,
     );
     assert!(report.passed(), "all checks must pass: {report:?}");
-    assert!(report.certified, "fixture-backed source is certified");
+    assert!(
+        !report.certified,
+        "a fixture run is not a live certification"
+    );
+    assert_eq!(
+        report.statuses.fixture_conformant,
+        fieldbook::conformance::ConformanceStageState::Pass,
+        "fixture conformance is reported separately"
+    );
     assert_eq!(
         report.checks.len(),
         7,

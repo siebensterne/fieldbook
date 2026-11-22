@@ -185,3 +185,10 @@ is explicitly
 | Five modalities have functional fixture implementations | `src/acquisition/fixture_connectors.rs::every_fixture_manifest_declares_one_realizable_modality`, `src/acquisition/fixture_connectors.rs::streaming_fixture_delivers_ordered_frames_and_recovers`, `src/acquisition/fixture_connectors.rs::snapshot_fixture_supports_keyed_lookup_and_pagination`, `src/acquisition/fixture_connectors.rs::batch_fixture_resumes_from_cursor`, `src/acquisition/fixture_connectors.rs::document_fixture_keeps_original_bytes_and_versions`, `src/acquisition/fixture_connectors.rs::onchain_fixture_keeps_block_continuity_and_reorg_evidence` | Deterministic fixtures only; no venue connection. |
 | A streaming slice reaches replay verification | `src/acquisition/stream_slice.rs::integrated_slice_reconciles_journal_typed_events_and_replay` | One source codec path; fixture evidence only. |
 | Typed events reference one stored raw record | `src/acquisition/codec.rs::typed_normalization_keeps_raw_evidence`, `src/acquisition/codec.rs::rejected_observations_keep_raw_evidence_without_typed_payload` | Raw bytes live in the evidence store, not in each typed event. |
+
+## Independent conformance statuses
+
+| Claim | Evidence | Limits |
+|---|---|---|
+| Code, fixture, integration, rights and external stages stay separate | `src/integrity/conformance.rs::connect_success_is_not_a_certification_signal`, `src/integrity/conformance.rs::integration_stage_uses_a_real_end_to_end_fixture`, `src/integrity/conformance.rs::external_evidence_is_declared_not_passing` | External references are declarations, not passes. |
+| A fixture run cannot certify a live source | `tests/source_conformance.rs::fixture_declared_source_is_certified`, `src/integrity/conformance.rs::mismatched_fixture_fails_closed` | Full certification requires independently validated network, live and history evidence. |
