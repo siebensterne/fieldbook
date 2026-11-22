@@ -1880,18 +1880,32 @@ async fn journal_storage_pressure_profile_fails_closed() {
     // Both outcomes are fail-closed; the manifest must still carry the
     // rejection state and the collector's terminal error.
     if let Some(output) = outcome.output.as_ref() {
-        let invalid = output
+        let finalized = output
             .report
             .journal_verification
             .as_ref()
             .is_some_and(|verification| {
-                verification.state == RunState::Failed || !verification.complete
+                verification.state == RunState::Finalized && verification.complete
             });
-        let verdict = format!(
-            "a fatal journal rejection cannot certify a capture: {:?}",
-            output.report.journal_verification
-        );
-        assert!(invalid, "{verdict}");
+        if finalized {
+            assert!(
+                !outcome.acceptance.valid,
+                "a finalized journal does not certify a rejected capture"
+            );
+        } else {
+            let invalid = output
+                .report
+                .journal_verification
+                .as_ref()
+                .is_some_and(|verification| {
+                    verification.state == RunState::Failed || !verification.complete
+                });
+            let verdict = format!(
+                "a fatal journal rejection cannot certify a capture: {:?}",
+                output.report.journal_verification
+            );
+            assert!(invalid, "{verdict}");
+        }
     }
 
     let document = read_single_manifest(&out);
