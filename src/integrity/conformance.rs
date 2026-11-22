@@ -6,11 +6,15 @@
 //! certification signal. Every check is explicit, fail-closed, and reported
 //! with a reason so an unmet condition cannot hide behind an ordinal status.
 
+use std::path::PathBuf;
+
 use serde::Deserialize;
 use serde::Serialize;
 
 use crate::{
+    acquisition::arbiter::{ArbiterLimits, SequencedPacket},
     acquisition::codec::{CodecRegistry, DecodeStatus},
+    acquisition::stream_slice::{CollectingSink, SliceConfig, run_stream_slice},
     governance::{
         adapter::SourceCapabilityManifest,
         coverage_certification::ExpectedUniverse,
@@ -18,6 +22,87 @@ use crate::{
         rights::{AuthorizationQuery, LicensingRegistry, Purpose, RecipientClass, UsageRight},
     },
 };
+
+/// Evidence state of one independent conformance stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConformanceStageState {
+    /// No evidence was supplied for this stage.
+    NotAssessed,
+    /// The harness verified this stage against a deterministic fixture.
+    Pass,
+    /// The harness found a discrepancy.
+    Fail,
+    /// External evidence was referenced but not independently validated here.
+    Declared,
+}
+
+impl ConformanceStageState {
+    /// Return the stable contract string for this state.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotAssessed => "not_assessed",
+            Self::Pass => "pass",
+            Self::Fail => "fail",
+            Self::Declared => "declared",
+        }
+    }
+}
+
+/// Separate conformance statuses. A fixture result cannot stand in for a live
+/// or network result, and a successful writer cannot stand in for completeness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConformanceStatuses {
+    pub code_present: ConformanceStageState,
+    pub fixture_conformant: ConformanceStageState,
+    pub integration_conformant: ConformanceStageState,
+    pub rights_approved: ConformanceStageState,
+    pub network_validated: ConformanceStageState,
+    pub live_verified: ConformanceStageState,
+    pub history_reconciled: ConformanceStageState,
+    pub certified: ConformanceStageState,
+}
+
+impl ConformanceStatuses {
+    /// Whether every stage carries independently verified passing evidence.
+    #[must_use]
+    pub fn fully_certified(&self) -> bool {
+        [
+            self.code_present,
+            self.fixture_conformant,
+            self.integration_conformant,
+            self.rights_approved,
+            self.network_validated,
+            self.live_verified,
+            self.history_reconciled,
+            self.certified,
+        ]
+        .iter()
+        .all(|state| *state == ConformanceStageState::Pass)
+    }
+}
+
+/// Optional references to evidence that this harness cannot independently
+/// validate. Providing a reference records a declaration, not a pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalEvidence {
+    #[serde(default)]
+    pub network_validation: Option<String>,
+    #[serde(default)]
+    pub live_capture: Option<String>,
+    #[serde(default)]
+    pub history_reconciliation: Option<String>,
+}
+
+/// Deterministic end-to-end fixture for the integration stage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntegrationFixture {
+    pub directory: PathBuf,
+    pub run_id: String,
+    pub config: SliceConfig,
+    pub packets: Vec<SequencedPacket>,
+    pub expected_typed_events: usize,
+}
 
 /// What a source claims before any conformance evidence is examined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +119,12 @@ pub struct ConformanceDeclaration {
     pub declared_kinds: Vec<String>,
     /// Rights that the declared workflow requires.
     pub rights_required: Vec<UsageRight>,
+    /// Optional end-to-end fixture for the integration stage.
+    #[serde(default)]
+    pub integration: Option<IntegrationFixture>,
+    /// Optional references to externally validated evidence.
+    #[serde(default)]
+    pub external: ExternalEvidence,
 }
 
 impl ConformanceDeclaration {
@@ -126,7 +217,9 @@ pub struct ConformanceReport {
     pub fixture: String,
     /// Independent checks and their dispositions.
     pub checks: Vec<ConformanceCheck>,
-    /// `true` only when every check passed.
+    /// Separate evidence statuses for each conformance stage.
+    pub statuses: ConformanceStatuses,
+    /// `true` only when every check passed. This is not a live certification.
     pub certified: bool,
 }
 
@@ -214,19 +307,44 @@ pub fn run_conformance(
         source_id: declaration.source_id.clone(),
         fixture: fixture.name.clone(),
         checks: Vec::new(),
+        statuses: ConformanceStatuses {
+            code_present: ConformanceStageState::NotAssessed,
+            fixture_conformant: ConformanceStageState::NotAssessed,
+            integration_conformant: ConformanceStageState::NotAssessed,
+            rights_approved: ConformanceStageState::NotAssessed,
+            network_validated: if declaration.external.network_validation.is_some() {
+                ConformanceStageState::Declared
+            } else {
+                ConformanceStageState::NotAssessed
+            },
+            live_verified: if declaration.external.live_capture.is_some() {
+                ConformanceStageState::Declared
+            } else {
+                ConformanceStageState::NotAssessed
+            },
+            history_reconciled: if declaration.external.history_reconciliation.is_some() {
+                ConformanceStageState::Declared
+            } else {
+                ConformanceStageState::NotAssessed
+            },
+            certified: ConformanceStageState::NotAssessed,
+        },
         certified: false,
     };
 
     match declaration.validate() {
-        Ok(()) => add_check(
-            &mut report,
-            "declaration",
-            true,
-            "manifest, modalities and identity are valid".to_owned(),
-        ),
+        Ok(()) => {
+            report.statuses.code_present = ConformanceStageState::Pass;
+            add_check(
+                &mut report,
+                "declaration",
+                true,
+                "manifest, modalities and identity are valid".to_owned(),
+            );
+        }
         Err(error) => {
+            report.statuses.code_present = ConformanceStageState::Fail;
             add_check(&mut report, "declaration", false, error.to_string());
-            report.certified = false;
             return report;
         }
     }
@@ -293,6 +411,11 @@ pub fn run_conformance(
             "typed normalization failed or raw evidence was altered".to_owned()
         },
     );
+    report.statuses.fixture_conformant = if codec_registered && decode_matches && typed_ok {
+        ConformanceStageState::Pass
+    } else {
+        ConformanceStageState::Fail
+    };
 
     let mut denied_rights = Vec::new();
     for right in &declaration.rights_required {
@@ -320,6 +443,11 @@ pub fn run_conformance(
             format!("denied rights: {}", denied_rights.join(", "))
         },
     );
+    report.statuses.rights_approved = if denied_rights.is_empty() {
+        ConformanceStageState::Pass
+    } else {
+        ConformanceStageState::Fail
+    };
 
     let universe_detail = match &declaration.expected_universe {
         Some(universe @ ExpectedUniverse::Enumerated { .. }) => match universe.measure() {
@@ -369,7 +497,48 @@ pub fn run_conformance(
         },
     );
 
-    report.certified = report.passed();
+    if let Some(integration) = &declaration.integration {
+        let sink = CollectingSink::default();
+        let outcome = run_stream_slice(
+            &integration.directory,
+            &integration.run_id,
+            &integration.config,
+            integration.packets.clone(),
+            codecs,
+            &sink,
+            ArbiterLimits::default(),
+        );
+        let passed = match &outcome {
+            Ok(result) => {
+                result.evidence_reconciled
+                    && result.verification.valid
+                    && result.typed_events == integration.expected_typed_events
+            }
+            Err(_) => false,
+        };
+        add_check(
+            &mut report,
+            "integration_replay",
+            passed,
+            if passed {
+                "journal, typed events and replay reconcile".to_owned()
+            } else {
+                "the end-to-end fixture path did not reconcile".to_owned()
+            },
+        );
+        report.statuses.integration_conformant = if passed {
+            ConformanceStageState::Pass
+        } else {
+            ConformanceStageState::Fail
+        };
+    }
+
+    report.certified = report.statuses.fully_certified();
+    report.statuses.certified = if report.statuses.fully_certified() {
+        ConformanceStageState::Pass
+    } else {
+        ConformanceStageState::NotAssessed
+    };
     report
 }
 
@@ -490,6 +659,8 @@ mod tests {
             }),
             declared_kinds: vec!["trade".to_owned()],
             rights_required: vec![UsageRight::InternalProcessing],
+            integration: None,
+            external: ExternalEvidence::default(),
         }
     }
 
@@ -548,11 +719,135 @@ mod tests {
             })
             .expect("rights registered");
         let report = run_conformance(&declaration(), &fixture(), &codecs, &licensing, 100);
-        assert!(report.certified, "all evidence checks must pass");
+        assert!(report.passed(), "all fixture checks must pass");
+        assert_eq!(
+            report.statuses.fixture_conformant,
+            ConformanceStageState::Pass,
+            "fixture conformance is explicit"
+        );
+        assert_eq!(
+            report.statuses.rights_approved,
+            ConformanceStageState::Pass,
+            "rights approval is explicit"
+        );
+        assert!(!report.certified, "a fixture cannot certify a live source");
         assert_eq!(report.checks.len(), 7, "seven explicit checks reported");
         assert!(
             report.checks.iter().all(|check| check.name != "connect"),
             "connection success is never a conformance check"
+        );
+    }
+
+    #[test]
+    fn integration_stage_uses_a_real_end_to_end_fixture() {
+        use crate::{
+            acquisition::arbiter::FeedChannel, acquisition::stream_slice::SliceConfig,
+            model::SourceId,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut source = declaration();
+        source.integration = Some(IntegrationFixture {
+            directory: directory.path().to_path_buf(),
+            run_id: "conformance-run".to_owned(),
+            config: SliceConfig {
+                source_id: "source".to_owned(),
+                source: SourceId::new(2, 0),
+                schema_version: 1,
+                profile: crate::acquisition::evidence::DurabilityProfile::D1,
+            },
+            packets: vec![SequencedPacket {
+                channel: FeedChannel::Primary,
+                sequence: 1,
+                payload: b"{\"trade_id\":\"t-1\",\"price_mantissa\":10,\"quantity_mantissa\":2}"
+                    .to_vec(),
+                received_at_us: 1_700_000_000_000_100,
+            }],
+            expected_typed_events: 1,
+        });
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register(
+                "source",
+                Box::new(JsonCodec {
+                    version: 1,
+                    status: DecodeStatus::Decoded,
+                }),
+            )
+            .expect("codec registered");
+        let mut licensing = LicensingRegistry::new();
+        licensing
+            .register(AuthorizationRecord {
+                identity: AuthorizationIdentity {
+                    provider_id: "provider".to_owned(),
+                    source_id: "source".to_owned(),
+                    dataset_id: "quotes".to_owned(),
+                    product_id: "quotes".to_owned(),
+                    territory: CountryCode::new("US").expect("country code"),
+                    usage_right: UsageRight::InternalProcessing,
+                    recipient_class: RecipientClass::Internal,
+                    purpose: Purpose::InternalAnalysis,
+                    valid_from: 0,
+                    valid_until: Some(200),
+                },
+                decision: RightDecision::Permitted,
+                audit: DecisionAudit {
+                    licence_reference: "contract".to_owned(),
+                    licence_document_hash: "hash".to_owned(),
+                    contract_revision: 1,
+                    recorded_at_us: 0,
+                    authority: "registry".to_owned(),
+                },
+            })
+            .expect("rights registered");
+        let report = run_conformance(&source, &fixture(), &codecs, &licensing, 100);
+        assert_eq!(
+            report.statuses.integration_conformant,
+            ConformanceStageState::Pass,
+            "end-to-end fixture path must pass"
+        );
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "integration_replay"),
+            "integration check is reported"
+        );
+        assert!(!report.certified, "no live evidence was supplied");
+    }
+
+    #[test]
+    fn external_evidence_is_declared_not_passing() {
+        let mut source = declaration();
+        source.external = ExternalEvidence {
+            network_validation: Some("authorized-network-test".to_owned()),
+            live_capture: Some("permitted-capture".to_owned()),
+            history_reconciliation: Some("reconstructed-history".to_owned()),
+        };
+        let mut codecs = CodecRegistry::new();
+        codecs
+            .register(
+                "source",
+                Box::new(JsonCodec {
+                    version: 1,
+                    status: DecodeStatus::Decoded,
+                }),
+            )
+            .expect("codec registered");
+        let report = run_conformance(&source, &fixture(), &codecs, &LicensingRegistry::new(), 100);
+        assert_eq!(
+            report.statuses.network_validated,
+            ConformanceStageState::Declared,
+            "an external reference is a declaration, not a pass"
+        );
+        assert_eq!(
+            report.statuses.live_verified,
+            ConformanceStageState::Declared,
+            "a fixture cannot verify a live capture"
+        );
+        assert!(
+            !report.statuses.fully_certified(),
+            "no stage was validated live"
         );
     }
 
