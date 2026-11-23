@@ -29,9 +29,7 @@ MANDATED = frozenset(
         "jsoncguide.html",
         "pyguide.html",
         "shellguide.html",
-        "verilogguide.html",
         "docguide-style.html",
-        "awesome-style-guide-master.md",
     }
 )
 

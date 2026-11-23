@@ -1,5 +1,13 @@
 # Analytics data contract
 
+> **Deprecated 2026-11-23 (RRP-005).** This offline-export contract is retained
+> until the approved NDC v2 release publication replaces it. Migration target:
+> the approved NDC v2 producer requirements,
+> `engineering/ndc-producer-requirements-v2-proposed.md`, and the workspace
+> `NDC-REGISTRY.md`. No field in this document is an NDC v2 release field, and
+> it grants no right or release acceptance. See
+> `docs/documentation-consolidation-2026-11-23.md`.
+
 This is the single versioned contract for offline analytics exports. The Rust
 capture engine owns acquisition and evidence; this contract describes typed
 projections of that evidence. `EXPORT_SCHEMA_VERSION = 1` in this release.

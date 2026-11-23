@@ -43,9 +43,11 @@ number inherited from the retired prediction-market captures is valid here.
 
 Local journal and replay behavior is exercised with abstract timestamps and
 arbitrary bytes only. Retained non-market PostgreSQL delivery evidence is
-listed in `measurements/README.md`. Cross-host replication, backup and restore
-remain a separately tested tier; zero loss, nanosecond precision, HFT and live
-readiness are not claimed. Live order submission stays disabled.
+recorded under `measurements/live/` with its own commands and digests. The
+former index is a dated pointer at `measurements/README.md`. Cross-host
+replication, backup and restore remain a separately tested tier; zero loss,
+nanosecond precision, HFT and live readiness are not claimed. Live order
+submission stays disabled.
 
 ## Rights boundary
 
