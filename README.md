@@ -72,6 +72,8 @@ rather than a rewrite of history.
 - [Style guide](docs/style-guide.md) — enforceable rules for every language.
 - [Documentation consolidation](docs/documentation-consolidation-2026-11-23.md)
   — RRP-005 change and authority record.
+- [Documentation standard adoption](docs/documentation-standard-adoption-2026-11-24.md)
+  — dated sweep and gate evidence for the adopted documentation standard.
 
 Format contracts: [replay format](docs/replay-format.md),
 [raw-frame journal](docs/raw-frame-journal.md),
