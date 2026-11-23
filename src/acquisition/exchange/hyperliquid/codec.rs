@@ -234,49 +234,12 @@ mod tests {
     use super::*;
     use crate::model::Price;
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/hyperliquid/reference.json");
-
-    #[test]
-    fn reference_document_round_trips_and_rejects_unknown_dex() {
-        let value: serde_json::Value = serde_json::from_str(REFERENCE).unwrap();
-        let markets = parse_reference_document(&value, &["".to_owned()], false).unwrap();
-        assert_eq!(markets.len(), 2);
-        assert_eq!(markets[0].tick_size_us, Some(100_000));
-        assert_eq!(
-            markets[0].numeric_spec.quantity_step,
-            Some(Quantity::new(10).unwrap())
-        );
-        assert_eq!(
-            markets[0].numeric_spec.lot_size,
-            Some(Quantity::new(10).unwrap())
-        );
-        assert!(parse_reference_document(&value, &["missing".to_owned()], false).is_err());
-    }
-
     #[test]
     fn excessive_precision_is_rejected_not_rounded() {
         let value: serde_json::Value =
             serde_json::from_str(r#"{"universe":[{"name":"BTC","szDecimals":9,"pxDecimals":2}]}"#)
                 .unwrap();
         assert!(parse_perp_universe(&value, "").is_err());
-    }
-
-    #[test]
-    fn spot_canonical_only_and_index_resolution() {
-        let value: serde_json::Value = serde_json::from_str(REFERENCE).unwrap();
-        let spot = value.get("spotMeta").unwrap();
-        let markets = parse_spot_meta(spot).unwrap();
-        assert_eq!(markets.len(), 1);
-        assert_eq!(markets[0].native_symbol, "hyperliquid:spot:PURR/USDC");
-        assert_eq!(
-            markets[0].numeric_spec.price_unit,
-            PriceUnit::Currency("USDC".to_owned())
-        );
-        assert_eq!(
-            markets[0].numeric_spec.quantity_unit,
-            QuantityUnit::Currency("PURR".to_owned())
-        );
-        assert_eq!(markets[0].tick_size_us, None);
     }
 
     #[test]

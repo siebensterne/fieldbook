@@ -136,17 +136,15 @@ the optional report/metadata sidecars.
 
 ## Example
 
-The checked-in fixture is `fixtures/sample_replay.jsonl`. It covers discovery,
-two replicas, a shadow snapshot, absolute deltas, a source loss and failover, a
-sequence reset and recovery, a lifecycle removal, periodic snapshots, and final
-snapshots.
+The synthetic replay fixture was retired under RRP-002. The replay format below
+is unchanged, but no checked-in market-shaped sample remains available. Replay
+inputs must come from an accepted real capture or an explicitly approved,
+non-market protocol vector.
 
 ```bash
 cargo run --release -- \
   --output /tmp/replay.sbe \
   --report /tmp/replay-report.json \
   --metadata /tmp/replay-markets.json \
-  replay fixtures/sample_replay.jsonl
-
 cargo run --release -- inspect /tmp/replay.sbe --read-chunk-size auto
 ```

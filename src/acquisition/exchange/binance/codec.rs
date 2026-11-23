@@ -282,59 +282,6 @@ mod tests {
     use super::*;
     use crate::model::Price;
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/binance/reference.json");
-
-    fn document() -> Value {
-        serde_json::from_str(REFERENCE).expect("fixture JSON")
-    }
-
-    fn quotes() -> Vec<String> {
-        vec!["USDT".to_owned()]
-    }
-
-    #[test]
-    fn exact_steps_are_derived_from_price_and_lot_filters() {
-        let markets = parse_reference_document(&document(), &quotes()).unwrap();
-        assert_eq!(markets.len(), 4);
-        let spot_btc = markets
-            .iter()
-            .find(|market| market.native_symbol == "binance:spot:BTC/USDT")
-            .expect("spot BTC/USDT");
-        assert_eq!(spot_btc.tick_size_us, Some(10_000));
-        assert_eq!(
-            spot_btc.numeric_spec.quantity_step,
-            Some(Quantity::new(10).unwrap())
-        );
-        assert_eq!(
-            spot_btc.numeric_spec.lot_size,
-            Some(Quantity::new(10).unwrap())
-        );
-        let perp_btc = markets
-            .iter()
-            .find(|market| market.native_symbol == "binance:perp:BTCUSDT")
-            .expect("perp BTCUSDT");
-        assert_eq!(perp_btc.tick_size_us, Some(100_000));
-        assert_eq!(
-            perp_btc.numeric_spec.quantity_step,
-            Some(Quantity::new(1_000).unwrap())
-        );
-        assert_eq!(perp_btc.numeric_spec.price_scale, 6);
-        assert_eq!(perp_btc.numeric_spec.quantity_scale, 6);
-        assert_eq!(Price::from_raw(1_000_000).raw(), 1_000_000);
-    }
-
-    #[test]
-    fn numeric_specs_validate_for_every_market() {
-        for market in parse_reference_document(&document(), &quotes()).unwrap() {
-            market.validate().expect("valid market");
-            market.numeric_spec.validate().expect("valid numeric spec");
-            assert_eq!(market.exchange, "binance");
-            assert_eq!(market.symbol, market.native_symbol);
-            assert!(market.exchange_market_id.is_none());
-            assert!(market.outcome.is_none());
-        }
-    }
-
     #[test]
     fn precision_beyond_canonical_scale_is_rejected_not_rounded() {
         assert!(exact_step("0.0000001", "tickSize").is_err());
@@ -342,68 +289,5 @@ mod tests {
         let (step, micros) = exact_step("0.00001000", "stepSize").unwrap();
         assert_eq!(step, Quantity::new(10).unwrap());
         assert_eq!(micros, 10);
-    }
-
-    #[test]
-    fn non_canonical_quotes_and_non_perpetual_contracts_are_excluded() {
-        let markets = parse_reference_document(&document(), &quotes()).unwrap();
-        let identities: Vec<_> = markets
-            .iter()
-            .map(|market| market.native_symbol.as_str())
-            .collect();
-        assert_eq!(
-            identities,
-            vec![
-                "binance:perp:BTCUSDT",
-                "binance:perp:ETHUSDT",
-                "binance:spot:BTC/USDT",
-                "binance:spot:ETH/USDT",
-            ]
-        );
-        assert!(!identities.iter().any(|id| id.contains("USDC")));
-        assert!(!identities.iter().any(|id| id.contains("230929")));
-        assert!(!identities.iter().any(|id| id.contains("HALT")));
-    }
-
-    #[test]
-    fn additive_unknown_fields_do_not_change_identity_or_specs() {
-        let with_additive = parse_reference_document(&document(), &quotes()).unwrap();
-        let stripped: Value = serde_json::from_str(
-            r#"{
-                "spot": {"symbols": [
-                    {"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT",
-                     "isSpotTradingAllowed":true,"filters":[
-                        {"filterType":"PRICE_FILTER","tickSize":"0.01000000"},
-                        {"filterType":"LOT_SIZE","stepSize":"0.00001000"}]}
-                ]},
-                "perp": {"symbols": [
-                    {"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT",
-                     "contractType":"PERPETUAL","filters":[
-                        {"filterType":"PRICE_FILTER","tickSize":"0.10"},
-                        {"filterType":"LOT_SIZE","stepSize":"0.001"}]}
-                ]}
-            }"#,
-        )
-        .unwrap();
-        let minimal = parse_reference_document(&stripped, &quotes()).unwrap();
-        assert_eq!(minimal.len(), 2);
-        for right in &minimal {
-            let left = with_additive
-                .iter()
-                .find(|market| market.native_symbol == right.native_symbol)
-                .expect("same identity with and without additive fields");
-            assert_eq!(left.tick_size_us, right.tick_size_us);
-            assert_eq!(left.numeric_spec, right.numeric_spec);
-        }
-    }
-
-    #[test]
-    fn malformed_reference_documents_fail_closed() {
-        let missing_filter: Value = serde_json::from_str(
-            r#"{"spot":{"symbols":[{"symbol":"BTCUSDT","status":"TRADING","baseAsset":"BTC","quoteAsset":"USDT","isSpotTradingAllowed":true,"filters":[]}]},"perp":{"symbols":[]}}"#,
-        )
-        .unwrap();
-        assert!(parse_reference_document(&missing_filter, &quotes()).is_err());
-        assert!(parse_reference_document(&document(), &[]).is_err());
     }
 }

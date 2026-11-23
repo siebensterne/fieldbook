@@ -1,5 +1,10 @@
 # Live market-data evidence runbook
 
+> Retired under RRP-002 (owner directive D11). The synthetic market-data
+> assets described below have been removed from the active tree. This text
+> is retained only as a historical record; no command or path in it is
+> executable. See `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 This runbook is for **read-only market-data validation**. The collector does not
 place orders. It connects directly to each venue, discovers a small set of open
 markets, subscribes to one websocket source, records an SBE capture and a

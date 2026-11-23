@@ -120,34 +120,6 @@ mod tests {
     use super::*;
     use crate::{capacity, config::Settings, exchange::capabilities_for};
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/binance/reference.json");
-
-    fn fixture_settings() -> BinanceSettings {
-        BinanceSettings {
-            reference_fixture: Some(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/binance/reference.json"),
-            ),
-            ..BinanceSettings::default()
-        }
-    }
-
-    #[test]
-    fn h0_identity_uniqueness_across_spot_and_perp() {
-        let value: serde_json::Value = serde_json::from_str(REFERENCE).expect("fixture JSON");
-        let markets = parse_reference_document(&value, &["USDT".to_owned()]).unwrap();
-        assert_eq!(markets.len(), 4);
-        let mut identities = std::collections::BTreeSet::new();
-        for market in &markets {
-            assert!(identities.insert(market.native_symbol.as_str()));
-            assert_eq!(market.symbol, market.native_symbol);
-        }
-        // A shared base asset is allowed but must not collapse two products.
-        assert!(identities.contains("binance:spot:BTC/USDT"));
-        assert!(identities.contains("binance:perp:BTCUSDT"));
-        assert!(!identities.contains("binance:spot:BTCUSDT"));
-    }
-
     #[test]
     fn h0_capability_is_clockless_and_lifecycle_plane_absent() {
         let exchange =
@@ -170,15 +142,5 @@ mod tests {
         // No phantom lifecycle socket is charged in capacity planning.
         let plan = capacity::plan(&settings, &[]).expect("capacity plan");
         assert_eq!(plan.lifecycle_connections, 0);
-    }
-
-    #[tokio::test]
-    async fn h0_reference_fixture_discovers_offline_universe() {
-        let exchange =
-            BinanceExchange::new(fixture_settings(), NetworkSettings::default()).unwrap();
-        let result = exchange.discover_markets_with_stats(0).await.unwrap();
-        assert_eq!(result.markets.len(), 4);
-        assert_eq!(result.stats.selected_markets, 4);
-        assert_eq!(result.stats.pages, 2);
     }
 }

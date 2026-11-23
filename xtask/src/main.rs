@@ -133,10 +133,6 @@ fn dispatch(root: &Path, args: &[String]) -> Result<Report, String> {
             run(&mut report, root, &[Cmd::new(&line)])?;
             Ok(report)
         }
-        Task::Fixtures => {
-            evidence::verify(&mut report, root)?;
-            Ok(report)
-        }
         Task::Assure => {
             evidence::assure(&mut report, root)?;
             Ok(report)

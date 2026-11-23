@@ -2,25 +2,6 @@ use std::path::Path;
 
 use crate::{command::Cmd, report::Report};
 
-const FIXTURES: &[&str] = &[
-    "fixtures/journal-v1-golden/golden",
-    "fixtures/journal-v2-golden/golden",
-];
-
-pub fn verify(report: &mut Report, root: &Path) -> Result<(), String> {
-    for fixture in FIXTURES {
-        let line = format!("cargo run --quiet --locked -- journal verify {fixture}");
-        let outcome = Cmd::new(&line).execute(root)?;
-        let failed = outcome.status == "failed";
-        println!("[{}] {}", outcome.status, line);
-        report.push(outcome);
-        if failed {
-            return Ok(());
-        }
-    }
-    Ok(())
-}
-
 pub fn checks(report: &mut Report, root: &Path) -> Result<(), String> {
     for script in [
         "python3 scripts/check_matrix_tests.py",

@@ -228,79 +228,6 @@ pub fn parse_reference_document(value: &Value) -> anyhow::Result<Vec<MarketInfo>
 mod tests {
     use super::*;
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/kraken/reference.json");
-
-    fn fixture() -> Value {
-        serde_json::from_str(REFERENCE).expect("fixture JSON")
-    }
-
-    #[test]
-    fn reference_document_decodes_all_active_pairs() {
-        let markets = parse_asset_pairs(&fixture()).unwrap();
-        assert_eq!(markets.len(), 5);
-        for market in &markets {
-            market.validate().unwrap();
-            market.numeric_spec.validate().unwrap();
-            assert_eq!(market.exchange, "kraken");
-            assert_eq!(market.symbol, market.native_symbol);
-            assert!(market.native_symbol.starts_with("kraken:spot:"));
-        }
-    }
-
-    #[test]
-    fn identity_is_namespaced_and_unique() {
-        let markets = parse_asset_pairs(&fixture()).unwrap();
-        let identities: std::collections::BTreeSet<_> = markets
-            .iter()
-            .map(|market| market.native_symbol.as_str())
-            .collect();
-        assert_eq!(identities.len(), markets.len());
-        assert!(identities.contains("kraken:spot:XBT/USD"));
-        assert!(identities.contains("kraken:spot:XBT/EUR"));
-        assert!(identities.contains("kraken:spot:XRP/USD"));
-    }
-
-    #[test]
-    fn duplicate_identity_is_rejected() {
-        let mut value = fixture();
-        let result = value.get_mut("result").unwrap().as_object_mut().unwrap();
-        let duplicate = result.get("XXBTZUSD").unwrap().clone();
-        result.insert("DUPLICATE".to_owned(), duplicate);
-        assert!(parse_asset_pairs(&value).is_err());
-    }
-
-    #[test]
-    fn price_and_quantity_scales_are_exact() {
-        let markets = parse_asset_pairs(&fixture()).unwrap();
-        let xbt = markets
-            .iter()
-            .find(|market| market.native_symbol == "kraken:spot:XBT/USD")
-            .unwrap();
-        assert_eq!(xbt.tick_size_us, Some(100_000));
-        assert_eq!(
-            xbt.numeric_spec.quantity_step,
-            Some(Quantity::new(10).unwrap())
-        );
-        assert_eq!(xbt.numeric_spec.lot_size, Some(Quantity::new(10).unwrap()));
-        let usdt = markets
-            .iter()
-            .find(|market| market.native_symbol == "kraken:spot:USDT/USD")
-            .unwrap();
-        assert_eq!(usdt.tick_size_us, Some(1));
-        assert_eq!(
-            usdt.numeric_spec.quantity_step,
-            Some(Quantity::new(1).unwrap())
-        );
-        assert_eq!(
-            usdt.numeric_spec.price_unit,
-            PriceUnit::Currency("USD".to_owned())
-        );
-        assert_eq!(
-            usdt.numeric_spec.quantity_unit,
-            QuantityUnit::Currency("USDT".to_owned())
-        );
-    }
-
     #[test]
     fn excessive_price_precision_is_rejected_not_rounded() {
         let value: Value = serde_json::from_str(
@@ -320,45 +247,9 @@ mod tests {
     }
 
     #[test]
-    fn inactive_status_is_excluded() {
-        let markets = parse_asset_pairs(&fixture()).unwrap();
-        assert!(
-            markets
-                .iter()
-                .all(|market| market.exchange_market_id.as_deref() != Some("XDOGEUSD"))
-        );
-        assert!(
-            markets
-                .iter()
-                .all(|market| market.native_symbol != "kraken:spot:DOGE/USD")
-        );
-    }
-
-    #[test]
-    fn legacy_codes_normalize_and_altname_becomes_title() {
-        let markets = parse_asset_pairs(&fixture()).unwrap();
-        let xrp = markets
-            .iter()
-            .find(|market| market.exchange_market_id.as_deref() == Some("XXRPZUSD"))
-            .unwrap();
-        assert_eq!(xrp.native_symbol, "kraken:spot:XRP/USD");
-        assert_eq!(xrp.title.as_deref(), Some("XRPUSD"));
-        assert_eq!(
-            xrp.numeric_spec.quantity_unit,
-            QuantityUnit::Currency("XRP".to_owned())
-        );
-    }
-
-    #[test]
     fn non_empty_envelope_error_is_rejected() {
         let value: Value =
             serde_json::from_str(r#"{"error":["EGeneral:invalid"],"result":{}}"#).unwrap();
         assert!(parse_asset_pairs(&value).is_err());
-    }
-
-    #[test]
-    fn unknown_additive_fields_are_ignored() {
-        // The fixture carries leverage, fee, margin and future unknown fields.
-        assert_eq!(parse_asset_pairs(&fixture()).unwrap().len(), 5);
     }
 }

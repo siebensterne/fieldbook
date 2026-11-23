@@ -77,53 +77,6 @@ mod tests {
     use super::*;
     use crate::config::BinanceSettings;
 
-    fn fixture_settings() -> BinanceSettings {
-        BinanceSettings {
-            reference_fixture: Some(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/binance/reference.json"),
-            ),
-            ..BinanceSettings::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn offline_discovery_reconciles_stats() {
-        let result = discover_with_stats(&fixture_settings(), 0).await.unwrap();
-        assert_eq!(result.markets.len(), 4);
-        assert_eq!(result.stats.selected_markets, 4);
-        assert_eq!(result.stats.outcome_symbols, 4);
-        assert_eq!(result.stats.pages, 2);
-        assert_eq!(result.stats.malformed_records, 0);
-        assert_eq!(result.stats.retries, 0);
-    }
-
-    #[tokio::test]
-    async fn max_markets_caps_the_offline_universe() {
-        let result = discover_with_stats(&fixture_settings(), 2).await.unwrap();
-        assert_eq!(result.markets.len(), 2);
-        assert_eq!(result.stats.selected_markets, 2);
-        assert_eq!(result.stats.outcome_symbols, 2);
-        assert_eq!(result.stats.pages, 2);
-    }
-
-    #[tokio::test]
-    async fn disabled_product_sections_are_excluded() {
-        let settings = BinanceSettings {
-            spot_enabled: false,
-            ..fixture_settings()
-        };
-        let result = discover_with_stats(&settings, 0).await.unwrap();
-        assert_eq!(result.markets.len(), 2);
-        assert!(
-            result
-                .markets
-                .iter()
-                .all(|market| market.native_symbol.starts_with("binance:perp:"))
-        );
-        assert_eq!(result.stats.pages, 1);
-    }
-
     #[tokio::test]
     async fn network_discovery_is_unavailable_in_h0() {
         let error = discover_with_stats(&BinanceSettings::default(), 0)

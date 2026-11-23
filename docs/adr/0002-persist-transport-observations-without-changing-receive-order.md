@@ -1,5 +1,10 @@
 # ADR 0002: Persist transport observations without changing application receive ordering
 
+> Historical record. Test paths named below were retired under RRP-002
+> (owner directive D11) and are not available in the active tree. This
+> document is preserved unchanged except for this notice; see
+> `docs/synthetic-asset-retirement-2026-11-23.md` for the current state.
+
 - **Status:** Accepted
 - **Date:** 2026-11-16
 **Decision owner:** Project maintainers

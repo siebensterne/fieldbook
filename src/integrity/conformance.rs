@@ -14,22 +14,13 @@ use serde::Serialize;
 use crate::{
     acquisition::arbiter::{ArbiterLimits, SequencedPacket},
     acquisition::codec::{CodecRegistry, DecodeStatus},
-    acquisition::fixture_connectors::{
-        FixtureBatchConnector, FixtureDocumentConnector, FixtureOnChainConnector,
-        FixtureSnapshotConnector, FixtureStreamFrame, FixtureStreamingConnector,
-    },
     acquisition::stream_slice::{CollectingSink, SliceConfig, run_stream_slice},
-    governance::modality::{
-        AcquiredRecord, AcquisitionModality, BatchConnector, BatchPage, DocumentConnector,
-        DocumentRecord, OnChainConnector, SnapshotConnector, StreamingConnector,
-    },
     governance::{
         adapter::SourceCapabilityManifest,
         coverage_certification::ExpectedUniverse,
         modality::validate_modalities,
         rights::{AuthorizationScope, LicensingRegistry, Operation, ScopeSet, UsageRight},
     },
-    taxonomy::CountryCode,
 };
 
 /// Evidence state of one independent conformance stage.
@@ -122,14 +113,6 @@ pub enum UnknownEventPolicy {
     AllowDocumented,
 }
 
-/// Description of a modality fixture the harness must invoke.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConnectorFixture {
-    pub modality: AcquisitionModality,
-    pub object_id: String,
-    pub expected_records: usize,
-}
-
 /// What a source claims before any conformance evidence is examined.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConformanceDeclaration {
@@ -166,9 +149,6 @@ pub struct ConformanceDeclaration {
     /// How undeclared observation kinds are treated.
     #[serde(default)]
     pub unknown_event_policy: UnknownEventPolicy,
-    /// Modality connector fixture the harness must invoke.
-    #[serde(default)]
-    pub connector_fixture: Option<ConnectorFixture>,
 }
 
 impl ConformanceDeclaration {
@@ -283,87 +263,6 @@ impl ConformanceReport {
     pub fn to_json(&self) -> anyhow::Result<serde_json::Value> {
         serde_json::to_value(self).map_err(|error| anyhow::anyhow!(error.to_string()))
     }
-}
-
-/// Invoke the real modality fixture and count the records it produces.
-fn invoke_connector_fixture(
-    fixture: &ConnectorFixture,
-    country: CountryCode,
-) -> anyhow::Result<usize> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(async {
-        let object_id = fixture.object_id.clone();
-        match fixture.modality {
-            AcquisitionModality::Streaming => {
-                let frames = vec![FixtureStreamFrame {
-                    object_id: object_id.clone(),
-                    payload: b"fixture".to_vec(),
-                    sequence: 1,
-                    source_timestamp_us: 1_000,
-                }];
-                let mut connector = FixtureStreamingConnector::new(country, "conformance", frames);
-                connector.connect().await?;
-                connector.subscribe(&[object_id]).await?;
-                let mut count = 0;
-                while connector.next_record().await?.is_some() {
-                    count += 1;
-                }
-                Ok(count)
-            }
-            AcquisitionModality::Snapshot => {
-                let record = AcquiredRecord {
-                    object_id,
-                    raw: b"fixture".to_vec(),
-                    source_timestamp_us: Some(1_000),
-                    sequence: Some(1),
-                };
-                let mut connector =
-                    FixtureSnapshotConnector::new(country, "conformance", vec![vec![record]]);
-                Ok(connector.fetch_page(None).await?.len())
-            }
-            AcquisitionModality::Batch => {
-                let record = AcquiredRecord {
-                    object_id: object_id.clone(),
-                    raw: b"fixture".to_vec(),
-                    source_timestamp_us: Some(1_000),
-                    sequence: Some(1),
-                };
-                let page = BatchPage {
-                    records: vec![record],
-                    next_cursor: None,
-                };
-                let mut connector = FixtureBatchConnector::new(country, "conformance", vec![page]);
-                Ok(connector.fetch_page(None).await?.records.len())
-            }
-            AcquisitionModality::Document => {
-                let bytes = b"fixture".to_vec();
-                let document = DocumentRecord {
-                    object_id: object_id.clone(),
-                    sha256: crate::util::sha256_hex(&bytes),
-                    published_us: Some(1_000),
-                    bytes,
-                };
-                let mut connector =
-                    FixtureDocumentConnector::new(country, "conformance", vec![document]);
-                Ok(usize::from(
-                    connector.fetch_document(&object_id).await?.is_some(),
-                ))
-            }
-            AcquisitionModality::OnChain => {
-                let block = AcquiredRecord {
-                    object_id,
-                    raw: b"fixture".to_vec(),
-                    source_timestamp_us: Some(1_000),
-                    sequence: Some(1),
-                };
-                let mut connector =
-                    FixtureOnChainConnector::new(country, "conformance", vec![block], Vec::new());
-                Ok(usize::from(connector.next_block().await?.is_some()))
-            }
-        }
-    })
 }
 
 fn add_check(report: &mut ConformanceReport, name: &str, passed: bool, detail: String) {
@@ -699,22 +598,6 @@ pub fn run_conformance(
         },
     );
 
-    if let Some(connector) = &declaration.connector_fixture {
-        let observed = invoke_connector_fixture(connector, declaration.manifest.country.clone());
-        let passed = observed
-            .as_ref()
-            .is_ok_and(|count| *count == connector.expected_records);
-        add_check(
-            &mut report,
-            "connector_fixture",
-            passed,
-            match observed {
-                Ok(count) => format!("connector produced {count} records"),
-                Err(error) => format!("connector fixture failed: {error}"),
-            },
-        );
-    }
-
     if let Some(integration) = &declaration.integration {
         let sink = CollectingSink::default();
         let outcome = run_stream_slice(
@@ -923,10 +806,9 @@ mod tests {
             external: ExternalEvidence::default(),
             provider_id: "provider".to_owned(),
             product_id: "quotes".to_owned(),
-            code_reference: Some("src/acquisition/fixture_connectors.rs".to_owned()),
+            code_reference: Some("src/integrity/conformance.rs".to_owned()),
             rights_exemption: None,
             unknown_event_policy: UnknownEventPolicy::Reject,
-            connector_fixture: None,
         }
     }
 
@@ -1154,34 +1036,6 @@ mod tests {
                 .iter()
                 .any(|check| check.name == "undeclared_kinds_absent" && !check.passed),
             "an unexpected kind must be reported"
-        );
-    }
-
-    #[test]
-    fn connector_fixture_is_invoked_by_the_harness() {
-        let mut source = declaration();
-        source.connector_fixture = Some(ConnectorFixture {
-            modality: AcquisitionModality::Streaming,
-            object_id: "fixture-object".to_owned(),
-            expected_records: 1,
-        });
-        let mut codecs = CodecRegistry::new();
-        codecs
-            .register(
-                "source",
-                Box::new(JsonCodec {
-                    version: 1,
-                    status: DecodeStatus::Decoded,
-                }),
-            )
-            .expect("codec registered");
-        let report = run_conformance(&source, &fixture(), &codecs, &LicensingRegistry::new(), 100);
-        assert!(
-            report
-                .checks
-                .iter()
-                .any(|check| check.name == "connector_fixture" && check.passed),
-            "the actual connector implementation must run"
         );
     }
 

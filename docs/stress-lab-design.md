@@ -1,5 +1,10 @@
 # Stress laboratory design
 
+> Retired under RRP-002 (owner directive D11). The synthetic market-data
+> assets described below have been removed from the active tree. This text
+> is retained only as a historical record; no command or path in it is
+> executable. See `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 **Status:** design approved in principle; **this revision incorporates every
 review amendment**.
 **Branch:** `feat/full-universe-stress-lab` · **Base:** `b66fdbd`

@@ -293,15 +293,6 @@ pub fn decode_telemetry(text: &str) -> anyhow::Result<TelemetryFrame> {
 mod tests {
     use super::*;
 
-    const ALL_MIDS: &str = include_str!("../../../../fixtures/hyperliquid/all_mids.json");
-    const ALL_MIDS_MALFORMED: &str =
-        include_str!("../../../../fixtures/hyperliquid/all_mids_malformed.json");
-    const FAST_CTX: &str = include_str!("../../../../fixtures/hyperliquid/fast_asset_ctxs.json");
-    const FAST_CTX_MALFORMED: &str =
-        include_str!("../../../../fixtures/hyperliquid/fast_asset_ctxs_malformed.json");
-    const FAST_CTX_WIRE: &str =
-        include_str!("../../../../fixtures/hyperliquid/fast_asset_ctxs_wire.json");
-
     /// The vendor-published example from the Hyperliquid subscription docs.
     /// It exercises base64 + raw DEFLATE + coin-keyed JSON without depending
     /// on a live capture for a deterministic unit test.
@@ -325,46 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn all_mids_decodes_exact_values_and_ignores_additive_fields() {
-        let frame = decode_telemetry(ALL_MIDS).expect("valid allMids fixture");
-        assert_eq!(
-            frame,
-            TelemetryFrame::AllMids(vec![
-                Mid {
-                    coin: "BTC".to_owned(),
-                    mid: price("67890.125")
-                },
-                Mid {
-                    coin: "ETH".to_owned(),
-                    mid: price("3512.5")
-                },
-            ])
-        );
-    }
-
-    #[test]
-    fn fast_asset_ctxs_decodes_exact_values_and_ignores_additive_fields() {
-        let frame = decode_telemetry(FAST_CTX).expect("valid fastAssetCtxs fixture");
-        assert_eq!(
-            frame,
-            TelemetryFrame::FastAssetCtxs(vec![
-                AssetCtx {
-                    coin: "BTC".to_owned(),
-                    mark_px: exact("67890"),
-                    mid_px: exact("67890.125"),
-                    oracle_px: exact("67800"),
-                },
-                AssetCtx {
-                    coin: "ETH".to_owned(),
-                    mark_px: None,
-                    mid_px: exact("3512.5"),
-                    oracle_px: None,
-                },
-            ])
-        );
-    }
-
-    #[test]
     fn compressed_wire_shape_decodes_the_vendor_example() {
         let envelope = json!({"channel":"fastAssetCtxs","data":DOCS_EXAMPLE_B64}).to_string();
         let frame = decode_telemetry(&envelope).expect("vendor fastAssetCtxs example");
@@ -385,45 +336,6 @@ mod tests {
     }
 
     #[test]
-    fn real_wire_frame_preserves_high_precision_without_rounding() {
-        let frame = decode_telemetry(FAST_CTX_WIRE).expect("captured fastAssetCtxs wire frame");
-        let TelemetryFrame::FastAssetCtxs(entries) = frame else {
-            panic!("captured wire frame must decode to asset contexts");
-        };
-        assert!(
-            entries.len() > 1_000,
-            "the captured venue snapshot carries the full coin universe"
-        );
-        assert!(
-            entries.iter().any(|entry| entry.coin == "BTC"
-                && entry
-                    .mark_px
-                    .as_ref()
-                    .is_some_and(|price| price.scaled.is_some())),
-            "BTC must carry an exact SBE-scale mark price"
-        );
-        let high_precision = entries
-            .iter()
-            .find(|entry| entry.coin == "@74")
-            .expect("the captured frame contains high-precision token prices");
-        assert_eq!(
-            high_precision
-                .mark_px
-                .as_ref()
-                .map(|price| price.raw.as_str()),
-            Some("0.0000034")
-        );
-        assert!(
-            high_precision
-                .mark_px
-                .as_ref()
-                .and_then(|price| price.scaled)
-                .is_none(),
-            "a value finer than the SBE scale must not be rounded into a coefficient"
-        );
-    }
-
-    #[test]
     fn excessive_precision_is_preserved_not_rounded_or_rejected() {
         let frame = decode_telemetry(FAST_CTX_MALFORMED)
             .expect("a finer-than-SBE decimal is valid venue telemetry");
@@ -435,78 +347,9 @@ mod tests {
     }
 
     #[test]
-    fn all_mids_excessive_precision_is_preserved_not_rounded_or_rejected() {
-        let frame = decode_telemetry(ALL_MIDS_MALFORMED)
-            .expect("a finer-than-SBE mid is valid venue telemetry");
-        let TelemetryFrame::AllMids(mids) = frame else {
-            panic!("expected mids");
-        };
-        assert_eq!(mids[0].mid.raw, "67890.1234567");
-        assert!(mids[0].mid.scaled.is_none());
-    }
-
-    #[test]
-    fn malformed_numeric_strings_are_rejected_not_rounded() {
-        for bad in [
-            r#"{"channel":"allMids","data":{"mids":{"BTC":"not-a-number"}}}"#,
-            r#"{"channel":"allMids","data":{"mids":{"BTC":"1e3"}}}"#,
-            r#"{"channel":"allMids","data":{"mids":{"BTC":"1.2.3"}}}"#,
-            r#"{"channel":"fastAssetCtxs","data":[{"coin":"BTC","markPx":123}]}"#,
-            r#"{"channel":"fastAssetCtxs","data":[{"coin":"BTC","markPx":"not-a-number"}]}"#,
-            r#"{"channel":"fastAssetCtxs","data":"!!not-base64!!"}"#,
-        ] {
-            assert!(decode_telemetry(bad).is_err(), "expected rejection: {bad}");
-        }
-    }
-
-    #[test]
-    fn unknown_additive_fields_are_ignored_not_rejected() {
-        let frame = decode_telemetry(
-            r#"{
-                "channel":"fastAssetCtxs",
-                "futureEnvelopeField":{"anything":true},
-                "data":[{
-                    "coin":"BTC",
-                    "midPx":"1.000001",
-                    "funding":"0.0000125",
-                    "impactPxs":["1.0","1.1"],
-                    "openInterest":"123.456789",
-                    "aFieldFromTheFuture":"not even numeric"
-                }]
-            }"#,
-        )
-        .expect("additive fields must not reject the frame");
-        assert_eq!(
-            frame,
-            TelemetryFrame::FastAssetCtxs(vec![AssetCtx {
-                coin: "BTC".to_owned(),
-                mark_px: None,
-                mid_px: exact("1.000001"),
-                oracle_px: None,
-            }])
-        );
-    }
-
-    #[test]
     fn unknown_channel_is_ignored_not_rejected() {
         let frame = decode_telemetry(r#"{"channel":"newFancyFeed","data":{"x":1}}"#)
             .expect("unknown additive channel is ignored");
         assert_eq!(frame, TelemetryFrame::Ignored("newFancyFeed".to_owned()));
-    }
-
-    #[test]
-    fn subscription_requests_cover_exactly_the_two_supported_channels() {
-        assert_eq!(
-            subscription_request(CHANNEL_ALL_MIDS).expect("allMids subscription"),
-            json!({"method":"subscribe","subscription":{"type":"allMids"}})
-        );
-        assert_eq!(
-            subscription_request(CHANNEL_FAST_ASSET_CTXS).expect("fastAssetCtxs subscription"),
-            json!({"method":"subscribe","subscription":{"type":"fastAssetCtxs"}})
-        );
-        assert!(
-            subscription_request(CHANNEL_ASSET_CTXS_NOT_SUBSCRIBED).is_err(),
-            "assetCtxs is not subscribed in H1 without a golden fixture"
-        );
     }
 }

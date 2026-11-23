@@ -58,9 +58,6 @@ LONG_STRING_FILES = frozenset(
 # Generated evidence is immutable and hash-pinned: it is validated for syntax
 # and whitespace but not reformatted or reflowed, which would change evidence.
 EVIDENCE_DIRS = frozenset({"measurements", "captures"})
-# Byte-exact raw wire observation retained from a live mainnet run. Its
-# hash is recorded in captures/INDEX.md; reformatting would destroy evidence.
-RAW_FIXTURES = frozenset({"fixtures/hyperliquid/fast_asset_ctxs_wire.json"})
 SHELLS = ("scripts/*.sh", "scripts/assurance/*.sh")
 URL_RE = re.compile(r"https?://\S+")
 LONG_TOKEN_RE = re.compile(r"\S{" + str(MAX_LINE - 10) + r",}")
@@ -126,7 +123,7 @@ def is_evidence(path: Path) -> bool:
         relative = path.relative_to(ROOT)
     except ValueError:
         return False
-    return bool(EVIDENCE_DIRS.intersection(relative.parts)) or (relative.as_posix() in RAW_FIXTURES)
+    return bool(EVIDENCE_DIRS.intersection(relative.parts))
 
 
 def basic_lines(path: Path, kind: str, errors: list[str]) -> list[str]:

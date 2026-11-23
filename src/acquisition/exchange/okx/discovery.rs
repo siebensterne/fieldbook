@@ -67,39 +67,4 @@ pub async fn discover_with_stats(
 #[cfg(all(test, feature = "market-shaped-tests"))]
 mod tests {
     use super::*;
-
-    fn fixture_settings() -> OkxSettings {
-        OkxSettings {
-            reference_fixture: Some(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/okx/reference.json"),
-            ),
-            ..OkxSettings::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn offline_discovery_reconciles_stats() {
-        let result = discover_with_stats(&fixture_settings(), 0).await.unwrap();
-        assert_eq!(result.markets.len(), 5);
-        assert_eq!(result.stats.selected_markets, 5);
-        assert_eq!(result.stats.outcome_symbols, 5);
-        assert_eq!(result.stats.pages, 1);
-        assert_eq!(result.stats.malformed_records, 0);
-        assert_eq!(result.stats.retries, 0);
-        assert_eq!(
-            result.markets.first().map(|market| market.symbol.as_str()),
-            Some("okx:spot:BTC/USDT")
-        );
-    }
-
-    #[tokio::test]
-    async fn discovery_fails_closed_without_a_fixture_and_honours_the_cap() {
-        let mut settings = OkxSettings::default();
-        assert!(discover_with_stats(&settings, 0).await.is_err());
-        settings = fixture_settings();
-        let result = discover_with_stats(&settings, 2).await.unwrap();
-        assert_eq!(result.markets.len(), 2);
-        assert_eq!(result.stats.outcome_symbols, 2);
-    }
 }

@@ -290,10 +290,9 @@ with typed direction, classification, signal, mechanism, correlation payloads,
 and outbound send results. For v1 journals it surfaces the legacy data records
 with `signal` and `mechanism` left `null` rather than fabricated.
 
-Checked-in golden fixtures pin both reader contracts:
-`fixtures/journal-v1-golden/golden` (a finalized v1 run) and
-`fixtures/journal-v2-golden/golden` (a finalized v2 run mixing data records,
-an inbound Ping, its outbound Pong, and an application-text PONG).
+The checked-in v1 and v2 golden journal runs were retired under RRP-002. The
+reader contracts remain in the production journal and its retained byte-framing
+and durability tests, but no checked-in golden run is available for replay.
 
 The checksums are integrity, not authenticity: SHA-256 detects accidental
 corruption and truncation, but an actor who can rewrite a segment can recompute

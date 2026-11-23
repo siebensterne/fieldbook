@@ -1,5 +1,10 @@
 # Latency experiment
 
+> Retired under RRP-002 (owner directive D11). The synthetic market-data
+> assets described below have been removed from the active tree. This text
+> is retained only as a historical record; no command or path in it is
+> executable. See `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 ## What is measured
 
 > **Evidence level.** The four 2026-10-24 runs below are single 60-second
