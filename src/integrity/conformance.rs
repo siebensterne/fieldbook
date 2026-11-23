@@ -330,7 +330,7 @@ fn declared_rights_query(
 ) -> Result<AuthorizationScope, crate::rights::RightsError> {
     use crate::rights::{
         Actor, DataObject, DeliveryMethod, Licensee, ObjectKind, Purpose, RecipientClass,
-        RecipientIdentity, Retention, TimeWindow, UsageMode,
+        RecipientIdentity, Retention, TimeWindow, UniverseRef, UsageMode,
     };
     let operation = match right {
         UsageRight::RealTimeAccess => Operation::RealTimeCapture,
@@ -345,10 +345,30 @@ fn declared_rights_query(
         UsageRight::DerivedData => Purpose::DerivedProduct,
         UsageRight::Redistribution => Purpose::Redistribution,
     };
+    let kind = match right {
+        UsageRight::RealTimeAccess => ObjectKind::RawSourceRecord,
+        UsageRight::HistoricalStorage => ObjectKind::CanonicalObservation,
+        UsageRight::InternalProcessing => ObjectKind::ResearchDataset,
+        UsageRight::DerivedData => ObjectKind::DerivedArtifact,
+        UsageRight::Redistribution => ObjectKind::NdcRelease,
+    };
+    let retention = match right {
+        UsageRight::HistoricalStorage | UsageRight::Redistribution => Retention::bounded(86_400),
+        _ => Retention::NONE,
+    };
+    let universe = UniverseRef::new(
+        "conformance-universe-1",
+        "v1",
+        &"a".repeat(64),
+        "conformance-membership",
+        TimeWindow::default(),
+        TimeWindow::default(),
+        1,
+    )?;
     AuthorizationScope::request()
         .actor(Actor::FieldbookProducer)
         .data_object(DataObject::new(
-            ObjectKind::CanonicalObservation,
+            kind,
             &declaration.dataset,
             "conformance-v1",
         )?)
@@ -370,10 +390,10 @@ fn declared_rights_query(
         ))?)
         .purpose(purpose)
         .delivery_method(DeliveryMethod::File)
-        .retention(Retention::NONE)
-        .instruments(ScopeSet::Universe("conformance-universe-1".to_owned()))
-        .fields(ScopeSet::Universe("conformance-universe-1".to_owned()))
-        .modalities(ScopeSet::Universe("conformance-universe-1".to_owned()))
+        .retention(retention)
+        .instruments(ScopeSet::Universe(universe.clone()))
+        .fields(ScopeSet::Universe(universe.clone()))
+        .modalities(ScopeSet::Universe(universe))
         .data_time_window(TimeWindow {
             from_us: Some(0),
             to_us: Some(4_102_444_800_000_000),

@@ -498,7 +498,8 @@ impl CoverageRecord {
     ) -> Result<crate::rights::AuthorizationQuery, crate::rights::RightsError> {
         use crate::rights::{
             Actor, DataObject, DeliveryMethod, Licensee, ObjectKind, Operation, Purpose,
-            RecipientClass, RecipientIdentity, Retention, ScopeSet, TimeWindow, UsageMode,
+            RecipientClass, RecipientIdentity, Retention, ScopeSet, TimeWindow, UniverseRef,
+            UsageMode,
         };
         let operation = match right {
             UsageRight::RealTimeAccess => Operation::RealTimeCapture,
@@ -515,13 +516,31 @@ impl CoverageRecord {
             UsageRight::DerivedData => Purpose::DerivedProduct,
             UsageRight::Redistribution => Purpose::Redistribution,
         };
+        let kind = match right {
+            UsageRight::RealTimeAccess => ObjectKind::RawSourceRecord,
+            UsageRight::HistoricalStorage => ObjectKind::CanonicalObservation,
+            UsageRight::InternalProcessing => ObjectKind::ResearchDataset,
+            UsageRight::DerivedData => ObjectKind::DerivedArtifact,
+            UsageRight::Redistribution => ObjectKind::NdcRelease,
+        };
+        let retention = match right {
+            UsageRight::HistoricalStorage | UsageRight::Redistribution => {
+                Retention::bounded(86_400)
+            }
+            _ => Retention::NONE,
+        };
+        let universe = UniverseRef::new(
+            "certification-universe-1",
+            "v1",
+            &"a".repeat(64),
+            "certification-membership",
+            TimeWindow::default(),
+            TimeWindow::default(),
+            1,
+        )?;
         AuthorizationScope::request()
             .actor(Actor::FieldbookProducer)
-            .data_object(DataObject::new(
-                ObjectKind::CanonicalObservation,
-                &self.dataset,
-                "coverage-v1",
-            )?)
+            .data_object(DataObject::new(kind, &self.dataset, "coverage-v1")?)
             .licensee(Licensee::system())
             .venue(self.provider_id.clone())
             .provider_id(self.provider_id.clone())
@@ -545,10 +564,10 @@ impl CoverageRecord {
             ))?)
             .purpose(purpose)
             .delivery_method(DeliveryMethod::File)
-            .retention(Retention::NONE)
-            .instruments(ScopeSet::Universe("certification-universe-1".to_owned()))
-            .fields(ScopeSet::Universe("certification-universe-1".to_owned()))
-            .modalities(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .retention(retention)
+            .instruments(ScopeSet::Universe(universe.clone()))
+            .fields(ScopeSet::Universe(universe.clone()))
+            .modalities(ScopeSet::Universe(universe))
             .data_time_window(TimeWindow {
                 from_us: Some(0),
                 to_us: Some(4_102_444_800_000_000),
@@ -892,16 +911,27 @@ mod tests {
         rights::{
             Actor, AuthorizationIdentity, AuthorizationRecord, DataObject, DecisionAudit,
             DeliveryMethod, Licensee, ObjectKind, Operation, Purpose, RecipientClass,
-            RecipientIdentity, Retention, RightDecision, ScopeSet, TimeWindow, UsageMode,
+            RecipientIdentity, Retention, RightDecision, ScopeSet, TimeWindow, UniverseRef,
+            UsageMode,
         },
     };
     use std::collections::BTreeMap;
 
     fn rights_scope() -> AuthorizationScope {
+        let universe = UniverseRef::new(
+            "certification-universe-1",
+            "v1",
+            &"a".repeat(64),
+            "certification-membership",
+            TimeWindow::default(),
+            TimeWindow::default(),
+            1,
+        )
+        .expect("abstract certification universe");
         AuthorizationScope::request()
             .actor(Actor::FieldbookProducer)
             .data_object(
-                DataObject::new(ObjectKind::CanonicalObservation, "quotes", "coverage-v1")
+                DataObject::new(ObjectKind::ResearchDataset, "quotes", "coverage-v1")
                     .expect("object identity"),
             )
             .licensee(Licensee::system())
@@ -922,9 +952,9 @@ mod tests {
             .purpose(Purpose::InternalAnalysis)
             .delivery_method(DeliveryMethod::File)
             .retention(Retention::NONE)
-            .instruments(ScopeSet::Universe("certification-universe-1".to_owned()))
-            .fields(ScopeSet::Universe("certification-universe-1".to_owned()))
-            .modalities(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .instruments(ScopeSet::Universe(universe.clone()))
+            .fields(ScopeSet::Universe(universe.clone()))
+            .modalities(ScopeSet::Universe(universe))
             .data_time_window(TimeWindow {
                 from_us: Some(0),
                 to_us: Some(4_102_444_800_000_000),

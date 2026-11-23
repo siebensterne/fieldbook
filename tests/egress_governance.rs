@@ -28,14 +28,20 @@ use fieldbook::{
     egress_intent::EgressIntent,
     rights::{
         Actor, DataObject, DeliveryMethod, Licensee, ObjectKind, Operation, Purpose,
-        RecipientClass, RecipientIdentity, Retention, ScopeSet, TimeWindow, UsageMode, UsageRight,
-        authorize_operations, has_active_authorization, require_provider_egress,
+        RecipientClass, RecipientIdentity, Retention, ScopeSet, TimeWindow, UniverseRef, UsageMode,
+        UsageRight, authorize_operations, has_active_authorization, require_provider_egress,
     },
     taxonomy::CountryCode,
     ws::{self, ConnectOptions},
 };
 
 fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
+    let universe = concat!(
+        "{ universe = { universe_id = \"governance-universe-1\", version = \"v1\", ",
+        "digest = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", ",
+        "membership_source = \"governance-membership\", valid_time = {}, ",
+        "knowledge_time = {}, revision = 1 } }"
+    );
     format!(
         "schema_version = 1\n\
          licensee = \"licensee-a\"\n\
@@ -64,9 +70,9 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          recipient_identity = \"recipient-a\"\n\
          purpose = \"internal_analysis\"\n\
          delivery_method = \"stream\"\n\
-         instruments = {{ universe = \"governance-universe-1\" }}\n\
-         fields = {{ universe = \"governance-universe-1\" }}\n\
-         modalities = {{ universe = \"governance-universe-1\" }}\n\
+         instruments = {universe}\n\
+         fields = {universe}\n\
+         modalities = {universe}\n\
          valid_from = 0\n\
          valid_until = {valid_until}\n\
          \n\
@@ -85,9 +91,34 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
     )
 }
 
+fn declared_universe() -> UniverseRef {
+    UniverseRef::new(
+        "governance-universe-1",
+        "v1",
+        &"a".repeat(64),
+        "governance-membership",
+        TimeWindow::default(),
+        TimeWindow::default(),
+        1,
+    )
+    .expect("abstract universe")
+}
+
 /// Explicit caller-supplied request matching the abstract rights fixture.
 fn egress_intent(venue: &str, operation: Operation) -> EgressIntent {
-    let universe = ScopeSet::Universe("governance-universe-1".to_owned());
+    let universe = ScopeSet::Universe(declared_universe());
+    let kind = match operation {
+        Operation::ReferenceDataRetrieval => ObjectKind::SourceReferenceRecord,
+        _ => ObjectKind::RawSourceRecord,
+    };
+    let data_time_window = if operation == Operation::ReferenceDataRetrieval {
+        TimeWindow {
+            from_us: Some(1),
+            to_us: Some(9),
+        }
+    } else {
+        TimeWindow::default()
+    };
     EgressIntent::builder()
         .provider_id("securities")
         .source_id("provider-source")
@@ -97,10 +128,7 @@ fn egress_intent(venue: &str, operation: Operation) -> EgressIntent {
         .dataset_id("market-data")
         .actor(Actor::FieldbookProducer)
         .operation(operation)
-        .data_object(
-            DataObject::new(ObjectKind::RawSourceRecord, "object-a", "v1")
-                .expect("abstract object identity"),
-        )
+        .data_object(DataObject::new(kind, "object-a", "v1").expect("abstract object identity"))
         .purpose(Purpose::InternalAnalysis)
         .usage_mode(UsageMode::NonDisplay)
         .usage_right(UsageRight::RealTimeAccess)
@@ -110,8 +138,8 @@ fn egress_intent(venue: &str, operation: Operation) -> EgressIntent {
         .territory(CountryCode::new("US").expect("country"))
         .instruments(universe.clone())
         .fields(universe.clone())
-        .modalities(ScopeSet::Universe("governance-universe-1".to_owned()))
-        .data_time_window(TimeWindow::default())
+        .modalities(ScopeSet::Universe(declared_universe()))
+        .data_time_window(data_time_window)
         .retention_request(Retention::bounded(86_400))
         .delivery_method(DeliveryMethod::Stream)
         .endpoint("wss://venue-a.example:443")
