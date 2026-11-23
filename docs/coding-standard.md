@@ -76,6 +76,11 @@ not debate either.
 | D6 | A doc example compiles under `cargo test --doc`. |
 | D7 | Commented-out code is deleted. Git retains the history. |
 | D8 | A comment that restates the signature is noise and is removed. |
+| D9 | Public API items carry `///`. A crate or module root opens with `//!` stating its responsibility and invariants. |
+| D10 | Implementation reasoning uses `//` and records why a decision exists, not a narration of the next statement. |
+| D11 | Every `unsafe` block carries `// SAFETY:` naming the invariant, preconditions and aliasing argument. Tracked annotations use `// TODO(owner):` and `// FIXME(owner):` with a named owner. |
+| D12 | Contracts document currency and quantity units, timestamp semantics and time zones, event ordering, numeric precision and rounding, and the invariants the code relies on. Serialization compatibility, ownership and lifecycle, replay and recovery, authorization boundaries and failure semantics are documented where they apply. |
+| D13 | Fieldbook follows the siebensterne documentation standard in the workspace file `engineering/style/DOCUMENTATION-STANDARD.md`; Markdown is the source for human-maintained documentation. |
 
 ## 7. Naming and terminology
 
