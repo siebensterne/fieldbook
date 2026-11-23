@@ -29,7 +29,9 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::sync::{Semaphore, broadcast, mpsc};
+use tokio::sync::Semaphore;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 
 use fieldbook::{
     config::Settings,
@@ -664,11 +666,9 @@ fn cancel_and_revocation_keep_audit_before_state_with_reconciliation() {
     );
     let evidence = revoked.gate.reconciliation_evidence();
     assert_eq!(evidence.len(), 1, "the failed decision is retained");
-    assert_eq!(evidence[0].decision, "grant_revoked");
-    assert_eq!(
-        evidence[0].context.event_kind.as_deref(),
-        Some("revocation")
-    );
+    assert_eq!(evidence[0].decision, "grant_revoked", "revocation audited");
+    let event_kind = evidence[0].context.event_kind.as_deref();
+    assert_eq!(event_kind, Some("revocation"), "event kind audited");
 
     let temp_b = tempfile::tempdir().expect("temporary directory");
     let cancelled = authorize(temp_b.path(), Arc::clone(&clock));
@@ -691,7 +691,10 @@ fn cancel_and_revocation_keep_audit_before_state_with_reconciliation() {
     );
     let evidence = cancelled.gate.reconciliation_evidence();
     assert_eq!(evidence.len(), 1, "cancellation evidence is retained");
-    assert_eq!(evidence[0].decision, "session_cancelled");
+    assert_eq!(
+        evidence[0].decision, "session_cancelled",
+        "cancellation audited"
+    );
 }
 
 #[test]

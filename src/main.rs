@@ -1,6 +1,7 @@
 //! Collector binary entry point.
 
-use std::{io::Write, sync::Arc};
+use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::CommandFactory as _;

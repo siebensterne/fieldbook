@@ -8,7 +8,9 @@
 //! reauthorized at its own side-effect boundary. A plan is installed atomically:
 //! a later failing step leaves no earlier step authorized.
 
-use std::{collections::BTreeSet, path::Path, sync::Arc};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use serde::Deserialize;
