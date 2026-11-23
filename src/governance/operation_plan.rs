@@ -11,7 +11,8 @@
 use std::path::Path;
 
 use anyhow::Context as _;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::{
     config::Settings,
@@ -138,7 +139,7 @@ pub struct SourceScope {
 }
 
 /// The caller-supplied request carried by a step. A provider step needs an
-/// endpoint; a local step deliberately has none and is never sent to a
+/// endpoint; a local step has none and is never sent to a
 /// provider transport.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "request_kind", rename_all = "snake_case")]
@@ -604,10 +605,16 @@ mod tests {
             Operation::RealTimeCapture,
         ];
         for operation in egress {
-            assert_eq!(class_for(operation), OperationClass::ProviderEgress);
             assert_eq!(
-                required_boundary(operation),
-                SideEffectBoundary::ProviderContact
+                class_for(operation),
+                OperationClass::ProviderEgress,
+                "egress class"
+            );
+            let boundary = required_boundary(operation);
+            assert_eq!(
+                boundary,
+                SideEffectBoundary::ProviderContact,
+                "contact boundary"
             );
         }
         let local = [
@@ -632,16 +639,20 @@ mod tests {
             ),
         ];
         for (operation, boundary) in local {
-            assert_eq!(class_for(operation), OperationClass::LocalDataUse);
-            assert_eq!(required_boundary(operation), boundary);
+            assert_eq!(
+                class_for(operation),
+                OperationClass::LocalDataUse,
+                "local class"
+            );
+            assert_eq!(required_boundary(operation), boundary, "local boundary");
         }
     }
 
     #[test]
     fn plan_identity_and_completeness_fail_closed() {
         let error = OperationPlan::new("", vec![]).unwrap_err();
-        assert_eq!(error, PlanError::MissingPlanId);
+        assert_eq!(error, PlanError::MissingPlanId, "missing id denied");
         let error = OperationPlan::new("plan", vec![]).unwrap_err();
-        assert_eq!(error, PlanError::EmptyPlan);
+        assert_eq!(error, PlanError::EmptyPlan, "empty plan denied");
     }
 }

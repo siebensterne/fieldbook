@@ -551,11 +551,17 @@ fn audit_event_carries_plan_step_and_boundary() {
             },
         )
         .expect("audited grant");
-    assert_eq!(event.plan_id.as_deref(), Some("plan-abstract"));
-    assert_eq!(event.step_id.as_deref(), Some("capture-object-a"));
     assert_eq!(
-        event.side_effect_boundary.as_deref(),
-        Some("provider_contact")
+        event.plan_id.as_deref(),
+        Some("plan-abstract"),
+        "plan id audited"
     );
+    assert_eq!(
+        event.step_id.as_deref(),
+        Some("capture-object-a"),
+        "step id audited"
+    );
+    let boundary = event.side_effect_boundary.as_deref();
+    assert_eq!(boundary, Some("provider_contact"), "boundary audited");
     let _ = AuditSink::new(&dir, 1).expect("audit directory is writable");
 }
