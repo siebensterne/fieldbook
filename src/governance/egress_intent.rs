@@ -110,7 +110,7 @@ impl EndpointIdentity {
 /// The full, caller-supplied request evaluated by the authorization gate.
 ///
 /// Every field must be supplied by the caller. In particular `endpoint_identity`
-/// is the endpoint that will actually be contacted; the gate compares it with
+/// is the endpoint that will be contacted; the gate compares it with
 /// the approved endpoint set in the matching grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -181,7 +181,7 @@ impl EgressIntent {
     }
 
     /// Build the authorization scope used for the full request-versus-grant
-    /// comparison. The approved-endpoint set is intentionally empty here: it is
+    /// comparison. The approved-endpoint set is empty here: it is
     /// a grant-only field and is compared separately by the gate.
     #[must_use]
     pub fn to_scope(&self) -> AuthorizationScope {

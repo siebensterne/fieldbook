@@ -30,7 +30,7 @@ modalities = { named = ["l2"] }
 data_time_window = { from_us = 1_700_000_000_000_000, to_us = 1_700_086_400_000_000 }
 retention_request = { limit = { bounded = 86400 }, purge_required = true }
 
-# The authority the process will actually contact. A redirect to a different
+# The authority the process will contact. A redirect to a different
 # authority is a new request and is reauthorized before it is followed.
 [intent.endpoint_identity]
 scheme = "wss"
