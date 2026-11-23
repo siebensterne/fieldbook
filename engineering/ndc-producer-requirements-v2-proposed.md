@@ -42,10 +42,12 @@ time semantics and validation order are not redefined by this document; where
 C0 states a stricter canonicalization rule, section 7 of this document follows
 C0.
 
-## 2. Four-concept semantic core
+## 2. Six separable concepts
 
-The producer model uses four separable concepts. No concept is inferred from
-another.
+The producer model uses the six separable concepts defined in C0. No concept is
+inferred from another. The four-concept core (technical action, data object, legal
+permission grant and purpose) is a subset of these six; capability and evidence are
+equally independent and are not folded into it.
 
 | Concept | Question answered | Producer-side form |
 |---|---|---|
@@ -53,6 +55,8 @@ another.
 | Data object | What does the action act upon? | an explicit object class: source reference record, raw source record, canonical observation, release, raw archive, research copy or derived artifact |
 | Legal permission grant | What does the written agreement allow for that action and object? | one reviewed `PERMIT` grant per action, object and identity, with a written evidence reference |
 | Purpose | Why is the action performed? | the exact string `proprietary_own_account_trading_research` from the written permission |
+| Capability | What can the source technically provide? | a declared source capability, never a permission or a producer activity |
+| Evidence | What proves the action or decision? | audit event, reviewed attestation, signature or durable receipt |
 
 A capability is not a permission. A permission is not an action. An action on a
 raw source record is not the same action on a research copy. A signature is not
@@ -377,7 +381,7 @@ the denominator of its own dimension at its own as-of instant.
 | Area | Producer obligation | Checked evidence | Rejection on failure |
 |---|---|---|---|
 | Release identity | emit one immutable `release_id` and exact contract version | `release_identity` | `REJECT_RELEASE_IDENTITY` |
-| Four concepts | declare action, object, grant and purpose as separate facts | `rights`, `producer_activity` | `REJECT_CONCEPT_CONFLATION` |
+| Six concepts | declare capability, action, object, grant, purpose and evidence as separate facts | `rights`, `producer_activity` | `REJECT_CONCEPT_CONFLATION` |
 | Action vocabulary | store the 14-value enum value, with an explicit canonical label mapping | `performed_operations` | `REJECT_OPERATION_ENUM` |
 | Purpose | preserve `proprietary_own_account_trading_research` verbatim | `reviewed_attestations` | `REJECT_PURPOSE` |
 | Licensee | name the legal entity from the written permission | `permission_grants` | `REJECT_LICENSEE` |
