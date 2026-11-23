@@ -1,5 +1,10 @@
 # Stress laboratory reference manifests
 
+> Retired under RRP-002 (owner directive D11). The synthetic market-data
+> assets described below have been removed from the active tree. This text
+> is retained only as a historical record; no command or path in it is
+> executable. See `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 These are the stability anchors for `tests/full_universe_stress.rs`. Each
 manifest records a real run of the collector against the synthetic loopback
 Kalshi venue; they name the exact source commit and binary they were built

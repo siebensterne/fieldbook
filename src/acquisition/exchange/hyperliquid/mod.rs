@@ -151,60 +151,6 @@ mod tests {
     use super::*;
     use crate::config::Settings;
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/hyperliquid/reference.json");
-
-    #[test]
-    fn h0_reference_document_produces_valid_namespaced_markets() {
-        let value: serde_json::Value = serde_json::from_str(REFERENCE).expect("fixture JSON");
-        let markets = parse_reference_document(&value, &["".to_owned(), "xyz".to_owned()], true)
-            .expect("valid reference document");
-        assert_eq!(markets.len(), 4);
-        for market in &markets {
-            market.validate().expect("valid market");
-            market.numeric_spec.validate().expect("valid numeric spec");
-            assert_eq!(market.exchange, "hyperliquid");
-            assert_eq!(market.symbol, market.native_symbol);
-            assert!(market.exchange_market_id.is_none());
-            assert!(market.outcome.is_none());
-        }
-        assert!(
-            markets
-                .iter()
-                .any(|market| market.native_symbol == "hyperliquid:perp::BTC")
-        );
-        assert!(
-            markets
-                .iter()
-                .any(|market| market.native_symbol == "hyperliquid:perp:xyz:BTC")
-        );
-        assert!(
-            markets
-                .iter()
-                .any(|market| market.native_symbol == "hyperliquid:spot:PURR/USDC")
-        );
-    }
-
-    #[tokio::test]
-    async fn h0_discovery_is_offline_and_reconciles_stats() {
-        let settings = HyperliquidSettings {
-            dexs: vec![String::new(), "xyz".to_owned()],
-            spot_enabled: true,
-            reference_fixture: Some(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/hyperliquid/reference.json"),
-            ),
-            ..HyperliquidSettings::default()
-        };
-        let exchange = HyperliquidExchange::new(settings, NetworkSettings::default()).unwrap();
-        let result = exchange.discover_markets_with_stats(0).await.unwrap();
-        assert_eq!(result.markets.len(), 4);
-        assert_eq!(result.stats.selected_markets, 4);
-        assert_eq!(result.stats.outcome_symbols, 4);
-        assert_eq!(result.stats.pages, 2);
-        assert_eq!(result.stats.malformed_records, 0);
-        assert_eq!(result.stats.retries, 0);
-    }
-
     #[test]
     fn h0_uses_clockless_capabilities_and_no_lifecycle_plane() {
         let exchange =
@@ -216,24 +162,6 @@ mod tests {
         assert_eq!(kind(), ExchangeKind::Hyperliquid);
         let settings = Settings::for_exchange(ExchangeKind::Hyperliquid);
         assert_eq!(settings.exchange, ExchangeKind::Hyperliquid);
-    }
-
-    #[test]
-    fn h2_subscribed_universe_is_exactly_the_selected_perpetuals() {
-        let value: serde_json::Value = serde_json::from_str(REFERENCE).expect("fixture JSON");
-        let markets = parse_reference_document(&value, &["".to_owned(), "xyz".to_owned()], true)
-            .expect("valid reference document");
-        let mut settings = HyperliquidSettings::default();
-        settings.books.perpetuals = vec!["BTC".to_owned()];
-        let exchange = HyperliquidExchange::new(settings, NetworkSettings::default()).unwrap();
-        let selected = exchange.subscribed_universe(markets);
-        let names: Vec<&str> = selected
-            .iter()
-            .map(|market| market.native_symbol.as_str())
-            .collect();
-        assert_eq!(names, ["hyperliquid:perp::BTC", "hyperliquid:perp:xyz:BTC"]);
-        assert!(!names.iter().any(|name| name.contains("/spot:")));
-        assert!(!names.iter().any(|name| name.contains("PURR")));
     }
 
     #[test]

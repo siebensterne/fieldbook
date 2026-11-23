@@ -6,93 +6,24 @@ on:
 permissions:
   contents: read
 
-# Live venue tests must run on an operator-managed machine whose physical
-# egress location and account are permitted by the relevant venue. Do not use
-# a hosted runner, VPN, or proxy to work around geographic restrictions.
+# Retired under RRP-002 (owner directive D11): the venue live integration
+# tests and the venue-specific evidence script were synthetic market-data
+# assets and are no longer in the tree. No provider contact, credential or
+# synthetic fixture is authorised by this workflow. It is retained as a
+# fail-closed placeholder so no stale live-runner configuration remains
+# active.
 jobs:
-  live:
-    name: Polymarket and Kalshi read-only market data
-    # Configure this protected environment to allow only main and require
-    # reviewer approval before exposing live API credentials to the runner.
-    environment: live-market-data
-    runs-on: [self-hosted, market-data-eligible]
-    timeout-minutes: 30
-    env:
-      RUN_LIVE_TESTS: "1"
-      RUN_LIVE_KALSHI_TESTS: "1"
-      # Path to a contract-derived rights file provisioned on the runner.
-      # Environment variables never grant a right; this only names the config.
-      LIVE_RIGHTS_FILE: ${{ vars.LIVE_RIGHTS_FILE }}
-      KALSHI_API_KEY_ID: ${{ secrets.KALSHI_API_KEY_ID }}
-      KALSHI_PRIVATE_KEY_PEM: ${{ secrets.KALSHI_PRIVATE_KEY_PEM }}
+  retired:
+    name: Live integration retired under D11
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Require the protected main branch
+      - name: Confirm no live venue test targets remain
         shell: bash
         run: |
           set -euo pipefail
-          test "$GITHUB_REF" = "refs/heads/main" || {
-            echo "Live credentials may only be used from protected main." >&2
+          if ls tests/live_*.rs >/dev/null 2>&1; then
+            echo "live venue test targets must not exist under D11" >&2
             exit 1
-          }
-
-      - name: Check out source
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: 1.99.1
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-
-      - name: Confirm runtime rights file and Kalshi credentials
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -n "$LIVE_RIGHTS_FILE" || {
-            echo "LIVE_RIGHTS_FILE must name a contract-derived rights file." >&2
-            exit 1
-          }
-          test -r "$LIVE_RIGHTS_FILE" || {
-            echo "LIVE_RIGHTS_FILE is not readable: $LIVE_RIGHTS_FILE" >&2
-            exit 1
-          }
-          test -n "$KALSHI_API_KEY_ID" || { echo "KALSHI_API_KEY_ID secret is required" >&2; exit 1; }
-          test -n "$KALSHI_PRIVATE_KEY_PEM" || { echo "KALSHI_PRIVATE_KEY_PEM secret is required" >&2; exit 1; }
-
-      - name: Run Polymarket public-feed discovery and websocket tests
-        run: cargo test --test live_polymarket --locked -- --ignored --nocapture
-
-      - name: Run Kalshi authenticated read-only market-data test
-        run: cargo test --test live_kalshi --locked -- --ignored --nocapture
-
-      # The tests above prove the adapters can discover and subscribe. This
-      # step produces the retained evidence bundle: SBE captures, raw journals,
-      # reconstruction/completeness/journal verification, and run-manifest.json.
-      - name: Produce verified dual-venue evidence
-        env:
-          LIVE_DURATION_SECS: "120"
-          LIVE_MAX_MARKETS: "5"
-          # This workflow is the smoke tier: a small selected market set. It
-          # cannot emit LIVE_UNIVERSE_OK. Run the script directly with
-          # LIVE_EVIDENCE_SCOPE=universe LIVE_MAX_MARKETS=0 for that claim.
-          LIVE_EVIDENCE_SCOPE: "smoke"
-          # Per-run directory avoids mixing evidence with stale captures left
-          # in a self-hosted runner's persistent workspace.
-          LIVE_EVIDENCE_DIR: captures/live-${{ github.run_id }}-${{ github.run_attempt }}
-        run: scripts/run-live-evidence.sh
-
-      # Upload even on failure so a partial or failed run retains its logs and
-      # manifests for review. A missing bundle is a warning; the script's exit
-      # status is what gates the job.
-      - name: Upload the evidence bundle
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: live-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: captures/live-${{ github.run_id }}-${{ github.run_attempt }}/
-          if-no-files-found: warn
-          retention-days: 90
+          fi
+          echo "live venue market-data tests retired; no provider action"

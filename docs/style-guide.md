@@ -98,9 +98,9 @@ keys, two-space structural indentation, a final newline and no trailing
 whitespace. Property names follow the versioned report and fixture schemas:
 these files are persisted artifacts, not new public APIs, so the guide's
 camelCase API naming rule is not applied to them. The guide's
-formatting and value rules are enforced. Byte-exact raw observations, such as
-`fixtures/hyperliquid/fast_asset_ctxs_wire.json`, are immutable evidence:
-their hashes are recorded in `captures/INDEX.md` and reformatting is forbidden.
+formatting and value rules are enforced. Byte-exact raw observations retained
+as evidence are hash-pinned in their manifest and must not be reformatted;
+synthetic fixture files were retired under RRP-002.
 
 ## Markdown
 

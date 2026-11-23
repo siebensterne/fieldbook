@@ -180,73 +180,6 @@ pub fn parse_reference_document(
 mod tests {
     use super::*;
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/coinbase/reference.json");
-
-    fn document() -> Value {
-        serde_json::from_str(REFERENCE).expect("fixture JSON")
-    }
-
-    #[test]
-    fn identity_is_unique_and_explicitly_namespaced() {
-        let markets = parse_reference_document(&document(), true).unwrap();
-        assert_eq!(markets.len(), 5);
-        let symbols: Vec<_> = markets
-            .iter()
-            .map(|market| market.native_symbol.as_str())
-            .collect();
-        let unique: std::collections::BTreeSet<_> = symbols.iter().copied().collect();
-        assert_eq!(unique.len(), symbols.len());
-        for market in &markets {
-            assert_eq!(market.exchange, "coinbase");
-            assert_eq!(market.symbol, market.native_symbol);
-            assert!(market.native_symbol.starts_with("coinbase:spot:"));
-            assert!(market.outcome.is_none());
-            assert!(market.exchange_market_id.is_none());
-        }
-        // Shared base, distinct quote: two independent markets.
-        assert!(symbols.contains(&"coinbase:spot:BTC/USD"));
-        assert!(symbols.contains(&"coinbase:spot:BTC/USDT"));
-    }
-
-    #[test]
-    fn numeric_spec_is_exact_from_increments() {
-        let markets = parse_reference_document(&document(), true).unwrap();
-        let btc = markets
-            .iter()
-            .find(|market| market.native_symbol == "coinbase:spot:BTC/USD")
-            .unwrap();
-        assert_eq!(btc.tick_size_us, Some(10_000)); // quote_increment 0.01
-        assert_eq!(
-            btc.numeric_spec.quantity_step,
-            Some(Quantity::new(1).unwrap())
-        );
-        assert_eq!(btc.numeric_spec.lot_size, Some(Quantity::new(1).unwrap()));
-        assert_eq!(btc.numeric_spec.price_scale, SCALE_U8);
-        assert_eq!(btc.numeric_spec.quantity_scale, SCALE_U8);
-        assert_eq!(
-            btc.numeric_spec.price_unit,
-            PriceUnit::Currency("USD".to_owned())
-        );
-        assert_eq!(
-            btc.numeric_spec.quantity_unit,
-            QuantityUnit::Currency("BTC".to_owned())
-        );
-
-        let link = markets
-            .iter()
-            .find(|market| market.native_symbol == "coinbase:spot:LINK/USD")
-            .unwrap();
-        assert_eq!(link.tick_size_us, Some(1)); // quote_increment 0.000001
-        assert_eq!(
-            link.numeric_spec.quantity_step,
-            Some(Quantity::new(1000).unwrap())
-        ); // base_increment 0.001
-        for market in &markets {
-            market.validate().unwrap();
-            market.numeric_spec.validate().unwrap();
-        }
-    }
-
     #[test]
     fn excess_precision_is_rejected_not_rounded() {
         let base: Value = serde_json::from_str(
@@ -268,26 +201,6 @@ mod tests {
         )
         .unwrap();
         assert!(parse_product(&quote, true).is_err());
-    }
-
-    #[test]
-    fn inactive_products_are_excluded() {
-        let markets = parse_reference_document(&document(), true).unwrap();
-        let symbols: Vec<_> = markets
-            .iter()
-            .map(|market| market.native_symbol.as_str())
-            .collect();
-        assert!(!symbols.contains(&"coinbase:spot:DOGE/USD")); // status offline
-        assert!(!symbols.contains(&"coinbase:spot:XRP/USD")); // trading_disabled
-        // Relaxing the gate admits them, but still requires a valid spec.
-        let all = parse_reference_document(&document(), false).unwrap();
-        assert_eq!(all.len(), 7);
-        let missing_status: Value = serde_json::from_str(
-            r#"{"id":"ADA-USD","base_currency":"ADA","quote_currency":"USD",
-                "base_increment":"1","quote_increment":"0.01"}"#,
-        )
-        .unwrap();
-        assert!(parse_product(&missing_status, true).unwrap().is_none());
     }
 
     #[test]

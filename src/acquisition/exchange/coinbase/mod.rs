@@ -124,63 +124,6 @@ mod tests {
     use super::*;
     use crate::config::{CoinbaseSettings, Settings};
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/coinbase/reference.json");
-
-    fn fixture_settings() -> CoinbaseSettings {
-        CoinbaseSettings {
-            reference_fixture: Some(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/coinbase/reference.json"),
-            ),
-            ..CoinbaseSettings::default()
-        }
-    }
-
-    #[test]
-    fn h0_reference_document_produces_valid_namespaced_markets() {
-        let value: serde_json::Value = serde_json::from_str(REFERENCE).expect("fixture JSON");
-        let markets = parse_reference_document(&value, true).expect("valid reference document");
-        assert_eq!(markets.len(), 5);
-        for market in &markets {
-            market.validate().expect("valid market");
-            market.numeric_spec.validate().expect("valid numeric spec");
-            assert_eq!(market.exchange, "coinbase");
-            assert_eq!(market.symbol, market.native_symbol);
-            assert!(market.native_symbol.starts_with("coinbase:spot:"));
-            assert!(market.exchange_market_id.is_none());
-            assert!(market.outcome.is_none());
-        }
-        assert!(
-            markets
-                .iter()
-                .any(|market| market.native_symbol == "coinbase:spot:BTC/USD")
-        );
-        assert!(
-            markets
-                .iter()
-                .any(|market| market.native_symbol == "coinbase:spot:BTC/USDT")
-        );
-    }
-
-    #[tokio::test]
-    async fn h0_discovery_is_offline_and_reconciles_stats() {
-        let exchange =
-            CoinbaseExchange::new(fixture_settings(), NetworkSettings::default()).unwrap();
-        let result = exchange.discover_markets_with_stats(0).await.unwrap();
-        assert_eq!(result.markets.len(), 5);
-        assert_eq!(result.stats.pages, 1);
-        assert_eq!(result.stats.selected_markets, 5);
-        assert_eq!(result.stats.outcome_symbols, 5);
-        assert_eq!(result.stats.malformed_records, 0);
-        assert_eq!(result.stats.retries, 0);
-        assert!(
-            result
-                .markets
-                .windows(2)
-                .all(|pair| pair[0].native_symbol <= pair[1].native_symbol)
-        );
-    }
-
     #[test]
     fn h0_uses_clockless_capabilities_and_no_lifecycle_plane() {
         let exchange =

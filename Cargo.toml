@@ -12,12 +12,14 @@ build = "src/util/build.rs"
 description = "Read-only multi-venue market-data collector with SBE capture and raw-frame journaling"
 license = "Apache-2.0"
 # Test targets are declared below. Without this, Cargo would implicitly enable
-# every file in tests/, including the preserved market-shaped sources.
+# every file in tests/. Every market-shaped target was retired under RRP-002;
+# the explicit registry below is the only permitted test surface.
 autotests = false
 
 [features]
-# Opt-in for historical market-shaped tests. Disabled by default: no normal
-# gate, task or CI job enables it. Preserved sources stay in the tree.
+# Retained as a detector for old synthetic market-shaped test code under D11.
+# No target, task, Makefile rule or CI job enables it; no synthetic data may be
+# reintroduced under this feature without a separate versioned owner decision.
 market-shaped-tests = []
 
 [dependencies]
@@ -90,86 +92,6 @@ name = "postgres_batch_live"
 
 [[test]]
 name = "postgres_live"
-
-# Preserved market-shaped targets. The explicit required-features gate keeps
-# them unregistered in every default build; the opt-in feature is enabled by no
-# gate and no CI job. Source is retained, not deleted.
-[[test]]
-name = "coverage_certificate"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "e2e_mock_exchange"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "evidence_pipeline"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "full_universe_stress"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "hyperliquid_books"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "hyperliquid_capacity"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "hyperliquid_telemetry"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "inspect_capture"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "kalshi_lifecycle_plane"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "lifecycle_churn"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "live_kalshi"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "live_polymarket"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "replay_fixture"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "session_recovery"
-required-features = ["market-shaped-tests"]
-
-[[test]]
-name = "source_conformance"
-required-features = ["market-shaped-tests"]
-
-# Standalone numeric-model benchmark; runs on stable Rust and prints timings.
-[[bench]]
-name = "numeric_model"
-harness = false
-
-[[bench]]
-name = "journal_reader"
-harness = false
-
-[[bench]]
-name = "codec_normalization"
-harness = false
-
-[[bench]]
-name = "pipeline_stages"
-harness = false
 
 # Debug information is only needed for workspace frames. Dependencies never
 # need DWARF here, and line tables keep backtraces usable for workspace code.

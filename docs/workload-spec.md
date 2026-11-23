@@ -1,5 +1,10 @@
 # M5 workload specification
 
+> Retired under RRP-002 (owner directive D11). The synthetic market-data
+> assets described below have been removed from the active tree. This text
+> is retained only as a historical record; no command or path in it is
+> executable. See `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 This document freezes the M5 workloads before results are collected. It
 describes what the harness produces, not what has been measured. M5.2 adds
 deterministic burst schedules without changing the frozen 4,000-instrument

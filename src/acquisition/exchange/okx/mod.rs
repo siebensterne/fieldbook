@@ -119,61 +119,6 @@ mod tests {
     use super::*;
     use crate::config::Settings;
 
-    const REFERENCE: &str = include_str!("../../../../fixtures/okx/reference.json");
-
-    fn scoped_settings() -> OkxSettings {
-        OkxSettings {
-            reference_fixture: Some(
-                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("fixtures/okx/reference.json"),
-            ),
-            ..OkxSettings::default()
-        }
-    }
-
-    #[test]
-    fn h0_reference_document_produces_valid_namespaced_markets() {
-        let value: serde_json::Value = serde_json::from_str(REFERENCE).expect("fixture JSON");
-        let markets = parse_instruments_document(&value, &scoped_settings().inst_types)
-            .expect("valid reference document");
-        assert_eq!(markets.len(), 5);
-        for market in &markets {
-            market.validate().expect("valid market");
-            market.numeric_spec.validate().expect("valid numeric spec");
-            assert_eq!(market.exchange, "okx");
-            assert_eq!(market.symbol, market.native_symbol);
-            assert!(market.exchange_market_id.is_none());
-            assert!(market.outcome.is_none());
-        }
-        assert!(
-            markets
-                .iter()
-                .any(|market| market.native_symbol == "okx:spot:BTC/USDT")
-        );
-        assert!(
-            markets
-                .iter()
-                .any(|market| market.native_symbol == "okx:swap:BTC/USDT")
-        );
-        let identities: std::collections::BTreeSet<&str> = markets
-            .iter()
-            .map(|market| market.native_symbol.as_str())
-            .collect();
-        assert_eq!(identities.len(), markets.len());
-    }
-
-    #[tokio::test]
-    async fn h0_discovery_is_offline_and_reconciles_stats() {
-        let exchange = OkxExchange::new(scoped_settings());
-        let result = exchange.discover_markets_with_stats(0).await.unwrap();
-        assert_eq!(result.markets.len(), 5);
-        assert_eq!(result.stats.selected_markets, 5);
-        assert_eq!(result.stats.outcome_symbols, 5);
-        assert_eq!(result.stats.pages, 1);
-        assert_eq!(result.stats.malformed_records, 0);
-        assert_eq!(result.stats.retries, 0);
-    }
-
     #[test]
     fn h0_uses_clockless_capabilities_and_no_lifecycle_plane() {
         let exchange = OkxExchange::new(OkxSettings::default());

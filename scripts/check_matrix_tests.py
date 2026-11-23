@@ -36,7 +36,9 @@ REQUIRED_REQUIREMENTS = (
 )
 
 # Moved here from scripts/check_architecture.py. These names must remain in the
-# matrix even as individual rows are edited.
+# matrix even as individual rows are edited. Under RRP-002 the six synthetic
+# mock-exchange evidence tests below were retired with their test targets; the
+# retained tests still anchor every requirement row.
 REQUIRED_EVIDENCE_TESTS = frozenset(
     {
         "snapshot_anchors_delta_application_in_per_symbol_order",
@@ -45,13 +47,10 @@ REQUIRED_EVIDENCE_TESTS = frozenset(
         "clocked_failover_anchors_resumed_deltas_and_preserves_receive_times",
         "clockless_full_recovery_requires_acknowledged_fence_and_fresh_snapshot",
         "recovery_snapshot_before_ack_is_rejected_without_mutation",
-        "single_socket_loss_fails_over_and_emits_anchoring_snapshot",
         "discovery_adds_and_removes_with_controls",
-        "discovery_churn_retires_and_adds_symbols",
         "normal_shutdown_drains_and_joins",
         "shutdown_drains_saturated_queue_and_joins",
         "finish_failure_on_shutdown_is_reported",
-        "negative_control_missing_update_is_detected_by_verify",
         "payload_bytes_survive_write_and_read",
         "checksum_mismatch_and_corrupt_manifest_fail_verification",
         "queue_saturation_then_shutdown_stays_failed",
@@ -60,9 +59,6 @@ REQUIRED_EVIDENCE_TESTS = frozenset(
         "blocked_writer_bounds_shutdown",
         "blocked_writer_bounds_abort",
         "graceful_shutdown_finalizes_rotated_segments",
-        "journal_accounts_for_every_delivered_payload",
-        "rejected_payloads_are_journaled_across_reconnects",
-        "journal_finalizes_and_verifies_on_graceful_shutdown",
     }
 )
 

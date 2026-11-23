@@ -157,7 +157,6 @@ memory behaviour at capture scale.
 
 ```bash
 cargo test --lib histogram::tests
-cargo test --test full_universe_stress stage_timing_cell_records_real_writer_write_latency
 python3 scripts/check_matrix_tests.py
 python3 scripts/check_architecture.py --check
 ```
@@ -190,7 +189,6 @@ Evidence journaling includes an fsync-bounded journal acknowledgement and is
 not comparable with in-memory stages. These numbers are observations of one
 workload on one host. They are not latency targets or production results.
 
-The earlier two-path comparison remains in `benches/codec_normalization.rs`.
-Its recorded 50,000-iteration result was 171 ns per operation for the JSON
-interchange path and 1,263 ns per operation for typed normalization. The two
-paths do different work, so that ratio is not a performance conclusion.
+The earlier two-path normalization benchmark was retired with the synthetic
+benchmarks under RRP-002. Its historical figures remain only in review records
+and must not be treated as current measurements.

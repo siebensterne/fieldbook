@@ -24,8 +24,6 @@ pub enum Task {
     E2e,
     /// Run matrix, architecture and generated-path gates.
     Verify,
-    /// Verify checked-in journal fixtures.
-    Fixtures,
     /// Measure compile time and enforce budgets.
     Perf,
     /// Run the full assurance superset.
@@ -51,7 +49,6 @@ impl Task {
         Self::Docs,
         Self::E2e,
         Self::Verify,
-        Self::Fixtures,
         Self::Perf,
         Self::Assure,
         Self::Check,
@@ -71,7 +68,6 @@ impl Task {
             Self::Docs => "docs",
             Self::E2e => "e2e",
             Self::Verify => "verify",
-            Self::Fixtures => "fixtures",
             Self::Perf => "perf",
             Self::Assure => "assure",
             Self::Check => "check",
@@ -92,7 +88,6 @@ impl Task {
             Self::Docs => "build rustdoc with warnings and broken links denied",
             Self::E2e => "run the curated end-to-end suites",
             Self::Verify => "run matrix, architecture and generated-path gates",
-            Self::Fixtures => "verify checked-in journal fixtures",
             Self::Perf => "measure compile time and enforce budgets",
             Self::Assure => "run the full assurance superset",
             Self::Check => "style, fmt, lint, tests, verify and e2e",

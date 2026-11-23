@@ -1,5 +1,10 @@
 # Hyperliquid integration plan
 
+> Retired under RRP-002 (owner directive D11). The synthetic market-data
+> assets described below have been removed from the active tree. This text
+> is retained only as a historical record; no command or path in it is
+> executable. See `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 **Status:** H0 reference data, H1 telemetry, H2 selected books/trades and H3
   capacity expansion (synthetic loopback) implemented. This document defined the
   staging contract before implementation.

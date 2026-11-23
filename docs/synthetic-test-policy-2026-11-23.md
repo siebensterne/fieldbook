@@ -1,5 +1,11 @@
 # Synthetic test policy — 2026-11-23
 
+> Historical W1.1 test-policy record. The 558-pass / 12-ignored counts and all
+> other figures below are immutable. Market-shaped sources named here were
+> retired from the active tree under RRP-002 (owner directive D11); counts
+> and the new coverage status are in
+> `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 **Record:** `docs/synthetic-test-policy-2026-11-23.md`
 **Date:** 2026-11-23
 **Status:** implemented; fail-closed compile-time and run-time test gate

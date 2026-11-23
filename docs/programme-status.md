@@ -508,10 +508,10 @@ hashes remain unchanged.
 
 ## Ignored tests
 
-Ignored tests remain opt-in by design: live venue tests requiring credentials
-or network (`live_kalshi`, `live_polymarket`), large/capacity cells, and
-reference-artifact generators. Reference generators listed above were executed
-for this ledger; capacity 25k/50k and live tiers were not executed.
+The synthetic live, capacity and reference-generator tests were retired under
+RRP-002. Historical counts in this record are immutable; the current permitted
+surface and withdrawn coverage are recorded in
+`docs/synthetic-asset-retirement-2026-11-23.md`.
 
 ## Governance
 

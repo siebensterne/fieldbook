@@ -158,13 +158,19 @@ cargo xtask e2e --list-ignored       # opt-in tests and why they are skipped
 cargo xtask e2e --run-ignored <name> # run one registered opt-in test
 cargo xtask check     # style, Rust gates, checks and e2e
 cargo xtask ci        # the full gate, including release build
-cargo xtask fixtures  # verify checked-in journal fixtures
 ```
 
-Market-shaped test targets and unit modules are gated by the
-`market-shaped-tests` Cargo feature, which is off by default. No default task
-or CI job enables it; the inventory, counts and withdrawn coverage are recorded
-in `docs/synthetic-test-policy-2026-11-23.md`.
+Synthetic market-data generators, fixtures, golden journals, mock-exchange
+targets and synthetic benchmarks were retired under owner directive D11
+(RRP-002). The `market-shaped-tests` Cargo feature is retained only as a
+detector for old synthetic code; no target, task or CI job enables it and no
+replacement synthetic data may be introduced without a separate versioned
+owner decision. Removed paths, hashes, preserved historical counts and
+withdrawn coverage are recorded in
+[`docs/synthetic-asset-retirement-2026-11-23.md`](docs/synthetic-asset-retirement-2026-11-23.md).
+The earlier W1.1/W1.2 policy record remains at
+[`docs/synthetic-test-policy-2026-11-23.md`](docs/synthetic-test-policy-2026-11-23.md)
+as an immutable historical document.
 
 The complete cross-language contract is in [`docs/style-guide.md`](docs/style-guide.md).
 Rust follows the [Linux kernel Rust guidelines](https://docs.kernel.org/rust/coding-guidelines.html)

@@ -1,5 +1,10 @@
 # M3.0 acquisition and data capability foundation
 
+> Retired under RRP-002 (owner directive D11). The synthetic market-data
+> assets described below have been removed from the active tree. This text
+> is retained only as a historical record; no command or path in it is
+> executable. See `docs/synthetic-asset-retirement-2026-11-23.md`.
+
 This record separates engineering evidence from operational claims. It is a
 local design and evidence note, not a production certification.
 

@@ -1,5 +1,10 @@
 # Scope containment fix — 2026-11-23
 
+> Historical record. Test paths named below were retired under RRP-002
+> (owner directive D11) and are not available in the active tree. This
+> document is preserved unchanged except for this notice; see
+> `docs/synthetic-asset-retirement-2026-11-23.md` for the current state.
+
 **Record:** `docs/scope-containment-2026-11-23.md`
 **Date:** 2026-11-23
 **Work item:** W1.2 C1 (Fieldbook scope containment and explicit requests)
