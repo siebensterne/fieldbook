@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     capacity::CapacityPlan,
-    config::{ExchangeKind, Settings},
+    config::Settings,
     exchange::DiscoveryStats,
     metrics::{CollectorStats, CoverageStats, WriterStats},
     model::{MarketInfo, SourceStatus},
@@ -30,8 +30,6 @@ pub const REPORT_SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportConfig {
     pub exchange: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kalshi_environment: Option<String>,
     pub shard_count: usize,
     pub replica_count: usize,
     pub snapshot_interval_secs: u64,
@@ -60,13 +58,7 @@ impl ReportConfig {
     #[must_use]
     pub fn from_settings(settings: &Settings, shard_count: usize) -> Self {
         Self {
-            exchange: settings.exchange.to_string(),
-            kalshi_environment: matches!(settings.exchange, ExchangeKind::Kalshi).then(|| {
-                match settings.kalshi.environment {
-                    crate::config::KalshiEnvironment::Demo => "demo".to_owned(),
-                    crate::config::KalshiEnvironment::Production => "production".to_owned(),
-                }
-            }),
+            exchange: settings.network.venue.clone(),
             shard_count,
             replica_count: settings.collector.replicas,
             snapshot_interval_secs: settings.collector.snapshot_interval_secs,
@@ -406,7 +398,7 @@ mod tests {
 
     #[test]
     fn report_config_records_the_durability_policy() {
-        let mut settings = Settings::for_exchange(crate::config::ExchangeKind::Polymarket);
+        let mut settings = Settings::for_venue("securities");
         settings.output.sync_on_close = false;
         let config = ReportConfig::from_settings(&settings, 4);
         assert!(!config.output_sync_on_close);

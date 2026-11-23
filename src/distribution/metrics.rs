@@ -31,10 +31,10 @@ use crate::{
 
 /// Lifecycle-plane health reported separately from the book plane.
 ///
-/// Kalshi-only: for venues without a separate lifecycle channel both fields
+/// For venues without a separate lifecycle channel both fields
 /// are zero and the readiness check is a no-op. `configured` counts the
 /// supervised lifecycle sockets this run spawned; `connected` counts the
-/// subset whose session is currently up. Readiness treats the Kalshi plane
+/// subset whose session is currently up. Readiness treats the lifecycle plane
 /// as required, not best-effort, so an entirely disconnected plane degrades
 /// `/readyz` while the REST reconciliation still bounds catalog divergence.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -94,7 +94,7 @@ pub struct CollectorStats {
     #[serde(default)]
     pub rejected_recovery_snapshots: u64,
     pub sequence_resets: u64,
-    /// Kalshi exchange-clock decreases observed on an active book. These are
+    /// Exchange-clock decreases observed on an active book. These are
     /// expected across exchange maintenance and start a new comparison epoch.
     pub clock_resets: u64,
     pub source_switches: u64,
@@ -654,7 +654,7 @@ impl MetricsRegistry {
             },
         );
 
-        // The lifecycle control plane is required for Kalshi runs that
+        // The lifecycle control plane is required for runs that declare it and
         // spawned one: universe membership must not silently diverge from the
         // authoritative catalog. A fully disconnected plane degrades
         // readiness; the REST reconciliation still bounds catalog divergence
@@ -1019,12 +1019,12 @@ impl MetricsRegistry {
         );
         gauge!(
             "collector_lifecycle_connected",
-            "Supervised lifecycle sockets connected (Kalshi lifecycle plane)",
+            "Supervised lifecycle sockets connected (lifecycle plane)",
             snapshot.lifecycle.connected
         );
         gauge!(
             "collector_lifecycle_configured",
-            "Supervised lifecycle sockets configured (Kalshi lifecycle plane)",
+            "Supervised lifecycle sockets configured (lifecycle plane)",
             snapshot.lifecycle.configured
         );
         gauge!(

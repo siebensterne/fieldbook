@@ -1,5 +1,4 @@
 use super::*;
-use crate::config::ExchangeKind;
 use crate::metrics::{CatalogHealth, MetricsRegistry, ReadinessPolicy, RuntimeStatus, WriterStats};
 use crate::model::{
     ContinuityState, Control, DiscontinuityReason, EventMeta, ExchangeEvent, Level, MarketInfo,
@@ -11,8 +10,8 @@ const NOW: i64 = 1_700_000_000_000_000;
 const SOURCE_A: SourceId = SourceId::new(0, 0);
 const SOURCE_B: SourceId = SourceId::new(0, 1);
 
-fn settings_for(exchange: ExchangeKind) -> Settings {
-    let mut settings = Settings::for_exchange(exchange);
+fn settings_for() -> Settings {
+    let mut settings = Settings::for_venue("securities");
     settings.collector.shards = 1;
     settings.collector.replicas = 2;
     settings.collector.snapshot_interval_secs = 60;
@@ -24,44 +23,26 @@ fn settings_for(exchange: ExchangeKind) -> Settings {
 
 fn core() -> CollectorCore {
     CollectorCore::new(
-        CoreConfig::from_settings(
-            &settings_for(ExchangeKind::Polymarket),
-            1,
-            ExchangeCapabilities::new(false),
-        )
-        .unwrap(),
+        CoreConfig::from_settings(&settings_for(), 1, ExchangeCapabilities::new(false)).unwrap(),
     )
     .unwrap()
 }
 
 fn clocked_core() -> CollectorCore {
     CollectorCore::new(
-        CoreConfig::from_settings(
-            &settings_for(ExchangeKind::Kalshi),
-            1,
-            ExchangeCapabilities::new(true),
-        )
-        .unwrap(),
+        CoreConfig::from_settings(&settings_for(), 1, ExchangeCapabilities::new(true)).unwrap(),
     )
     .unwrap()
 }
 
 #[test]
 fn capabilities_are_not_derived_from_the_venue_name() {
-    let unclocked_kalshi = CoreConfig::from_settings(
-        &settings_for(ExchangeKind::Kalshi),
-        1,
-        ExchangeCapabilities::new(false),
-    )
-    .unwrap();
+    let unclocked_kalshi =
+        CoreConfig::from_settings(&settings_for(), 1, ExchangeCapabilities::new(false)).unwrap();
     assert!(!unclocked_kalshi.capabilities.has_sequence_clock);
 
-    let clocked_polymarket = CoreConfig::from_settings(
-        &settings_for(ExchangeKind::Polymarket),
-        1,
-        ExchangeCapabilities::new(true),
-    )
-    .unwrap();
+    let clocked_polymarket =
+        CoreConfig::from_settings(&settings_for(), 1, ExchangeCapabilities::new(true)).unwrap();
     assert!(clocked_polymarket.capabilities.has_sequence_clock);
 }
 
@@ -537,73 +518,6 @@ fn clocked_shadow_replica_takes_over_after_source_loss() {
     };
     assert_eq!(snapshot.bids[0].price_level, 410_000);
     assert_eq!(core.stats().source_switches, 1);
-}
-
-#[test]
-fn kalshi_without_clock_requires_clockless_recovery() {
-    use crate::exchange::capabilities_for;
-    use crate::exchange::kalshi::codec::{KalshiMessage, decode_kalshi_message};
-    // Build the production core for Kalshi via the capability mapping.
-    let caps = capabilities_for(ExchangeKind::Kalshi);
-    let mut core = CollectorCore::new(
-        CoreConfig::from_settings(&settings_for(ExchangeKind::Kalshi), 1, caps).unwrap(),
-    )
-    .unwrap();
-    discover_one(&mut core);
-    core.handle_status(connected_status(SOURCE_A, true), NOW);
-    core.handle_status(connected_status(SOURCE_B, true), NOW);
-
-    // Real Kalshi wire frames with no `msg.clock`.
-    let primary_payload = r#"{"type":"orderbook_snapshot","sid":1,"seq":1,"sending_ts_ms":1669149841000,"msg":{"market_ticker":"A","yes_dollars_fp":[["0.40","10.00"]],"no_dollars_fp":[["0.60","5.00"]]}}"#;
-    let standby_payload = r#"{"type":"orderbook_snapshot","sid":2,"seq":1,"sending_ts_ms":1669149841000,"msg":{"market_ticker":"A","yes_dollars_fp":[["0.41","10.00"]],"no_dollars_fp":[["0.59","5.00"]]}}"#;
-    let delta_payload = r#"{"type":"orderbook_delta","sid":1,"seq":2,"sending_ts_ms":1669149841100,"msg":{"market_ticker":"A","price_dollars":"0.40","delta_fp":"1.00","side":"yes","ts_ms":1669149841100}}"#;
-    let primary_event = match decode_kalshi_message(primary_payload, NOW).unwrap() {
-        KalshiMessage::Snapshot { event, .. } => event,
-        _ => panic!("expected snapshot"),
-    };
-    let standby_event = match decode_kalshi_message(standby_payload, NOW + 1).unwrap() {
-        KalshiMessage::Snapshot { event, .. } => event,
-        _ => panic!("expected snapshot"),
-    };
-    let delta_event = match decode_kalshi_message(delta_payload, NOW + 2).unwrap() {
-        KalshiMessage::Delta { event, .. } => event,
-        _ => panic!("expected delta"),
-    };
-    // Wire frames without `msg.clock` must decode with no clock.
-    for event in [&primary_event, &standby_event, &delta_event] {
-        match event {
-            ExchangeEvent::Snapshot { meta, .. } | ExchangeEvent::LevelChange { meta, .. } => {
-                assert_eq!(meta.clock, None, "wire without clock must stay clockless");
-            }
-            _ => panic!("unexpected event"),
-        }
-    }
-    core.handle_event(SOURCE_A, primary_event);
-    core.handle_event(SOURCE_A, delta_event);
-    core.handle_event(SOURCE_B, standby_event);
-
-    // Primary disconnects. The standby book is valid but its freshness
-    // cannot be proven without a comparable clock.
-    let outputs = core.handle_status(connected_status(SOURCE_A, false), NOW + 10);
-    assert!(
-        outputs.is_empty(),
-        "stale standby must not be promoted without a clock"
-    );
-    assert_eq!(core.markets["A"].active, None);
-    assert_eq!(core.markets["A"].continuity, ContinuityState::Resyncing);
-    // Clockless recovery: request, ack, reject before fence, accept after.
-    let (generation, _symbols, _reconnect) = recovery_control(&mut core, SOURCE_B);
-    let before = core.handle_event(
-        SOURCE_B,
-        snapshot_event_fenced("A", 425_000, 575_000, None, NOW + 11, 2, 1),
-    );
-    assert!(before.is_empty());
-    core.handle_recovery_ready(SOURCE_B, &["A".to_owned()], generation, 1, 7);
-    let after = core.handle_event(
-        SOURCE_B,
-        snapshot_event_fenced("A", 425_000, 575_000, None, NOW + 12, 2, 8),
-    );
-    assert_eq!(after.len(), 1);
 }
 
 #[test]
@@ -2286,7 +2200,7 @@ fn blast_radius_source_loss_invalidates_all_books_then_reanchors_3000_instrument
 
 #[test]
 fn blast_radius_independent_shards_do_not_share_a_failure() {
-    let mut settings = settings_for(ExchangeKind::Polymarket);
+    let mut settings = settings_for();
     settings.collector.shards = 2;
     let mut core = CollectorCore::new(
         CoreConfig::from_settings(&settings, 2, ExchangeCapabilities::new(false)).unwrap(),

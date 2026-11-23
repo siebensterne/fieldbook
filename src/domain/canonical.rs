@@ -221,7 +221,7 @@ impl BestBidOffer {
     }
 }
 
-/// Asset or venue-wide context (for example Hyperliquid `allMids` or
+/// Asset or venue-wide context (for example venue statistics or
 /// `fastAssetCtxs`). Telemetry and asset records are context, never a book
 /// anchor, book delta or trade.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

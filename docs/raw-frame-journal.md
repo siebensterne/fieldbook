@@ -1,5 +1,7 @@
 # Raw-frame journal
 
+> **RRP-003 notice (2026-11-23).** Venue-specific examples and adapter references below describe families retired under RRP-003. They are retained as historical design rationale, not active capability claims. See `product-scope-retirement-2026-11-23.md`.
+
 The current implementation writes journal schema v2, defined by
 [ADR-0002](adr/0002-persist-transport-observations-without-changing-receive-order.md).
 Every retained observation — application data frames **and** native WebSocket

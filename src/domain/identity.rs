@@ -217,19 +217,14 @@ pub fn venue_mappings_from_markets(
             let instrument = InstrumentId::derive(authority, authority, &market.native_symbol);
             let venue = VenueId::derive(authority, authority, "venue");
             let listing = ListingId::derive(authority, authority, &market.native_symbol);
+            // A grouping key is carried verbatim. No provider name selects a
+            // relationship kind: the retired adapters encoded their own venue
+            // semantics, and generic identity derivation stays venue-neutral.
             let relationships = market
                 .exchange_market_id
                 .as_ref()
-                .map(|grouping| match authority {
-                    "kalshi" => Relationship::EventOf {
-                        event_id: grouping.clone(),
-                    },
-                    "polymarket" => Relationship::ConditionOf {
-                        condition_id: grouping.clone(),
-                    },
-                    _ => Relationship::DexOf {
-                        dex: grouping.clone(),
-                    },
+                .map(|grouping| Relationship::DexOf {
+                    dex: grouping.clone(),
                 })
                 .into_iter()
                 .collect();
@@ -556,7 +551,7 @@ mod adapter_tests {
         assert_ne!(kalshi[0].instrument, coinbase[0].instrument);
         assert!(matches!(
             kalshi[0].relationships[0],
-            Relationship::EventOf { .. }
+            Relationship::DexOf { .. }
         ));
     }
 
@@ -572,7 +567,7 @@ mod adapter_tests {
         assert_ne!(mappings[0].instrument, mappings[1].instrument);
         assert!(matches!(
             mappings[0].relationships[0],
-            Relationship::ConditionOf { .. }
+            Relationship::DexOf { .. }
         ));
     }
 

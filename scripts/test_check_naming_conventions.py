@@ -28,7 +28,7 @@ class NamingConventionTests(unittest.TestCase):
         """Check that a domain name produces no finding."""
         self.assertEqual(
             check_naming_conventions.phase_label_findings(
-                ["tests/durable_pipeline.rs", "docs/workload-spec.md"]
+                ["tests/durable_pipeline.rs", "docs/performance-methodology.md"]
             ),
             [],
         )
@@ -39,7 +39,7 @@ class NamingConventionTests(unittest.TestCase):
             check_naming_conventions.phase_label_findings(
                 [
                     "measurements/perf/p6-1-batch-matrix/evidence.json",
-                    "measurements/stress/m5-v16-bundle/index.json",
+                    "measurements/live/2026-11-18-postgres-source-scoped/evidence.json",
                 ]
             ),
             [],

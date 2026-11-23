@@ -1,23 +1,16 @@
-# Kalshi collector example. Credentials may also come from KALSHI_API_KEY_ID,
-# KALSHI_PRIVATE_KEY_PATH, or KALSHI_PRIVATE_KEY_PEM.
-exchange = "kalshi"
+# Securities market-data platform example configuration.
+#
+# RRP-003 retired the crypto and prediction-market adapter families. No venue
+# adapter is registered: a securities venue is onboarded only after its source,
+# rights and NDC projection are qualified (workspace W4). This template
+# contains only generic acquisition, transport, durability and governance
+# settings. It contains no credentials, venue endpoints or capability claims.
 
 [governance]
 # Required for collect, discover, latency, network-probe and analytics-export.
 # Without a rights file these commands deny before any provider contact.
 # rights_file = "rights.toml"
 # audit_dir = "captures/authorization-audit"
-
-[kalshi]
-# Production is the built-in default because the challenge targets live
-# markets. Use "demo" with demo credentials for a simulated exchange.
-environment = "production"
-key_id = ""
-# private_key_path = "/absolute/path/to/kalshi-private-key.pem"
-batch_size = 100
-discovery_page_size = 1000
-request_timeout_secs = 20
-discovery_page_delay_ms = 50
 
 [collector]
 # 0 derives the shard count from the initial symbol count and the soft socket
@@ -37,10 +30,8 @@ final_snapshots = true
 writer_queue = 16384
 flush_interval_secs = 1
 max_markets = 0
-# Dedicated lifecycle control plane (Kalshi only): supervised sockets that
-# carry market_lifecycle_v2 so book shards never see lifecycle traffic. Book
-# connections are unaffected. Set to 0 to disable; new markets then enter only
-# via REST discovery. Lifecycle sockets are counted in max_total_connections.
+# Dedicated market-lifecycle control-plane sockets. An adapter without a
+# separate lifecycle channel ignores this value. Set to 0 to disable.
 lifecycle_replicas = 1
 duration_secs = 0
 writer_send_timeout_secs = 30
@@ -53,7 +44,7 @@ max_estimated_book_memory_mb = 1024
 max_snapshot_bytes_per_sec = 16777216
 connect_concurrency = 8
 # Last-known-good discovery checkpoint. Modes: off, warm, require, stale.
-# catalog_path = "captures/kalshi-catalog.json"
+# catalog_path = "captures/securities-catalog.json"
 catalog_mode = "off"
 catalog_max_age_secs = 3600
 allow_empty_catalog = false
@@ -75,11 +66,12 @@ connect_race = 1
 # Deadline for one full connection attempt (DNS, TCP, TLS, websocket upgrade,
 # including every raced candidate).
 connect_timeout_secs = 30
-# Egress route for collection traffic. "direct" (the default) dials venues
-# directly and ignores shell proxy variables. "explicit_proxy" uses ONE
-# configured proxy for REST discovery and websockets; it must be a route the
-# venue's terms, your account eligibility and applicable law permit you to
-# use. A proxy is a network path, not an entitlement.
+# Egress route for collection traffic. "direct" (the default) dials the
+# configured source directly and ignores shell proxy variables.
+# "explicit_proxy" uses ONE configured proxy for REST discovery and
+# websockets; it must be a route the venue's terms, your account eligibility
+# and applicable law permit you to use. A proxy is a network path, not an
+# entitlement, and there is never a silent fallback to direct networking.
 egress_mode = "direct"
 # With egress_mode = "explicit_proxy", the proxy URL and credentials come
 # from environment variables, never from this file:
@@ -95,15 +87,14 @@ egress_mode = "direct"
 # proxy_remote_dns = true
 # Non-secret route label recorded in journal manifests and probe reports.
 # proxy_label = "approved-egress-a"
-# A proxy that cannot be reached never falls back to direct networking.
 
 [output]
-path = "captures/kalshi.sbe"
+path = "captures/securities.sbe"
 # Matches the template reader's default. Periodic flushes write only encoded
 # bytes; the final chunk is padded on close.
 chunk_size = 67108864
-metadata_path = "captures/kalshi-markets.json"
-report_path = "captures/kalshi-report.json"
+metadata_path = "captures/securities-markets.json"
+report_path = "captures/securities-report.json"
 sync_on_close = true
 # Existing capture, sidecar, catalog, manifest, and segment files are startup
 # errors unless this is true.
@@ -125,7 +116,7 @@ listen = "127.0.0.1:9090"
 [journal]
 # Uncomment to retain every received public data frame. Each run creates a new
 # subdirectory with a manifest and checksummed segments.
-# directory = "captures/kalshi-journal"
+# directory = "captures/securities-journal"
 queue_capacity = 4096
 enqueue_timeout_ms = 250
 flush_interval_ms = 1000

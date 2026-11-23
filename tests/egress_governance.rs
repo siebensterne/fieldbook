@@ -22,11 +22,10 @@ use clap::CommandFactory as _;
 use clap::Parser as _;
 
 use fieldbook::{
-    config::{CoinbaseSettings, ExchangeKind, KrakenSettings, NetworkSettings, Settings},
+    config::{NetworkSettings, Settings},
     distribution::cli::Cli,
     egress::http_client,
     egress_intent::EgressIntent,
-    exchange::{CoinbaseExchange, KrakenExchange},
     rights::{
         DeliveryMethod, Licensee, Operation, Purpose, Recipient, Retention, ScopeSet, TimeWindow,
         UsageMode, UsageRight, authorize_operations, has_active_authorization,
@@ -49,7 +48,7 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          [rights.identity]\n\
          licensee = \"licensee-a\"\n\
          venue = \"{venue}\"\n\
-         provider_id = \"kalshi\"\n\
+         provider_id = \"securities\"\n\
          source_id = \"provider-source\"\n\
          dataset_id = \"market-data\"\n\
          product_id = \"market-data-feed\"\n\
@@ -86,7 +85,7 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
 fn egress_intent(venue: &str, operation: Operation) -> EgressIntent {
     let universe = ScopeSet::Universe("governance-universe-1".to_owned());
     EgressIntent::builder()
-        .provider_id("kalshi")
+        .provider_id("securities")
         .source_id("provider-source")
         .source_product_id("market-data-feed")
         .venue_id(venue)
@@ -115,7 +114,7 @@ fn settings_with_rights(text: &str) -> (tempfile::TempDir, Settings) {
     let directory = tempfile::tempdir().expect("temporary directory");
     let path = directory.path().join("rights.toml");
     std::fs::write(&path, text).expect("write rights file");
-    let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
+    let mut settings = Settings::for_venue("securities");
     settings.governance.rights_file = Some(path);
     settings.governance.audit_dir = Some(directory.path().join("audit"));
     (directory, settings)
@@ -140,7 +139,7 @@ fn collect_without_rights_file_denies_before_egress() {
         !has_active_authorization(),
         "the test process starts ungated"
     );
-    let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
+    let mut settings = Settings::for_venue("securities");
     settings.governance.rights_file = None;
     let error = authorize_operations(&settings, &[Operation::RealTimeCapture])
         .expect_err("collection without a rights file must deny");
@@ -153,8 +152,11 @@ fn collect_without_rights_file_denies_before_egress() {
         "a denied command installs no authorization"
     );
     assert!(
-        require_provider_egress(&egress_intent("kalshi", Operation::ReferenceDataRetrieval))
-            .is_err(),
+        require_provider_egress(&egress_intent(
+            "securities",
+            Operation::ReferenceDataRetrieval
+        ))
+        .is_err(),
         "no proof means no HTTP client"
     );
     assert!(
@@ -171,7 +173,7 @@ fn collect_without_rights_file_denies_before_egress() {
 
 #[test]
 fn expired_and_unknown_rights_deny_every_gated_command() {
-    let (_expired_dir, expired) = settings_with_rights(&rights_toml("kalshi", "permitted", 1));
+    let (_expired_dir, expired) = settings_with_rights(&rights_toml("securities", "permitted", 1));
     assert!(
         authorize_operations(&expired, &[Operation::RealTimeCapture]).is_err(),
         "an expired right denies collection"
@@ -181,7 +183,7 @@ fn expired_and_unknown_rights_deny_every_gated_command() {
         "an expired right denies discovery"
     );
     let (_unknown_dir, unknown) =
-        settings_with_rights(&rights_toml("kalshi", "contract_required", i64::MAX));
+        settings_with_rights(&rights_toml("securities", "contract_required", i64::MAX));
     assert!(
         authorize_operations(&unknown, &[Operation::SourceContact]).is_err(),
         "an UNKNOWN right denies a network probe"
@@ -252,7 +254,7 @@ fn analytics_export_denial_publishes_nothing() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let staging = directory.path().join("staging");
     std::fs::create_dir(&staging).expect("create staging directory");
-    let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
+    let mut settings = Settings::for_venue("securities");
     settings.governance.rights_file = None;
     assert!(
         authorize_operations(&settings, &[Operation::DerivedDataCreation]).is_err(),
@@ -262,32 +264,6 @@ fn analytics_export_denial_publishes_nothing() {
         .expect("read staging directory")
         .collect();
     assert!(published.is_empty(), "a denial publishes no files");
-}
-
-#[test]
-fn coinbase_and_kraken_adapter_clients_deny_without_rights() {
-    assert!(
-        !has_active_authorization(),
-        "the test process starts ungated"
-    );
-    let coinbase_network = Settings::for_exchange(ExchangeKind::Coinbase).network;
-    assert_eq!(
-        coinbase_network.venue, "coinbase",
-        "adapter transport carries the Coinbase venue"
-    );
-    assert!(
-        CoinbaseExchange::new(CoinbaseSettings::default(), coinbase_network).is_err(),
-        "Coinbase client construction is gated"
-    );
-    let kraken_network = Settings::for_exchange(ExchangeKind::Kraken).network;
-    assert_eq!(
-        kraken_network.venue, "kraken",
-        "adapter transport carries the Kraken venue"
-    );
-    assert!(
-        KrakenExchange::new(KrakenSettings::default(), kraken_network).is_err(),
-        "Kraken client construction is gated"
-    );
 }
 
 #[test]
@@ -301,10 +277,10 @@ fn unconfigured_transport_default_is_not_a_provider_venue() {
         http_client("governance-test/1", Duration::from_secs(1), &network, None).is_ok(),
         "a standalone loopback transport may build a client without rights"
     );
-    let live = Settings::for_exchange(ExchangeKind::Kalshi).network;
+    let live = Settings::for_venue("securities").network;
     assert_eq!(
-        live.venue, "kalshi",
-        "settings derive the venue from the exchange"
+        live.venue, "securities",
+        "the caller-supplied venue label reaches the transport"
     );
     assert!(
         http_client("governance-test/1", Duration::from_secs(1), &live, None).is_err(),

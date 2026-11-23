@@ -61,10 +61,10 @@ impl FrameClassification {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HeartbeatMechanism {
-    /// Application-level text `PING`/`PONG` (Polymarket): one outstanding
+    /// Application-level text `PING`/`PONG`: one outstanding
     /// heartbeat, no request nonce, ack typed from the text frame.
     ApplicationText,
-    /// Native WebSocket control frames (Kalshi): PONG payload correlates
+    /// Native WebSocket control frames: PONG payload correlates
     /// with the client ping.
     WebSocketControl,
     /// The venue carries no client-driven heartbeat; liveness comes from
@@ -90,7 +90,7 @@ pub enum SessionSignal {
     /// The venue acknowledged the client's heartbeat. The payload is the
     /// correlation evidence: `Some(bytes)` for a native WebSocket PONG
     /// (which echoes the client ping's payload), `None` for an
-    /// application-text PONG (Polymarket's text protocol carries no
+    /// application-text PONG (a text protocol carries no
     /// nonce - correlation there is the single-outstanding-window
     /// contract, an explicit venue limitation).
     HeartbeatAck { correlation: Option<Vec<u8>> },

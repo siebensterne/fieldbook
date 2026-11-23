@@ -1,18 +1,9 @@
-//! Exchange adapters and their common discovery/session interface.
-
-pub mod binance;
-pub mod coinbase;
-pub use binance::BinanceExchange;
-pub use coinbase::CoinbaseExchange;
-pub mod hyperliquid;
-pub use hyperliquid::HyperliquidExchange;
-pub mod kalshi;
-pub mod kraken;
-pub use kraken::KrakenExchange;
-pub mod okx;
-pub mod polymarket;
-
-pub use okx::OkxExchange;
+//! Exchange adapter abstraction and common discovery/session interface.
+//!
+//! The seven crypto and prediction-market adapter families were retired under
+//! RRP-003. This module keeps only the venue-neutral contract: no concrete
+//! adapter is registered here. A securities venue adapter is added only after
+//! its source, rights and NDC projection are qualified (workspace W4).
 
 use std::{sync::Arc, time::Instant};
 
@@ -20,11 +11,11 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    capacity::count_selected_markets, config::ExchangeKind, model::MarketInfo,
-    products::SourceCapabilities, session::SessionFactory, time::now_us,
+    capacity::count_selected_markets, model::MarketInfo, products::SourceCapabilities,
+    session::SessionFactory, time::now_us,
 };
 
-/// Venue features that the exchange adapter reports to the collector core.
+/// Venue features that an exchange adapter reports to the collector core.
 ///
 /// The core consumes these values instead of identifying a venue by name, so
 /// adding an exchange requires a new adapter and capability declaration, not a
@@ -43,53 +34,31 @@ impl ExchangeCapabilities {
     }
 }
 
-/// Capability declaration for a configured venue.
+/// Conservative capability declaration used when no adapter is present.
 ///
-/// The coordinator obtains capabilities from the constructed adapter. Replay
-/// has no adapter, so this mapping is the composition-root equivalent for the
-/// selected configuration.
+/// Replay and offline inspection have no live venue to interrogate. They use
+/// this clockless declaration rather than assuming a sequence clock, so a
+/// replay never claims ordering guarantees it cannot verify.
 #[must_use]
-pub fn capabilities_for(kind: ExchangeKind) -> ExchangeCapabilities {
-    match kind {
-        // Kalshi `seq` is per-subscription and cannot compare replicas. The
-        // wire `clock` is optional and is not assumed cross-replica
-        // comparable, so the core uses the clockless recovery path.
-        ExchangeKind::Kalshi => ExchangeCapabilities::new(false),
-        ExchangeKind::Polymarket => ExchangeCapabilities::new(false),
-        ExchangeKind::Hyperliquid => hyperliquid::capabilities(),
-        ExchangeKind::Coinbase => coinbase::capabilities(),
-        ExchangeKind::Kraken => kraken::capabilities(),
-        // OKX H0 publishes no cross-replica comparable sequence clock; H1-H3
-        // keep the receive-fence-only ordering authority.
-        ExchangeKind::Okx => okx::capabilities(),
-        ExchangeKind::Binance => binance::capabilities(),
-    }
+pub fn capabilities_for() -> ExchangeCapabilities {
+    ExchangeCapabilities::default()
 }
 
-/// Typed capability declaration for a configured venue.
+/// Conservative typed source-capability declaration for offline paths.
 ///
-/// Every adapter declares its own products and delivery model; this mapping is
-/// the composition-root/replay equivalent of the adapter's
-/// [`Exchange::source_capabilities`]. The legacy [`capabilities_for`] above is
-/// unchanged and continues to report only the sequence-clock flag.
+/// The composition root obtains typed capabilities from a constructed adapter.
+/// With no adapter registered, the offline declaration is empty by construction:
+/// no live products, no reference-data claim and no sequence clock.
 #[must_use]
-pub fn source_capabilities_for(kind: ExchangeKind) -> SourceCapabilities {
-    match kind {
-        ExchangeKind::Kalshi => kalshi::typed_capabilities(),
-        ExchangeKind::Polymarket => polymarket::typed_capabilities(),
-        ExchangeKind::Hyperliquid => hyperliquid::typed_capabilities(),
-        ExchangeKind::Coinbase => coinbase::typed_capabilities(),
-        ExchangeKind::Kraken => kraken::typed_capabilities(),
-        ExchangeKind::Okx => okx::typed_capabilities(),
-        ExchangeKind::Binance => binance::typed_capabilities(),
-    }
+pub fn source_capabilities_for() -> SourceCapabilities {
+    SourceCapabilities::from_legacy(false)
 }
 
 /// Telemetry for one complete discovery round.
 ///
 /// `selected_markets` counts venue records; `outcome_symbols` counts the
-/// subscribable tokens those records produced. The two differ on Polymarket,
-/// where one Gamma record expands into several outcome tokens.
+/// subscribable tokens those records produced. The two differ when one
+/// discovery record expands into several outcome tokens.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryStats {
     pub pages: u64,
@@ -159,7 +128,7 @@ pub trait Exchange: Send + Sync + 'static {
     /// Fetch a discovery round with page and record telemetry.
     ///
     /// The default implementation preserves adapters that do not publish
-    /// page-level counters; both built-in adapters override it.
+    /// page-level counters; adapters with telemetry override it.
     async fn discover_markets_with_stats(
         &self,
         max_markets: usize,
@@ -195,116 +164,9 @@ pub trait Exchange: Send + Sync + 'static {
     }
 }
 
-pub use kalshi::{KalshiExchange, KalshiSessionFactory};
-pub use polymarket::{PolymarketExchange, PolymarketSessionFactory};
-
-#[cfg(all(test, feature = "market-shaped-tests"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn configured_venue_capabilities_are_explicit() {
-        // Per-subscription `seq` does not compare replicas, and the wire
-        // `clock` is optional. Kalshi must not claim a sequence clock until
-        // a cross-replica comparable clock is verified.
-        assert!(!capabilities_for(ExchangeKind::Kalshi).has_sequence_clock);
-        assert!(!capabilities_for(ExchangeKind::Polymarket).has_sequence_clock);
-        assert!(!capabilities_for(ExchangeKind::Hyperliquid).has_sequence_clock);
-        // Coinbase H0 has no verified cross-replica sequence clock either.
-        assert!(!capabilities_for(ExchangeKind::Coinbase).has_sequence_clock);
-        assert!(!capabilities_for(ExchangeKind::Kraken).has_sequence_clock);
-        assert!(!capabilities_for(ExchangeKind::Okx).has_sequence_clock);
-        assert!(!capabilities_for(ExchangeKind::Binance).has_sequence_clock);
-    }
-
-    #[test]
-    fn typed_capabilities_are_declared_for_every_venue() {
-        use std::collections::BTreeSet;
-
-        use crate::products::{
-            BackpressureBehavior, HeartbeatMechanism, OrderingScope, PrecisionModel, ProductKind,
-            SubscriptionTopology, UpdateModel,
-        };
-
-        let kalshi = source_capabilities_for(ExchangeKind::Kalshi);
-        assert_eq!(
-            kalshi.products,
-            BTreeSet::from([ProductKind::OrderBookL2, ProductKind::VenueLifecycle])
-        );
-        assert_eq!(
-            kalshi.subscription_topology,
-            SubscriptionTopology::PerInstrument
-        );
-        assert_eq!(kalshi.heartbeat, HeartbeatMechanism::NativePingPong);
-        assert_eq!(kalshi.update_model, UpdateModel::SnapshotAndDelta);
-        assert!(kalshi.provides_reference_data);
-        assert_eq!(kalshi.ordering_scope, OrderingScope::ReceiveFence);
-
-        let polymarket = source_capabilities_for(ExchangeKind::Polymarket);
-        assert_eq!(
-            polymarket.products,
-            BTreeSet::from([ProductKind::OrderBookL2])
-        );
-        assert_eq!(
-            polymarket.subscription_topology,
-            SubscriptionTopology::PerInstrument
-        );
-        assert_eq!(polymarket.heartbeat, HeartbeatMechanism::ApplicationText);
-        assert!(!polymarket.supports(ProductKind::VenueLifecycle));
-
-        let hyperliquid = source_capabilities_for(ExchangeKind::Hyperliquid);
-        assert_eq!(
-            hyperliquid.products,
-            BTreeSet::from([
-                ProductKind::OrderBookL2,
-                ProductKind::Trades,
-                ProductKind::AssetContext,
-                ProductKind::GlobalStatistics,
-            ])
-        );
-        assert_eq!(
-            hyperliquid.subscription_topology,
-            SubscriptionTopology::PerInstrument
-        );
-        assert_eq!(hyperliquid.telemetry_topology, SubscriptionTopology::Global);
-        assert_eq!(hyperliquid.update_model, UpdateModel::SnapshotOnly);
-        assert_eq!(hyperliquid.precision, PrecisionModel::ExactDecimal);
-
-        for kind in [
-            ExchangeKind::Coinbase,
-            ExchangeKind::Kraken,
-            ExchangeKind::Okx,
-            ExchangeKind::Binance,
-        ] {
-            let h0 = source_capabilities_for(kind);
-            assert!(h0.products.is_empty(), "{kind} declares no live products");
-            assert!(h0.provides_reference_data, "{kind} declares reference data");
-            assert_eq!(h0.update_model, UpdateModel::ReferenceData);
-            assert_eq!(
-                h0.subscription_topology,
-                SubscriptionTopology::NotApplicable
-            );
-            assert_eq!(h0.telemetry_topology, SubscriptionTopology::NotApplicable);
-            assert_eq!(h0.heartbeat, HeartbeatMechanism::Disabled);
-            assert_eq!(h0.backpressure, BackpressureBehavior::NotApplicable);
-        }
-
-        for kind in [
-            ExchangeKind::Kalshi,
-            ExchangeKind::Polymarket,
-            ExchangeKind::Hyperliquid,
-            ExchangeKind::Coinbase,
-            ExchangeKind::Kraken,
-            ExchangeKind::Okx,
-            ExchangeKind::Binance,
-        ] {
-            assert_eq!(
-                source_capabilities_for(kind).has_sequence_clock,
-                capabilities_for(kind).has_sequence_clock,
-                "{kind} capability flag changed"
-            );
-        }
-    }
 
     struct LegacyOnlyExchange;
 
@@ -350,5 +212,18 @@ mod tests {
         assert_eq!(declared, SourceCapabilities::from_legacy(true));
         assert!(declared.has_sequence_clock);
         assert!(declared.products.is_empty());
+    }
+
+    #[test]
+    fn offline_capability_declarations_are_conservative() {
+        assert!(!capabilities_for().has_sequence_clock, "no sequence clock");
+        assert!(
+            !source_capabilities_for().has_sequence_clock,
+            "no source sequence clock"
+        );
+        assert!(
+            source_capabilities_for().products.is_empty(),
+            "no products declared"
+        );
     }
 }

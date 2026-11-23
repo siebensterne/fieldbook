@@ -12,379 +12,6 @@ use std::{
 use anyhow::{Context, bail};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
-use url::Url;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum ExchangeKind {
-    #[default]
-    Kalshi,
-    Polymarket,
-    Hyperliquid,
-    Coinbase,
-    Kraken,
-    /// OKX reference-data connector (H0). The connector is a selector, not a
-    /// venue registry: product-type scope is part of instrument identity.
-    Okx,
-    /// Binance reference-data connector (H0). Offline-only discovery; spot and
-    /// perpetual products are distinguished by canonical quote scoping.
-    Binance,
-}
-
-impl std::fmt::Display for ExchangeKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Kalshi => f.write_str("kalshi"),
-            Self::Polymarket => f.write_str("polymarket"),
-            Self::Hyperliquid => f.write_str("hyperliquid"),
-            Self::Coinbase => f.write_str("coinbase"),
-            Self::Kraken => f.write_str("kraken"),
-            Self::Okx => f.write_str("okx"),
-            Self::Binance => f.write_str("binance"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum KalshiEnvironment {
-    /// Live exchange. The collector is read-only, and the default targets
-    /// live markets; production credentials do not authenticate against
-    /// the demo host.
-    #[default]
-    Production,
-    /// Simulated exchange with demo credentials.
-    Demo,
-}
-
-impl KalshiEnvironment {
-    #[must_use]
-    pub fn rest_base(self) -> &'static str {
-        match self {
-            Self::Production => "https://external-api.kalshi.com/trade-api/v2",
-            Self::Demo => "https://demo-api.kalshi.co/trade-api/v2",
-        }
-    }
-
-    #[must_use]
-    pub fn ws_url(self) -> &'static str {
-        match self {
-            Self::Production => "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
-            Self::Demo => "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KalshiSettings {
-    pub environment: KalshiEnvironment,
-    pub key_id: String,
-    pub private_key_path: Option<PathBuf>,
-    /// Number of market tickers per orderbook subscription.
-    pub batch_size: usize,
-    /// REST page size for market discovery (Kalshi maximum: 1000).
-    pub discovery_page_size: usize,
-    pub request_timeout_secs: u64,
-    /// Delay between discovery pages, to stay well inside rate limits.
-    pub discovery_page_delay_ms: u64,
-    /// Override the REST base URL. Production leaves this unset and uses the
-    /// selected environment; the loopback mock exchange in the integration
-    /// tests sets it. Never use this to point a credentialed run at a host
-    /// you do not control.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rest_url: Option<String>,
-    /// Override the websocket URL. Same contract as `rest_url`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ws_url: Option<String>,
-}
-
-impl Default for KalshiSettings {
-    fn default() -> Self {
-        Self {
-            environment: KalshiEnvironment::Production,
-            key_id: String::new(),
-            private_key_path: None,
-            batch_size: 100,
-            discovery_page_size: 1000,
-            request_timeout_secs: 20,
-            discovery_page_delay_ms: 50,
-            rest_url: None,
-            ws_url: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct PolymarketSettings {
-    pub gamma_url: String,
-    pub ws_url: String,
-    /// Number of asset ids per dynamic subscribe/unsubscribe frame. The
-    /// initial snapshot subscription is always sent as one frame.
-    pub batch_size: usize,
-    /// Gamma keyset page size. The endpoint accepts at most 100 records.
-    pub discovery_page_size: usize,
-    pub request_timeout_secs: u64,
-    /// Delay between discovery pages.
-    pub discovery_page_delay_ms: u64,
-    /// Require an explicit `acceptingOrders == true`.
-    ///
-    /// A missing field is unconfirmed and is excluded while this is enabled.
-    /// Disable it to include records whose accepting state is unknown, while
-    /// retaining the active/closed/archived/order-book filters.
-    pub require_accepting_orders: bool,
-}
-
-impl Default for PolymarketSettings {
-    fn default() -> Self {
-        Self {
-            gamma_url: "https://gamma-api.polymarket.com".to_owned(),
-            ws_url: "wss://ws-subscriptions-clob.polymarket.com/ws/market".to_owned(),
-            batch_size: 500,
-            discovery_page_size: 100,
-            request_timeout_secs: 20,
-            discovery_page_delay_ms: 50,
-            require_accepting_orders: true,
-        }
-    }
-}
-
-/// Telemetry subscription settings for Hyperliquid (H1).
-///
-/// Subscriptions are channel-level and venue-wide: `allMids` and
-/// `fastAssetCtxs` are statistics feeds, never book subscriptions. `assetCtxs`
-/// is absent because no checked-in golden fixture pins its wire shape,
-/// so H1 does not subscribe to it. Adding it is a later, fixture-gated change.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HyperliquidTelemetrySettings {
-    /// Telemetry channels to subscribe to on each connection. Only `allMids`
-    /// and `fastAssetCtxs` are supported in H1; any other value is rejected
-    /// rather than silently ignored.
-    pub subscriptions: Vec<String>,
-}
-
-impl Default for HyperliquidTelemetrySettings {
-    fn default() -> Self {
-        Self {
-            subscriptions: vec!["allMids".to_owned(), "fastAssetCtxs".to_owned()],
-        }
-    }
-}
-
-/// Selected-book settings for Hyperliquid (H2).
-///
-/// The book universe is an explicit, finite list of perpetual coin names on the
-/// main DEX. The default contains a finite selection and does not expand to the full
-/// venue universe. Spot instruments are never subscribed to `l2Book` or
-/// `trades`; identity and numeric semantics come from H0 discovery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HyperliquidBookSettings {
-    /// Selected perpetual coin names on the main DEX (for example `BTC`).
-    /// Empty and duplicate entries are ignored by the selection helper.
-    /// The default is a small finite set, not the venue universe.
-    pub perpetuals: Vec<String>,
-    /// Subscribe to the venue `trades` channel for the selected coins. Trades
-    /// are telemetry: they are journaled as `ProtocolControl` observations and
-    /// never become book deltas or coverage anchors.
-    pub trades_telemetry: bool,
-}
-
-impl Default for HyperliquidBookSettings {
-    fn default() -> Self {
-        Self {
-            perpetuals: vec![
-                "BTC", "ETH", "SOL", "ARB", "OP", "AVAX", "LINK", "DOGE", "ADA", "SUI",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            trades_telemetry: true,
-        }
-    }
-}
-
-/// Reference-data, telemetry and selected-book settings for Hyperliquid (H0
-/// reference data, H1 telemetry, H2 selected books/trades).
-///
-/// `reference_fixture` is an explicitly configured offline source for
-/// deterministic discovery. When absent, discovery uses the `info_url` REST
-/// endpoint. `ws_url` and `telemetry` are added with backward-compatible
-/// defaults: an H0 configuration that predates them still deserializes and
-/// now opens a telemetry-only websocket. `books` is likewise defaulted so an
-/// older configuration keeps parsing; the session subscribes to book feeds
-/// only for native symbols present in the desired set.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct HyperliquidSettings {
-    pub info_url: String,
-    /// Public websocket endpoint used by the H1/H2 session.
-    pub ws_url: String,
-    /// Perpetual DEX names to include. The empty string is the main DEX.
-    pub dexs: Vec<String>,
-    pub spot_enabled: bool,
-    pub reference_fixture: Option<PathBuf>,
-    pub request_timeout_secs: u64,
-    pub telemetry: HyperliquidTelemetrySettings,
-    /// H2 selected perpetual books; never the full universe, never spot.
-    pub books: HyperliquidBookSettings,
-}
-
-impl Default for HyperliquidSettings {
-    fn default() -> Self {
-        Self {
-            info_url: "https://api.hyperliquid.xyz/info".to_owned(),
-            ws_url: "wss://api.hyperliquid.xyz/ws".to_owned(),
-            dexs: vec![String::new()],
-            spot_enabled: false,
-            reference_fixture: None,
-            request_timeout_secs: 20,
-            telemetry: HyperliquidTelemetrySettings::default(),
-            books: HyperliquidBookSettings::default(),
-        }
-    }
-}
-
-/// Reference-data settings for Coinbase Exchange (H0).
-///
-/// `reference_fixture` is an explicitly configured offline `products` document
-/// for deterministic discovery. When absent, discovery uses the `rest_url`
-/// `/products` endpoint. H0 opens no websocket and produces no market events;
-/// the session seam is a no-network stub with a disabled heartbeat.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct CoinbaseSettings {
-    /// Public Coinbase Exchange REST base URL used for `/products`.
-    pub rest_url: String,
-    /// Optional offline products fixture. H0 tests and catalog checkpoints use
-    /// this so discovery does not depend on a live venue.
-    pub reference_fixture: Option<PathBuf>,
-    pub request_timeout_secs: u64,
-    /// Require an explicit `status == "online"` and `trading_disabled == false`
-    /// for a product to enter the discovered universe. A missing status is
-    /// unconfirmed and is excluded while this is enabled.
-    pub require_online: bool,
-}
-
-impl Default for CoinbaseSettings {
-    fn default() -> Self {
-        Self {
-            rest_url: "https://api.exchange.coinbase.com".to_owned(),
-            reference_fixture: None,
-            request_timeout_secs: 20,
-            require_online: true,
-        }
-    }
-}
-
-/// Reference-data settings for Kraken (H0).
-///
-/// `reference_fixture` is an explicitly configured offline `AssetPairs`-style
-/// document used for deterministic discovery. When absent, discovery performs
-/// a read-only GET against `asset_pairs_url`. No websocket is opened during H0
-/// discovery. `pairs` is an optional explicit selection of venue pair keys or
-/// canonical `BASE/QUOTE` identities; an empty list selects every active pair.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct KrakenSettings {
-    /// Public REST endpoint serving the `AssetPairs` document.
-    pub asset_pairs_url: String,
-    /// Optional offline `AssetPairs`-style fixture for deterministic discovery.
-    pub reference_fixture: Option<PathBuf>,
-    /// Explicit pair selection. Empty means all active pairs.
-    pub pairs: Vec<String>,
-    pub request_timeout_secs: u64,
-}
-
-impl Default for KrakenSettings {
-    fn default() -> Self {
-        Self {
-            asset_pairs_url: "https://api.kraken.com/0/public/AssetPairs".to_owned(),
-            reference_fixture: None,
-            pairs: Vec::new(),
-            request_timeout_secs: 20,
-        }
-    }
-}
-
-/// H0 reference-data settings for OKX.
-///
-/// H0 opens no socket: discovery reads an explicitly configured offline
-/// `instruments`-style document. `inst_types` scopes which OKX product types
-/// enter the universe (currently SPOT and SWAP); an instrument outside that
-/// list is out of universe, never silently added. `rest_url` is recorded as the
-/// planned H1 REST endpoint and is the probe's default target; H0 never dials
-/// it. Unknown fields are denied so a misspelled key fails at load time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct OkxSettings {
-    /// OKX `instType` values in scope. Only SPOT and SWAP decode in H0; other
-    /// values are filtered out by the codec rather than admitted by default.
-    pub inst_types: Vec<String>,
-    /// Offline `instruments` document used by H0 discovery. When absent, H0
-    /// discovery fails closed: live REST discovery is a planned H1 stage.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reference_fixture: Option<PathBuf>,
-    /// Planned public REST base for H1 instrument discovery. H0 does not use
-    /// it to open a connection.
-    pub rest_url: String,
-    /// Request timeout for the planned H1 REST client.
-    pub request_timeout_secs: u64,
-}
-
-impl Default for OkxSettings {
-    fn default() -> Self {
-        Self {
-            inst_types: vec!["SPOT".to_owned(), "SWAP".to_owned()],
-            reference_fixture: None,
-            rest_url: "https://www.okx.com/api/v5/public/instruments".to_owned(),
-            request_timeout_secs: 20,
-        }
-    }
-}
-
-/// Reference-data settings for Binance (H0).
-///
-/// H0 is offline-only: discovery reads an explicitly configured
-/// `exchangeInfo`-style fixture, never a network endpoint. The two URLs are
-/// documented endpoints reserved for later staged gates; they are not
-/// contacted here. `canonical_quotes` bounds the universe to a single quote
-/// currency per product type, so a symbol quoting anything else is excluded
-/// rather than silently merged under a bare base-asset name.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct BinanceSettings {
-    /// Public spot `exchangeInfo` endpoint (reserved for a later stage).
-    pub spot_info_url: String,
-    /// Public USDⓈ-M futures `exchangeInfo` endpoint (reserved for a later stage).
-    pub perp_info_url: String,
-    /// Quote assets admitted as canonical. Symbols quoting any other asset are
-    /// excluded from discovery.
-    pub canonical_quotes: Vec<String>,
-    /// Include spot `exchangeInfo` symbols in discovery.
-    pub spot_enabled: bool,
-    /// Include perpetual `exchangeInfo` symbols in discovery.
-    pub perp_enabled: bool,
-    /// Explicit offline reference fixture. Required in H0; no network fallback.
-    pub reference_fixture: Option<PathBuf>,
-    pub request_timeout_secs: u64,
-}
-
-impl Default for BinanceSettings {
-    fn default() -> Self {
-        Self {
-            spot_info_url: "https://api.binance.com/api/v3/exchangeInfo".to_owned(),
-            perp_info_url: "https://fapi.binance.com/fapi/v1/exchangeInfo".to_owned(),
-            canonical_quotes: vec!["USDT".to_owned()],
-            spot_enabled: true,
-            perp_enabled: true,
-            reference_fixture: None,
-            request_timeout_secs: 20,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -419,19 +46,15 @@ pub struct CollectorSettings {
     pub writer_queue: usize,
     /// Flush cadence for partial SBE chunks.
     pub flush_interval_secs: u64,
-    /// Cap on selected venue market records (0 means no cap).
-    ///
-    /// One Polymarket Gamma record can contribute several outcome tokens; the
-    /// cap is applied between records, never inside one record's outcome set.
-    /// Kalshi publishes one symbol per market, so the same contract applies.
+    /// Cap on selected venue market records (0 means no cap). The cap is
+    /// applied between discovery records, never inside one record's outcome
+    /// set, so a multi-outcome record is never silently truncated.
     pub max_markets: usize,
     /// Dedicated market-lifecycle control-plane connections. Book shards carry
     /// only order-book subscriptions; this many supervised lifecycle sockets
-    /// carry `market_lifecycle_v2`. Kalshi-only: other venues expose no
-    /// separate lifecycle channel and ignore this value (it is not counted in
-    /// their connection budget). Set to 0 to disable the lifecycle plane;
-    /// new markets then enter only via REST discovery and terminal removals
-    /// are deferred to the reconciliation cadence.
+    /// carry lifecycle traffic. An adapter without a separate lifecycle channel
+    /// ignores this value and does not charge it to its connection budget.
+    /// Set to 0 to disable the lifecycle plane.
     pub lifecycle_replicas: usize,
     /// Optional run duration; 0 means run until SIGINT/SIGTERM.
     pub duration_secs: u64,
@@ -633,7 +256,7 @@ pub struct NetworkSettings {
     /// the name of the approved egress path. Recorded verbatim; credentials
     /// must never be placed here.
     pub proxy_label: Option<String>,
-    /// Venue this transport serves. Derived from `exchange` at settings load
+    /// Venue this transport serves. Supplied by the caller at settings load
     /// time; never read from a file or environment. A standalone transport
     /// uses a loopback-only test identity; an empty venue denies.
     #[serde(skip)]
@@ -659,7 +282,7 @@ impl Default for NetworkSettings {
             proxy_remote_dns: true,
             proxy_label: None,
             // A standalone transport default is a loopback test transport.
-            // Settings derived from an exchange replace it with that venue.
+            // Callers replace it with the venue they are authorized to use.
             venue: "loopback".to_owned(),
             declared_intent: None,
         }
@@ -765,15 +388,7 @@ pub struct GovernanceSettings {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct FileConfig {
-    pub exchange: ExchangeKind,
     pub governance: GovernanceSettings,
-    pub kalshi: KalshiSettings,
-    pub polymarket: PolymarketSettings,
-    pub hyperliquid: HyperliquidSettings,
-    pub coinbase: CoinbaseSettings,
-    pub kraken: KrakenSettings,
-    pub okx: OkxSettings,
-    pub binance: BinanceSettings,
     pub collector: CollectorSettings,
     pub network: NetworkSettings,
     pub output: OutputSettings,
@@ -783,15 +398,7 @@ pub struct FileConfig {
 
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
-    pub exchange: ExchangeKind,
     pub governance: GovernanceSettings,
-    pub kalshi: KalshiSettings,
-    pub polymarket: PolymarketSettings,
-    pub hyperliquid: HyperliquidSettings,
-    pub coinbase: CoinbaseSettings,
-    pub kraken: KrakenSettings,
-    pub okx: OkxSettings,
-    pub binance: BinanceSettings,
     pub collector: CollectorSettings,
     pub network: NetworkSettings,
     pub output: OutputSettings,
@@ -800,32 +407,21 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Built-in defaults for one explicit venue, without reading configuration
-    /// files or environment variables. Tests use this so their behavior does
-    /// not depend on a developer's shell.
+    /// Built-in defaults with an explicit non-secret venue label, without
+    /// reading configuration files or environment variables. Offline tests
+    /// and replay use this so their behavior does not depend on a shell.
     #[must_use]
-    pub fn for_exchange(exchange: ExchangeKind) -> Self {
-        let file = FileConfig {
-            exchange,
-            ..FileConfig::default()
-        };
+    pub fn for_venue(venue: &str) -> Self {
+        let file = FileConfig::default();
         let mut settings = Self {
-            exchange: file.exchange,
             governance: file.governance,
-            kalshi: file.kalshi,
-            polymarket: file.polymarket,
-            hyperliquid: file.hyperliquid,
-            coinbase: file.coinbase,
-            kraken: file.kraken,
-            okx: file.okx,
-            binance: file.binance,
             collector: file.collector,
             network: file.network,
             output: file.output,
             metrics: file.metrics,
             journal: file.journal,
         };
-        settings.sync_venue();
+        settings.network.venue = venue.to_owned();
         settings
     }
 
@@ -840,15 +436,7 @@ impl Settings {
             None => FileConfig::default(),
         };
         let mut settings = Self {
-            exchange: file.exchange,
             governance: file.governance,
-            kalshi: file.kalshi,
-            polymarket: file.polymarket,
-            hyperliquid: file.hyperliquid,
-            coinbase: file.coinbase,
-            kraken: file.kraken,
-            okx: file.okx,
-            binance: file.binance,
             collector: file.collector,
             network: file.network,
             output: file.output,
@@ -856,7 +444,6 @@ impl Settings {
             journal: file.journal,
         };
         settings.apply_environment()?;
-        settings.sync_venue();
         settings.load_declared_intent(path.and_then(Path::parent))?;
         settings.network.declared_intent = settings.governance.declared_intent.clone();
         settings.validate()?;
@@ -880,37 +467,7 @@ impl Settings {
         Ok(())
     }
 
-    /// Keep the egress venue derived from the effective exchange selection.
-    pub fn sync_venue(&mut self) {
-        self.network.venue = self.exchange.to_string();
-    }
-
     fn apply_environment(&mut self) -> anyhow::Result<()> {
-        if let Ok(exchange) = std::env::var("COLLECTOR_EXCHANGE") {
-            self.exchange = match exchange.to_ascii_lowercase().as_str() {
-                "kalshi" => ExchangeKind::Kalshi,
-                "polymarket" => ExchangeKind::Polymarket,
-                "hyperliquid" => ExchangeKind::Hyperliquid,
-                "coinbase" => ExchangeKind::Coinbase,
-                "kraken" => ExchangeKind::Kraken,
-                "okx" => ExchangeKind::Okx,
-                "binance" => ExchangeKind::Binance,
-                other => bail!("unknown COLLECTOR_EXCHANGE `{other}`"),
-            };
-        }
-        if let Ok(value) = std::env::var("KALSHI_ENVIRONMENT") {
-            self.kalshi.environment = match value.to_ascii_lowercase().as_str() {
-                "production" | "prod" => KalshiEnvironment::Production,
-                "demo" => KalshiEnvironment::Demo,
-                other => bail!("unknown KALSHI_ENVIRONMENT `{other}`"),
-            };
-        }
-        if let Ok(value) = std::env::var("KALSHI_API_KEY_ID") {
-            self.kalshi.key_id = value;
-        }
-        if let Ok(value) = std::env::var("KALSHI_PRIVATE_KEY_PATH") {
-            self.kalshi.private_key_path = Some(PathBuf::from(value));
-        }
         if let Ok(value) = std::env::var("COLLECTOR_OUTPUT") {
             self.output.path = value;
         }
@@ -929,12 +486,11 @@ impl Settings {
 
     /// SHA-256 of the capture-affecting configuration.
     ///
-    /// The digest covers the exchange, collector, network, output, and journal
+    /// The digest covers the collector, network, output, and journal
     /// sections. Credentials are excluded so the value can be published in a
     /// journal manifest without exposing secrets.
     pub fn capture_config_sha256(&self) -> anyhow::Result<String> {
         let canonical = serde_json::json!({
-            "exchange": self.exchange,
             "collector": self.collector,
             "network": self.network,
             "output": self.output,
@@ -1124,52 +680,6 @@ impl Settings {
         );
         anyhow::ensure!(!self.output.path.is_empty(), "output path is empty");
         validate_output_paths(self)?;
-        anyhow::ensure!(
-            self.kalshi.batch_size >= 1 && self.kalshi.batch_size <= 1000,
-            "kalshi.batch_size must be in [1, 1000]"
-        );
-        anyhow::ensure!(
-            self.kalshi.discovery_page_size >= 1 && self.kalshi.discovery_page_size <= 1000,
-            "kalshi.discovery_page_size must be in [1, 1000]"
-        );
-        anyhow::ensure!(
-            self.polymarket.batch_size >= 1,
-            "polymarket.batch_size must be >= 1"
-        );
-        anyhow::ensure!(
-            self.polymarket.discovery_page_size >= 1 && self.polymarket.discovery_page_size <= 100,
-            "polymarket.discovery_page_size must be in [1, 100]"
-        );
-        validate_endpoint(
-            "polymarket.gamma_url",
-            &self.polymarket.gamma_url,
-            "https",
-            Some("http"),
-        )?;
-        validate_endpoint(
-            "polymarket.ws_url",
-            &self.polymarket.ws_url,
-            "wss",
-            Some("ws"),
-        )?;
-        validate_endpoint(
-            "coinbase.rest_url",
-            &self.coinbase.rest_url,
-            "https",
-            Some("http"),
-        )?;
-        validate_endpoint(
-            "Kalshi REST base URL",
-            self.kalshi.environment.rest_base(),
-            "https",
-            None,
-        )?;
-        validate_endpoint(
-            "Kalshi websocket URL",
-            self.kalshi.environment.ws_url(),
-            "wss",
-            None,
-        )?;
         Ok(())
     }
 
@@ -1177,55 +687,6 @@ impl Settings {
     pub fn discovery_interval(&self) -> Duration {
         Duration::from_secs(self.collector.discovery_interval_secs)
     }
-}
-
-/// Validate a network endpoint without assuming a particular hostname.
-///
-/// Production endpoints must use TLS. Plain HTTP/WS is accepted only for a
-/// loopback host, which keeps local integration tests possible without
-/// permitting accidental plaintext traffic to a remote exchange or proxy.
-fn validate_endpoint(
-    name: &str,
-    value: &str,
-    secure_scheme: &str,
-    plain_scheme: Option<&str>,
-) -> anyhow::Result<Url> {
-    let url = Url::parse(value).with_context(|| format!("invalid {name}"))?;
-    anyhow::ensure!(!url.cannot_be_a_base(), "{name} must be a hierarchical URL");
-    anyhow::ensure!(
-        url.host_str().is_some_and(|host| !host.is_empty()),
-        "{name} must include a host"
-    );
-    anyhow::ensure!(
-        url.username().is_empty() && url.password().is_none(),
-        "{name} must not embed credentials"
-    );
-    anyhow::ensure!(
-        url.query().is_none() && url.fragment().is_none(),
-        "{name} must not contain a query or fragment"
-    );
-    anyhow::ensure!(url.port() != Some(0), "{name} must not use port 0");
-    let scheme = url.scheme();
-    let secure = scheme == secure_scheme;
-    let plain = plain_scheme.is_some_and(|plain| scheme == plain);
-    let loopback = url.host_str().is_some_and(|host| {
-        let host = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-    });
-    anyhow::ensure!(
-        secure || (plain && loopback),
-        "{name} must use {secure_scheme}{}",
-        plain_scheme.map_or_else(String::new, |plain| format!(
-            " (or {plain} only for a loopback host)"
-        ))
-    );
-    Ok(url)
 }
 
 /// Validate that the capture and every sidecar resolve to distinct files.
@@ -1458,26 +919,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coinbase_settings_default_to_public_reference_data() {
-        let settings = Settings::for_exchange(ExchangeKind::Coinbase);
-        assert_eq!(settings.exchange, ExchangeKind::Coinbase);
-        assert_eq!(
-            settings.coinbase.rest_url,
-            "https://api.exchange.coinbase.com"
-        );
-        assert!(settings.coinbase.require_online);
-        assert!(settings.coinbase.reference_fixture.is_none());
-        assert_eq!(ExchangeKind::Coinbase.to_string(), "coinbase");
-        settings
-            .validate()
-            .expect("default Coinbase settings validate");
-    }
-
-    #[test]
     fn capture_fingerprint_tracks_capture_settings_not_credentials() {
-        let mut settings = Settings::for_exchange(ExchangeKind::Polymarket);
+        let mut settings = Settings::for_venue("securities");
         let first = settings.capture_config_sha256().expect("fingerprint");
-        settings.kalshi.key_id = "not-part-of-the-fingerprint".to_owned();
+        settings.governance.rights_file = Some(PathBuf::from("not-part-of-the-fingerprint.toml"));
         assert_eq!(
             first,
             settings.capture_config_sha256().expect("fingerprint")
@@ -1487,47 +932,6 @@ mod tests {
             first,
             settings.capture_config_sha256().expect("fingerprint")
         );
-    }
-
-    #[test]
-    fn okx_exchange_kind_is_lowercase_serialized_and_displayed() {
-        assert_eq!(ExchangeKind::Okx.to_string(), "okx");
-        assert_eq!(
-            serde_json::to_string(&ExchangeKind::Okx).unwrap(),
-            "\"okx\""
-        );
-        assert_eq!(
-            serde_json::from_str::<ExchangeKind>("\"okx\"").unwrap(),
-            ExchangeKind::Okx
-        );
-        let settings = Settings::for_exchange(ExchangeKind::Okx);
-        assert_eq!(settings.exchange, ExchangeKind::Okx);
-        assert_eq!(settings.okx.inst_types, vec!["SPOT", "SWAP"]);
-        assert!(settings.okx.reference_fixture.is_none());
-        assert!(settings.okx.rest_url.starts_with("https://"));
-    }
-
-    #[test]
-    fn kalshi_defaults_to_production() {
-        assert_eq!(KalshiEnvironment::default(), KalshiEnvironment::Production);
-        let settings = KalshiSettings::default();
-        assert_eq!(settings.environment, KalshiEnvironment::Production);
-        assert!(settings.environment.ws_url().contains("external-api-ws"));
-        assert!(!settings.environment.ws_url().contains("demo"));
-        assert!(settings.environment.rest_base().contains("external-api"));
-    }
-
-    #[test]
-    fn binance_settings_defaults_are_offline_and_quote_scoped() {
-        let settings = Settings::for_exchange(ExchangeKind::Binance);
-        assert_eq!(settings.exchange, ExchangeKind::Binance);
-        assert_eq!(settings.exchange.to_string(), "binance");
-        assert!(settings.binance.reference_fixture.is_none());
-        assert_eq!(settings.binance.canonical_quotes, vec!["USDT".to_owned()]);
-        assert!(settings.binance.spot_enabled && settings.binance.perp_enabled);
-        let parsed: BinanceSettings = toml::from_str("canonical_quotes = [\"USDT\"]").unwrap();
-        assert!(parsed.spot_info_url.starts_with("https://"));
-        assert!(parsed.perp_info_url.starts_with("https://"));
     }
 
     #[test]
@@ -1662,21 +1066,17 @@ mod tests {
         assert!(settings.validate().is_err());
     }
 
-    fn settings_with_urls(gamma: &str, ws: &str) -> Settings {
-        let mut settings = Settings::load(None).unwrap();
-        settings.polymarket.gamma_url = gamma.to_owned();
-        settings.polymarket.ws_url = ws.to_owned();
-        settings
-    }
-
     #[test]
     fn checked_in_examples_parse_and_validate() {
-        for path in ["config.example.toml", "config.polymarket.example.toml"] {
-            let settings = Settings::load(Some(Path::new(path)))
-                .unwrap_or_else(|error| panic!("{path} must load: {error:#}"));
-            assert_eq!(settings.collector.catalog_mode, CatalogMode::Off);
-            assert!(!settings.output.overwrite);
-        }
+        let settings = Settings::load(Some(Path::new("config.example.toml")))
+            .expect("config.example.toml must load");
+        assert_eq!(
+            settings.collector.catalog_mode,
+            CatalogMode::Off,
+            "catalog off"
+        );
+        assert!(!settings.output.overwrite, "overwrite disabled");
+        settings.validate().expect("example config must validate");
     }
 
     #[test]
@@ -1740,57 +1140,6 @@ mod tests {
         settings.network.source_ip = Some("127.0.0.1".parse().unwrap());
         settings.network.source_port = Some(40_000);
         settings.network.connect_race = 1;
-        assert!(settings.validate().is_ok());
-    }
-
-    #[test]
-    fn validates_url_scheme_host_and_loopback_policy() {
-        assert!(
-            settings_with_urls(
-                "https://gamma-api.polymarket.com",
-                "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-            )
-            .validate()
-            .is_ok()
-        );
-        assert!(
-            settings_with_urls("http://127.0.0.1:8080", "ws://[::1]:8080/ws")
-                .validate()
-                .is_ok()
-        );
-        assert!(
-            settings_with_urls("http://localhost:8080", "ws://localhost:8080/ws")
-                .validate()
-                .is_ok()
-        );
-        for (gamma, ws) in [
-            ("file:///etc/passwd", "wss://example.com/ws"),
-            ("https://", "wss://example.com/ws"),
-            ("https://user:pass@example.com", "wss://example.com/ws"),
-            ("https://example.com?token=secret", "wss://example.com/ws"),
-            ("ftp://example.com", "wss://example.com/ws"),
-            ("http://example.com", "wss://example.com/ws"),
-            ("http://localhost.evil", "wss://example.com/ws"),
-            ("https://example.com:0", "wss://example.com/ws"),
-            ("https://gamma-api.polymarket.com", "ws://example.com/ws"),
-            (
-                "https://gamma-api.polymarket.com",
-                "wss://example.com/ws#fragment",
-            ),
-        ] {
-            assert!(
-                settings_with_urls(gamma, ws).validate().is_err(),
-                "expected rejection for {gamma} / {ws}"
-            );
-        }
-    }
-
-    #[test]
-    fn enforces_the_gamma_keyset_page_limit() {
-        let mut settings = Settings::load(None).unwrap();
-        settings.polymarket.discovery_page_size = 101;
-        assert!(settings.validate().is_err());
-        settings.polymarket.discovery_page_size = 100;
         assert!(settings.validate().is_ok());
     }
 }

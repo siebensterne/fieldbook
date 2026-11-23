@@ -1,5 +1,7 @@
 # Design decisions
 
+> **RRP-003 notice (2026-11-23).** Venue-specific examples and adapter references below describe families retired under RRP-003. They are retained as historical design rationale, not active capability claims. See `product-scope-retirement-2026-11-23.md`.
+
 > Historical record. Test paths named below were retired under RRP-002
 > (owner directive D11) and are not available in the active tree. This
 > document is preserved unchanged except for this notice; see

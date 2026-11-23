@@ -1,5 +1,7 @@
 # Cross-venue market data platform charter
 
+> **RRP-003 notice (2026-11-23).** Venue-specific examples and adapter references below describe families retired under RRP-003. They are retained as historical design rationale, not active capability claims. See `product-scope-retirement-2026-11-23.md`.
+
 This document defines the target domain and adapter boundaries for the
 platform. It is a design decision, not a description of current support.
 [`architecture.md`](architecture.md) remains the authoritative description of

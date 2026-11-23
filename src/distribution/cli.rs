@@ -7,8 +7,6 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use crate::config::CatalogMode;
-use crate::config::ExchangeKind;
-use crate::config::KalshiEnvironment;
 use crate::config::Settings;
 
 #[derive(Debug, Parser)]
@@ -16,7 +14,7 @@ use crate::config::Settings;
     name = "fieldbook",
     version,
     arg_required_else_help = true,
-    about = "Low-latency prediction-market order-book collector",
+    about = "Securities market-data acquisition, durability and release platform",
     long_about = "An explicit subcommand is required; running with no command \
                   starts no provider activity. Live commands (collect, discover, \
                   latency, network-probe, analytics-export) also require a \
@@ -43,20 +41,6 @@ pub struct Cli {
     /// is the request evaluated against the rights file, not a grant.
     #[arg(long = "egress-intent-file", global = true, value_name = "FILE")]
     pub egress_intent_file: Option<PathBuf>,
-
-    #[arg(long, global = true, value_enum)]
-    pub exchange: Option<ExchangeKind>,
-
-    #[arg(long = "kalshi-environment", global = true, value_enum)]
-    pub kalshi_environment: Option<KalshiEnvironment>,
-
-    /// Kalshi API key id.
-    #[arg(long = "kalshi-key-id", global = true)]
-    pub kalshi_key_id: Option<String>,
-
-    /// Path to a PEM-encoded Kalshi private key.
-    #[arg(long = "kalshi-private-key", global = true, value_name = "FILE")]
-    pub kalshi_private_key: Option<PathBuf>,
 
     /// Disable `TCP_NODELAY` on websocket sockets.
     #[arg(long = "no-tcp-nodelay", global = true)]
@@ -129,8 +113,8 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub replicas: Option<usize>,
 
-    /// Kalshi only: dedicated market-lifecycle control-plane sockets
-    /// (`market_lifecycle_v2`). Book shards never carry lifecycle subscriptions.
+    /// Dedicated market-lifecycle control-plane sockets. Book shards never
+    /// carry lifecycle subscriptions.
     #[arg(long, global = true, value_name = "N")]
     pub lifecycle_replicas: Option<usize>,
 
@@ -342,9 +326,6 @@ pub fn gated_operations(command: &Command) -> &'static [crate::rights::Operation
 
 impl Cli {
     pub fn apply_settings(&self, settings: &mut Settings) -> anyhow::Result<()> {
-        if let Some(exchange) = self.exchange {
-            settings.exchange = exchange;
-        }
         if let Some(path) = &self.rights_file {
             settings.governance.rights_file = Some(path.clone());
         }
@@ -356,15 +337,6 @@ impl Cli {
             let intent = crate::egress_intent::EgressIntent::load(path)?;
             settings.governance.declared_intent = Some(intent.clone());
             settings.network.declared_intent = Some(intent);
-        }
-        if let Some(environment) = self.kalshi_environment {
-            settings.kalshi.environment = environment;
-        }
-        if let Some(key_id) = &self.kalshi_key_id {
-            settings.kalshi.key_id = key_id.clone();
-        }
-        if let Some(path) = &self.kalshi_private_key {
-            settings.kalshi.private_key_path = Some(path.clone());
         }
         if self.no_tcp_nodelay {
             settings.network.tcp_nodelay = false;
@@ -444,7 +416,6 @@ impl Cli {
         if let Some(duration_secs) = self.duration_secs {
             settings.collector.duration_secs = duration_secs;
         }
-        settings.sync_venue();
         settings
             .validate()
             .context("validating command-line overrides")?;
@@ -516,14 +487,14 @@ mod tests {
             "fieldbook",
             "journal",
             "recover",
-            "/var/lib/prediction/journal/run-1",
+            "/var/lib/securities/journal/run-1",
         ])
         .expect("parse journal recover command");
         assert!(matches!(
             cli.command,
             Some(Command::Journal {
                 command: JournalCommand::Recover { run }
-            }) if run == Path::new("/var/lib/prediction/journal/run-1")
+            }) if run == Path::new("/var/lib/securities/journal/run-1")
         ));
     }
 }

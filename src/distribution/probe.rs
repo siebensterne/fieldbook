@@ -19,7 +19,7 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::{
-    config::{ExchangeKind, Settings},
+    config::Settings,
     egress::{EgressRoute, RouteProvenance},
     rights::Operation,
     util::sha256_hex,
@@ -99,9 +99,10 @@ pub fn classify_reason(error: &anyhow::Error) -> String {
 /// Run the probe against `target` using the loaded settings, resolving the
 /// route from the process environment.
 ///
-/// The default target is the websocket endpoint of the configured exchange;
-/// `--target` overrides it verbatim. A configuration-level failure is a
-/// failed report (`reason: "config"`), not a panic.
+/// A target must be supplied explicitly with `--target`; no venue endpoint
+/// default is registered after the RRP-003 adapter retirement. A
+/// configuration-level failure is a failed report (`reason: "config"`), not a
+/// panic.
 pub async fn run(settings: &Settings, target: Option<&str>) -> anyhow::Result<ProbeReport> {
     match EgressRoute::from_network(&settings.network) {
         Ok(route) => run_with_route(settings, route, target).await,
@@ -120,7 +121,11 @@ pub async fn run_with_route(
     route: EgressRoute,
     target: Option<&str>,
 ) -> anyhow::Result<ProbeReport> {
-    let target = target.map_or_else(|| default_target(settings), str::to_owned);
+    let Some(target) = target else {
+        anyhow::bail!(
+            "network-probe requires an explicit --target; no venue endpoint default is registered"
+        );
+    };
     let provenance = route.provenance(&settings.network);
     // The probe declares a source-contact request from the caller-supplied
     // intent and the actual target. No permission is inferred from the target.
@@ -128,7 +133,7 @@ pub async fn run_with_route(
         .network
         .declared_intent
         .as_ref()
-        .map(|declared| declared.for_source_contact(&target))
+        .map(|declared| declared.for_source_contact(target))
         .transpose()?;
 
     let mut options = ConnectOptions {
@@ -149,7 +154,7 @@ pub async fn run_with_route(
     };
 
     let started = Instant::now();
-    let outcome = ws::connect(&target, &[], &options).await;
+    let outcome = ws::connect(target, &[], &options).await;
     let total_us = started.elapsed().as_micros() as u64;
     let trace = options.trace.take();
     let stages = trace.map(ProbeTrace::finish).unwrap_or_default();
@@ -166,7 +171,7 @@ pub async fn run_with_route(
             .or(option_env!("GITHUB_SHA"))
             .unwrap_or("unknown"),
         route: provenance,
-        target,
+        target: target.to_owned(),
         stages,
         total_us,
         result,
@@ -202,19 +207,12 @@ fn failed_config_report(target: &str) -> ProbeReport {
     }
 }
 
-fn default_target(settings: &Settings) -> String {
-    match settings.exchange {
-        ExchangeKind::Kalshi => settings.kalshi.environment.ws_url().to_owned(),
-        ExchangeKind::Polymarket => settings.polymarket.ws_url.clone(),
-        ExchangeKind::Hyperliquid => settings.hyperliquid.info_url.clone(),
-        ExchangeKind::Coinbase => settings.coinbase.rest_url.clone(),
-        ExchangeKind::Kraken => settings.kraken.asset_pairs_url.clone(),
-        // H0 opens no socket; the planned H1 REST endpoint is the probe target.
-        ExchangeKind::Okx => settings.okx.rest_url.clone(),
-        // H0 is offline-only; the spot exchangeInfo URL is the documented
-        // endpoint reserved for a later stage, not a claim of live access.
-        ExchangeKind::Binance => settings.binance.spot_info_url.clone(),
-    }
+/// Diagnostic placeholder used only in a configuration-failure report.
+///
+/// A live probe always requires an explicit target; no venue endpoint is
+/// registered in the retired-adapter tree.
+fn default_target(_settings: &Settings) -> String {
+    "unspecified".to_owned()
 }
 
 /// Serialize a report to JSON text. Serialization of this fixed schema

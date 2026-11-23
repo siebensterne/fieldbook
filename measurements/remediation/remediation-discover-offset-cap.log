@@ -1,5 +1,0 @@
-Error: discovering polymarket markets
-
-Caused by:
-    Polymarket discovery HTTP 422: {"type":"validation error","error":"offset too large, use /markets/keyset for deeper pagination"}
-    

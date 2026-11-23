@@ -23,7 +23,8 @@ authoritative when this summary and a policy differ.
   `git-policy.json`.
 - Authorship, license and provenance: `ORIGIN.md`.
 - Style and formatting: `docs/style-standards.md`.
-- Live evidence and egress: `docs/live-evidence-runbook.md`.
+- Current scope and operating bounds: `docs/operating-envelope.md`.
+- Rights and egress enforcement: `docs/rights-enforcement-2026-11-23.md`.
 
 A passing check does not authorize provider contact, dataset collection or
 live execution.

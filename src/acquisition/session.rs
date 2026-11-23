@@ -129,8 +129,8 @@ impl SessionFrame {
     /// inbound evidence and (for a peer Ping) the outbound Pong result.
     ///
     /// `pong_signal` is the venue's interpretation of an inbound native Pong:
-    /// `HeartbeatAck` where native Pong acknowledges a client heartbeat
-    /// (Kalshi), `ProtocolControl` where it does not (Polymarket).
+    /// `HeartbeatAck` where native Pong acknowledges a client heartbeat,
+    /// `ProtocolControl` where it does not.
     #[must_use]
     pub fn native_control(
         payload: crate::ws::WsPayload,
@@ -1216,9 +1216,9 @@ async fn handle_control(
 /// Cancellation safety lives in the session contract, not in a buffer here: a
 /// poll dropped while awaiting a read loses no data because the transport
 /// keeps read state inside the session, and a decoded data frame is returned
-/// without further await points. Control-frame handling that does await
-/// (Kalshi's reconcile and rate-limit backoff) is re-driven by its
-/// acknowledgement timeout, which self-heals through a reconnect.
+/// without further await points. Control-frame handling that does await is
+/// re-driven by its acknowledgement timeout, which self-heals through a
+/// reconnect.
 async fn read_next_frame(
     session: &mut Option<Box<dyn MarketDataSession>>,
 ) -> Result<SessionFrame, SessionFailure> {
@@ -1737,7 +1737,6 @@ fn truncate_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exchange::Exchange as _;
     use crate::protocol::{FrameClassification, FrameDirection};
     use std::sync::{
         Arc,
@@ -1916,78 +1915,6 @@ mod tests {
         assert_eq!(observations[1].receive_seq, Some(1));
     }
 
-    #[tokio::test]
-    async fn stalled_connect_reports_status_and_stops_cleanly() {
-        // A TCP listener that accepts and never upgrades the handshake. The
-        // connect deadline must turn this into a bounded, reported failure
-        // rather than a wedge.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((stream, _)) = listener.accept().await {
-                held.push(stream);
-            }
-        });
-
-        let mut settings =
-            crate::config::Settings::for_exchange(crate::config::ExchangeKind::Polymarket);
-        settings.polymarket.ws_url = format!("ws://{address}");
-        settings.network.connect_timeout_secs = 1;
-        // This is an offline loopback test: use the loopback transport identity
-        // so no provider rights are needed for the local HTTP client or socket.
-        settings.network.venue = "loopback".to_owned();
-        let exchange = std::sync::Arc::new(
-            crate::exchange::polymarket::PolymarketExchange::new(
-                settings.polymarket.clone(),
-                settings.network.clone(),
-            )
-            .unwrap(),
-        );
-        let factory = exchange.session_factory();
-
-        let (event_tx, mut event_rx) = mpsc::channel(64);
-        let (_command_tx, command_rx) = mpsc::channel(8);
-        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
-        let config = WorkerConfig::from_settings(&settings.collector);
-        let worker = tokio::spawn(run_worker(
-            factory,
-            SourceId::new(0, 0),
-            command_rx,
-            event_tx,
-            config,
-            shutdown_rx,
-        ));
-
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-        let mut saw_failure = false;
-        while !saw_failure && tokio::time::Instant::now() < deadline {
-            let event = match tokio::time::timeout_at(deadline, event_rx.recv()).await {
-                Ok(Some(event)) => event,
-                _ => break,
-            };
-            if let WorkerEvent::Status(status) = event
-                && !status.connected
-                && status
-                    .last_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("timed out"))
-            {
-                saw_failure = true;
-            }
-        }
-        assert!(
-            saw_failure,
-            "the stalled handshake must fail within the connect deadline and be reported"
-        );
-
-        // Shutdown still stops the worker promptly, even after a stalled
-        // attempt.
-        let _ = shutdown_tx.send(());
-        let stopped = tokio::time::timeout(Duration::from_secs(10), worker).await;
-        assert!(stopped.is_ok(), "worker did not stop after shutdown");
-    }
-
     struct ConnectGauge {
         current: AtomicUsize,
         maximum: AtomicUsize,
@@ -2049,8 +1976,7 @@ mod tests {
 
     #[tokio::test]
     async fn connect_concurrency_is_bounded_across_workers() {
-        let mut settings =
-            crate::config::Settings::for_exchange(crate::config::ExchangeKind::Polymarket);
+        let mut settings = crate::config::Settings::for_venue("loopback");
         settings.collector.connect_concurrency = 2;
         let gauge = Arc::new(ConnectGauge {
             current: AtomicUsize::new(0),

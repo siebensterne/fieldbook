@@ -4,7 +4,7 @@
 //! selected venue records and outcome symbols into the resources the run will
 //! use and rejects a configuration that exceeds a declared ceiling. The
 //! estimates are conservative fixed costs, recorded in
-//! `docs/operating-envelope.md`; they are planning bounds, not a substitute for
+//! the current-state scope record; they are planning bounds, not a substitute for
 //! the measured scale runs.
 
 use std::collections::BTreeSet;
@@ -77,19 +77,10 @@ pub fn plan(settings: &Settings, markets: &[MarketInfo]) -> anyhow::Result<Capac
     let selected_markets = count_selected_markets(markets);
     let shards = derive_shard_count(settings, outcome_symbols)?;
     let replicas = settings.collector.replicas;
-    let lifecycle_connections = match settings.exchange {
-        crate::config::ExchangeKind::Kalshi => settings.collector.lifecycle_replicas,
-        // Polymarket, Hyperliquid, Coinbase, Kraken and OKX have no separate
-        // lifecycle channel. Binance H0 is reference-data only and declares
-        // none either. Charging phantom sockets would reject valid
-        // full-universe runs.
-        crate::config::ExchangeKind::Polymarket
-        | crate::config::ExchangeKind::Hyperliquid
-        | crate::config::ExchangeKind::Coinbase
-        | crate::config::ExchangeKind::Kraken
-        | crate::config::ExchangeKind::Okx
-        | crate::config::ExchangeKind::Binance => 0,
-    };
+    // No venue adapter is registered after RRP-003. The lifecycle knob is
+    // charged only when a caller explicitly configures it; no retired venue
+    // default implies a lifecycle plane.
+    let lifecycle_connections = settings.collector.lifecycle_replicas;
     let total_connections = shards
         .saturating_mul(replicas)
         .saturating_add(lifecycle_connections);
@@ -185,8 +176,8 @@ pub fn plan_fixed_topology(
 
 /// Count distinct venue market records represented by the selected symbols.
 ///
-/// Polymarket repeats one `exchange_market_id` for every outcome token; Kalshi
-/// supplies one symbol per market and usually no separate market id.
+/// A venue may repeat one `exchange_market_id` for every outcome token;
+/// another may supply one symbol per market and no separate market id.
 #[must_use]
 pub fn count_selected_markets(markets: &[MarketInfo]) -> usize {
     let mut records = BTreeSet::new();
@@ -239,9 +230,9 @@ mod tests {
 
     fn market(index: usize) -> MarketInfo {
         MarketInfo {
-            exchange: "polymarket".to_owned(),
+            exchange: "securities".to_owned(),
             native_symbol: format!("token-{index:08}"),
-            symbol: format!("polymarket:0x{index:08}:0"),
+            symbol: format!("securities:{index:08}:0"),
             title: None,
             outcome: None,
             exchange_market_id: Some(format!("0x{index:08}")),
@@ -258,7 +249,8 @@ mod tests {
     }
 
     fn settings(shards: usize, per_socket: usize, max_shards: usize) -> Settings {
-        let mut settings = Settings::for_exchange(crate::config::ExchangeKind::Polymarket);
+        let mut settings = Settings::for_venue("securities");
+        settings.collector.lifecycle_replicas = 0;
         settings.collector.shards = shards;
         settings.collector.max_symbols_per_socket = per_socket;
         settings.collector.max_shards = max_shards;
@@ -317,7 +309,7 @@ mod tests {
         let mut settings = settings(2, 5_000, 64);
         settings.collector.snapshot_interval_secs = 60;
         let mut selected = markets(3);
-        // Two outcome tokens share one Gamma record.
+        // Two outcome tokens share one discovery record.
         selected[1].exchange_market_id = selected[0].exchange_market_id.clone();
         let plan = plan(&settings, &selected).unwrap();
         assert_eq!(plan.selected_markets, 2);
@@ -366,17 +358,15 @@ mod tests {
         );
     }
 
-    fn kalshi_settings(shards: usize, per_socket: usize, max_shards: usize) -> Settings {
-        let mut settings = Settings::for_exchange(crate::config::ExchangeKind::Kalshi);
-        settings.collector.shards = shards;
-        settings.collector.max_symbols_per_socket = per_socket;
-        settings.collector.max_shards = max_shards;
+    fn lifecycle_settings(shards: usize, per_socket: usize, max_shards: usize) -> Settings {
+        let mut settings = settings(shards, per_socket, max_shards);
+        settings.collector.lifecycle_replicas = 1;
         settings
     }
 
     #[test]
-    fn kalshi_plan_charges_the_lifecycle_connection() {
-        let settings = kalshi_settings(2, 5_000, 64);
+    fn configured_lifecycle_plane_is_charged() {
+        let settings = lifecycle_settings(2, 5_000, 64);
         let plan = plan(&settings, &markets(10)).unwrap();
         assert_eq!(plan.replicas, 2);
         assert_eq!(plan.lifecycle_connections, 1);
@@ -384,33 +374,8 @@ mod tests {
     }
 
     #[test]
-    fn polymarket_plan_ignores_the_lifecycle_plane() {
-        let settings = settings(2, 5_000, 64);
-        // The knob exists in the shared settings but charges nothing:
-        // Polymarket has no separate lifecycle channel.
-        assert_eq!(settings.collector.lifecycle_replicas, 1);
-        let plan = plan(&settings, &markets(10)).unwrap();
-        assert_eq!(plan.lifecycle_connections, 0);
-        assert_eq!(plan.total_connections, 4);
-    }
-
-    #[test]
-    fn kraken_plan_ignores_the_lifecycle_plane() {
-        let mut settings = Settings::for_exchange(crate::config::ExchangeKind::Kraken);
-        settings.collector.shards = 2;
-        settings.collector.max_symbols_per_socket = 5_000;
-        settings.collector.max_shards = 64;
-        // Kraken has no separate lifecycle channel, so the shared knob charges
-        // nothing even when configured.
-        assert_eq!(settings.collector.lifecycle_replicas, 1);
-        let plan = plan(&settings, &markets(10)).unwrap();
-        assert_eq!(plan.lifecycle_connections, 0);
-        assert_eq!(plan.total_connections, 4);
-    }
-
-    #[test]
     fn lifecycle_plane_counts_against_the_connection_ceiling() {
-        let mut settings = kalshi_settings(2, 5_000, 64);
+        let mut settings = lifecycle_settings(2, 5_000, 64);
         settings.collector.max_total_connections = 4;
         let error = plan(&settings, &markets(10)).unwrap_err();
         assert!(error.to_string().contains("max_total_connections"));
@@ -419,7 +384,7 @@ mod tests {
 
     #[test]
     fn disabling_the_lifecycle_plane_frees_the_slot() {
-        let mut settings = kalshi_settings(2, 5_000, 64);
+        let mut settings = lifecycle_settings(2, 5_000, 64);
         settings.collector.lifecycle_replicas = 0;
         settings.collector.max_total_connections = 4;
         let plan = plan(&settings, &markets(10)).unwrap();
@@ -429,7 +394,7 @@ mod tests {
 
     #[test]
     fn lifecycle_plane_survives_capacity_refresh() {
-        let mut settings = kalshi_settings(2, 5_000, 64);
+        let mut settings = lifecycle_settings(2, 5_000, 64);
         settings.collector.max_total_connections = 4;
         let error = plan_fixed_topology(&settings, &markets(10), &[5, 5]).unwrap_err();
         assert!(error.to_string().contains("max_total_connections"));

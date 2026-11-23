@@ -9,7 +9,7 @@ version = "0.3.0"
 edition = "2024"
 rust-version = "1.99"
 build = "src/util/build.rs"
-description = "Read-only multi-venue market-data collector with SBE capture and raw-frame journaling"
+description = "Securities market-data acquisition, durability and release platform with SBE capture and raw-frame journaling"
 license = "Apache-2.0"
 # Test targets are declared below. Without this, Cargo would implicitly enable
 # every file in tests/. Every market-shaped target was retired under RRP-002;

@@ -24,11 +24,8 @@ use crate::{
     capacity,
     catalog::Catalog,
     collector::{CollectorCore, CoreConfig},
-    config::{CatalogMode, ExchangeKind, JournalSyncMode, Settings},
-    exchange::{
-        BinanceExchange, CoinbaseExchange, DiscoveryResult, DiscoveryStats, Exchange,
-        HyperliquidExchange, KalshiExchange, KrakenExchange, OkxExchange, PolymarketExchange,
-    },
+    config::{CatalogMode, JournalSyncMode, Settings},
+    exchange::{DiscoveryResult, DiscoveryStats, Exchange},
     histogram::{Histogram, StageTimings},
     journal::{JournalConfig, JournalHandle, JournalMeta, SyncMode},
     metrics::{CatalogHealth, MetricsRegistry, ReadinessPolicy, RuntimeStatus, run_server_on},
@@ -40,7 +37,7 @@ use crate::{
     writer::WriterHandle,
 };
 
-/// Shard identifier reserved for the dedicated Kalshi lifecycle control plane.
+/// Shard identifier reserved for a dedicated market-lifecycle control plane.
 /// Book shards are validated to `<= 256`, so `u16::MAX` never collides with a
 /// book source. Exported for the report's source list; consumers should use
 /// `source.shard == LIFECYCLE_SHARD` to distinguish the control plane.
@@ -116,42 +113,23 @@ fn spawn_discovery_round(
     });
 }
 
-/// Build the selected exchange adapter. `require_auth` is true for live
-/// collection and false for public discovery-only commands.
+/// Build the selected exchange adapter.
+///
+/// RRP-003 retired all seven crypto and prediction-market adapter families.
+/// No securities venue adapter is registered yet: venue adapters are onboarded
+/// only after source qualification, rights and an accepted NDC projection
+/// (workspace W4). This function is the single fail-closed composition root,
+/// so `collect`, `discover` and `latency` deny before a client or socket is
+/// created instead of silently selecting a retired venue.
 pub fn build_exchange(
     settings: &Settings,
     require_auth: bool,
 ) -> anyhow::Result<Arc<dyn Exchange>> {
-    match settings.exchange {
-        ExchangeKind::Kalshi => Ok(Arc::new(KalshiExchange::new(
-            settings.kalshi.clone(),
-            settings.network.clone(),
-            require_auth,
-        )?)),
-        ExchangeKind::Polymarket => Ok(Arc::new(PolymarketExchange::new(
-            settings.polymarket.clone(),
-            settings.network.clone(),
-        )?)),
-        ExchangeKind::Hyperliquid => Ok(Arc::new(HyperliquidExchange::new(
-            settings.hyperliquid.clone(),
-            settings.network.clone(),
-        )?)),
-        ExchangeKind::Coinbase => Ok(Arc::new(CoinbaseExchange::new(
-            settings.coinbase.clone(),
-            settings.network.clone(),
-        )?)),
-        ExchangeKind::Kraken => Ok(Arc::new(KrakenExchange::new(
-            settings.kraken.clone(),
-            settings.network.clone(),
-        )?)),
-        // OKX H0 is reference-data only: no socket is opened and `require_auth`
-        // is therefore irrelevant. The offline fixture is selected in settings.
-        ExchangeKind::Okx => Ok(Arc::new(OkxExchange::new(settings.okx.clone()))),
-        ExchangeKind::Binance => Ok(Arc::new(BinanceExchange::new(
-            settings.binance.clone(),
-            settings.network.clone(),
-        )?)),
-    }
+    let _ = (settings, require_auth);
+    bail!(
+        "no qualified venue adapter: securities venue adapters are onboarded only \
+         after source qualification, rights and an accepted NDC projection (W4)"
+    )
 }
 
 /// Start the raw-frame journal when a directory is configured.
@@ -402,9 +380,8 @@ where
     let started_at_us = now_us().context("reading wall clock at startup")?;
     let exchange = build_exchange(&settings, true)?;
     let bootstrap = bootstrap_markets(&settings, &exchange, started_at_us).await?;
-    // Venue adapters narrow discovery to the set the session will
-    // subscribe. Hyperliquid's selected perpetuals are a finite subset of the
-    // venue universe; metadata, desired subscriptions and coverage must all
+    // A qualified venue adapter may narrow discovery to the set the session
+    // will subscribe. Metadata, desired subscriptions and coverage must all
     // use that same set or the certificate demands anchors that were never
     // requested.
     let initial_markets = exchange.subscribed_universe(bootstrap.markets);
@@ -1337,7 +1314,7 @@ mod tests {
     }
 
     fn settings_with_catalog(mode: CatalogMode, path: &std::path::Path) -> Settings {
-        let mut settings = Settings::for_exchange(ExchangeKind::Polymarket);
+        let mut settings = Settings::for_venue("securities");
         settings.collector.catalog_mode = mode;
         settings.collector.catalog_path = Some(path.to_path_buf());
         settings.collector.catalog_max_age_secs = 3_600;

@@ -13,7 +13,8 @@ report.
 - Inject secrets from a local manager or the environment and redact request
   and response diagnostics.
 - Egress is direct or an explicitly configured fail-closed proxy; the rules
-  are in `docs/live-evidence-runbook.md` and `docs/git-workflow.md`.
+  are in `docs/egress-intent-2026-11-23.md`, `docs/operating-envelope.md` and
+  `docs/git-workflow.md`.
 
 ## Scope
 
