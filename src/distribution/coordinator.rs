@@ -30,6 +30,7 @@ use crate::{
     journal::{JournalConfig, JournalHandle, JournalMeta, SyncMode},
     metrics::{CatalogHealth, MetricsRegistry, ReadinessPolicy, RuntimeStatus, run_server_on},
     model::{Control, MarketInfo, OutputMessage, SourceId},
+    operation_plan::SessionAuthorization,
     persistence::PersistenceHandle,
     report::{CatalogReport, ReportConfig, RunReport, sidecar_path},
     session::{WorkerConfig, WorkerEvent, run_worker},
@@ -343,9 +344,12 @@ async fn bootstrap_markets(
 
 /// Run a live collection until SIGINT/SIGTERM, the configured duration, or a
 /// fatal source/writer error.
-pub async fn run(settings: Settings) -> anyhow::Result<RunReport> {
+pub async fn run(
+    settings: Settings,
+    authorization: SessionAuthorization,
+) -> anyhow::Result<RunReport> {
     let duration_secs = settings.collector.duration_secs;
-    run_with_shutdown(settings, async move {
+    run_with_shutdown(settings, authorization, async move {
         let signal = wait_for_shutdown_signal();
         tokio::pin!(signal);
         if duration_secs == 0 {
@@ -369,7 +373,11 @@ pub async fn run(settings: Settings) -> anyhow::Result<RunReport> {
 /// the live orchestration testable without relying on process signals or a
 /// fixed wall-clock duration. `collector.duration_secs` is interpreted by
 /// [`run`], not by this function.
-pub async fn run_with_shutdown<F>(settings: Settings, shutdown: F) -> anyhow::Result<RunReport>
+pub async fn run_with_shutdown<F>(
+    settings: Settings,
+    authorization: SessionAuthorization,
+    shutdown: F,
+) -> anyhow::Result<RunReport>
 where
     F: std::future::Future<Output = String>,
 {
@@ -471,6 +479,9 @@ where
     let factory = Arc::clone(&exchange).session_factory();
     let mut worker_config = WorkerConfig::from_settings(&settings.collector);
     worker_config.journal = journal.clone();
+    // One authorization lifecycle shared by every source worker. All sockets
+    // observe the same gate, authority handle and checkpoint schedule.
+    worker_config.authorization = Some(authorization);
     let (worker_event_tx, mut worker_event_rx) = mpsc::channel::<WorkerEvent>(8192);
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
     let mut commands: BTreeMap<SourceId, mpsc::Sender<Control>> = BTreeMap::new();
@@ -843,6 +854,19 @@ where
                     receive_seq,
                 );
             }
+            Ok(Some(WorkerEvent::AuthorizationHalted {
+                source,
+                reason,
+                lease_id,
+                lease_epoch,
+                buffered_frames,
+                uncommitted_events,
+            })) => {
+                warn!(
+                    %source, %reason, %lease_id, lease_epoch, buffered_frames, uncommitted_events,
+                    "authorization halted a source during shutdown"
+                );
+            }
             Ok(None) | Err(_) => break,
         }
     }
@@ -1117,6 +1141,23 @@ async fn process_worker_event(
         }
         WorkerEvent::Stopped { source } => {
             active_sources.remove(&source);
+        }
+        WorkerEvent::AuthorizationHalted {
+            source,
+            reason,
+            lease_id,
+            lease_epoch,
+            buffered_frames,
+            uncommitted_events,
+        } => {
+            // Fail closed: no queued record from this source is committed after
+            // an authorization denial. The gate's final audit state is the
+            // authoritative account; counts here reconcile the in-flight burst.
+            active_sources.remove(&source);
+            bail!(
+                "source {source} authorization halted ({reason}) lease={lease_id} epoch={lease_epoch}: \
+                 {buffered_frames} buffered frame(s) and {uncommitted_events} uncommitted event(s) not committed"
+            );
         }
     }
     Ok(())

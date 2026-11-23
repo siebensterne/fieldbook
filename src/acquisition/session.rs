@@ -18,6 +18,7 @@ use crate::{
     model::{
         Control, ExchangeEvent, HeartbeatState, ResetReason, SourceId, SourceStatus, TransportState,
     },
+    operation_plan::SessionAuthorization,
     protocol::{ControlOpcode, SendResult, TransportObservation},
     time::now_us,
 };
@@ -364,6 +365,17 @@ pub enum WorkerEvent {
     Stopped {
         source: SourceId,
     },
+    /// Fail-closed stop after an authorization checkpoint denial. The counts
+    /// are frames read and decoded events queued on this connection but not yet
+    /// committed by the coordinator, retained for reconciliation.
+    AuthorizationHalted {
+        source: SourceId,
+        reason: String,
+        lease_id: String,
+        lease_epoch: u64,
+        buffered_frames: u64,
+        uncommitted_events: u64,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -378,6 +390,9 @@ pub struct WorkerConfig {
     pub connect_permits: Arc<Semaphore>,
     /// Raw-frame journal shared by every source worker.
     pub journal: Option<JournalHandle>,
+    /// Authorization lifecycle shared by every worker of one collector. A
+    /// halt on any worker cancels the shared gate session, so all sockets stop.
+    pub authorization: Option<SessionAuthorization>,
 }
 
 /// The complete heartbeat contract an adapter supplies for its session.
@@ -479,6 +494,7 @@ impl WorkerConfig {
             reconnect_max_backoff: Duration::from_secs(30),
             connect_permits: Arc::new(Semaphore::new(settings.connect_concurrency.max(1))),
             journal: None,
+            authorization: None,
         }
     }
 }
@@ -502,6 +518,10 @@ pub async fn run_worker(
     // decoding or filtering can hide a frame from recovery ordering.
     let mut connection_epoch = 0u64;
     let mut receive_seq = 0u64;
+    // The authorization lifecycle is owned by the worker, not by the adapter.
+    // A denial is a stop condition for receive, subscription and transport.
+    let mut authorization = config.authorization.clone();
+    let mut halt_reason: Option<String> = None;
 
     loop {
         if session.is_none() {
@@ -638,6 +658,24 @@ pub async fn run_worker(
             Some(now + spec.send_interval)
         };
         let mut next_status = now + config.status_interval;
+        let checkpoint_interval = authorization
+            .as_ref()
+            .map_or(Duration::from_secs(3600), |value| {
+                Duration::from_micros(value.checkpoint_interval_us)
+            });
+        let mut next_checkpoint = now + checkpoint_interval;
+
+        // Reauthorize the full plan before any frame is processed on a fresh
+        // connection. A restarted process always reauthorizes before resuming.
+        if let Some(active_authorization) = authorization.as_mut()
+            && let Err(error) = active_authorization.checkpoint()
+        {
+            let reason = format!("authorization checkpoint denied on connect: {error:#}");
+            status.last_error = Some(truncate_error(&anyhow::anyhow!(reason.clone())));
+            halt_authorization(&mut authorization, &reason, &status, &events).await;
+            close_and_stop(session.take(), &mut status, &events).await;
+            return;
+        }
 
         if !desired.is_empty() {
             let reset = ExchangeEvent::StreamReset {
@@ -722,9 +760,18 @@ pub async fn run_worker(
                             &events,
                             connection_epoch,
                             receive_seq,
+                            authorization.as_ref(),
+                            &mut halt_reason,
                         )
                         .await;
-                        if must_reconnect {
+                        if halt_reason.is_some() {
+                            let reason = halt_reason.take().unwrap_or_default();
+                            status.last_error =
+                                Some(truncate_error(&anyhow::anyhow!(reason.clone())));
+                            halt_authorization(&mut authorization, &reason, &status, &events).await;
+                            should_stop = true;
+                        }
+                        if must_reconnect || should_stop {
                             break;
                         }
                     }
@@ -738,6 +785,24 @@ pub async fn run_worker(
                     TransportState::Reconnecting
                 };
                 break;
+            }
+
+            // Authorization checkpoint before any timer or socket work. The
+            // deadline is monotonic, and this runs on every iteration, so a
+            // continuously ready socket cannot starve it.
+            if let Some(active_authorization) = authorization.as_mut()
+                && active_authorization.checkpoint_due()
+            {
+                match active_authorization.checkpoint() {
+                    Ok(_) => next_checkpoint = Instant::now() + checkpoint_interval,
+                    Err(error) => {
+                        let reason = format!("authorization checkpoint denied: {error:#}");
+                        status.last_error = Some(truncate_error(&anyhow::anyhow!(reason.clone())));
+                        halt_authorization(&mut authorization, &reason, &status, &events).await;
+                        should_stop = true;
+                        break;
+                    }
+                }
             }
 
             let now = Instant::now();
@@ -818,6 +883,7 @@ pub async fn run_worker(
                 .min(next_status)
                 .min(next_periodic_reconnect)
                 .min(idle_deadline)
+                .min(next_checkpoint)
                 .min(tracker.next_deadline().unwrap_or(next_status));
             let mut pending_control: Option<Control> = None;
             tokio::select! {
@@ -828,6 +894,35 @@ pub async fn run_worker(
                 frame = read_next_frame(&mut session) => {
                     match frame {
                         Ok(mut frame) => {
+                            // Reauthorize the active plan before this queued
+                            // record is journaled or emitted. A read that
+                            // crossed the checkpoint deadline cannot outrun it.
+                            if let Some(active_authorization) = authorization.as_mut()
+                                && active_authorization.checkpoint_due()
+                            {
+                                match active_authorization.checkpoint() {
+                                    Ok(_) => {
+                                        next_checkpoint = Instant::now() + checkpoint_interval;
+                                    }
+                                    Err(error) => {
+                                        let reason = format!(
+                                            "authorization checkpoint denied before frame: {error:#}"
+                                        );
+                                        status.last_error = Some(truncate_error(
+                                            &anyhow::anyhow!(reason.clone()),
+                                        ));
+                                        halt_authorization(
+                                            &mut authorization,
+                                            &reason,
+                                            &status,
+                                            &events,
+                                        )
+                                        .await;
+                                        should_stop = true;
+                                        break;
+                                    }
+                                }
+                            }
                             // The frame's actual receive instant, captured
                             // before any await point. Heartbeat deadline and
                             // RTT accounting must use this - not the loop-top
@@ -1078,8 +1173,16 @@ pub async fn run_worker(
                     &events,
                     connection_epoch,
                     receive_seq,
+                    authorization.as_ref(),
+                    &mut halt_reason,
                 )
                 .await;
+                if halt_reason.is_some() {
+                    let reason = halt_reason.take().unwrap_or_default();
+                    status.last_error = Some(truncate_error(&anyhow::anyhow!(reason.clone())));
+                    halt_authorization(&mut authorization, &reason, &status, &events).await;
+                    should_stop = true;
+                }
             }
         }
 
@@ -1118,6 +1221,10 @@ pub async fn run_worker(
     let _ = events.send(WorkerEvent::Stopped { source }).await;
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "control handling carries the source identity, session, journal counters and authorization lifecycle"
+)]
 async fn handle_control(
     action: Control,
     desired: &mut BTreeSet<String>,
@@ -1126,9 +1233,19 @@ async fn handle_control(
     events: &mpsc::Sender<WorkerEvent>,
     connection_epoch: u64,
     receive_seq: u64,
+    authorization: Option<&SessionAuthorization>,
+    halt_reason: &mut Option<String>,
 ) -> bool {
     match action {
         Control::SetSubscriptions(next) => {
+            // A widened subscription is a scope-widening request. Recheck it
+            // against the live gate before the transport sees it.
+            if let Some(active_authorization) = authorization
+                && let Err(error) = active_authorization.recheck_subscription(&next)
+            {
+                *halt_reason = Some(format!("subscription reauthorization denied: {error:#}"));
+                return true;
+            }
             *desired = next;
             status.subscriptions = desired.len();
             let mut reconnect = false;
@@ -1227,6 +1344,38 @@ async fn read_next_frame(
         None => Err(SessionFailure::Reconnect(anyhow::anyhow!(
             "missing session"
         ))),
+    }
+}
+
+/// Cancel the shared gate session, commit the final audit state and report the
+/// buffered/uncommitted counts. Transport closure and status publication remain
+/// with the caller's existing stop path.
+async fn halt_authorization(
+    authorization: &mut Option<SessionAuthorization>,
+    reason: &str,
+    status: &SourceStatus,
+    events: &mpsc::Sender<WorkerEvent>,
+) {
+    let Some(active_authorization) = authorization.as_mut() else {
+        return;
+    };
+    match active_authorization.halt(reason, status.data_frames_received, status.messages) {
+        Ok(outcome) => {
+            warn!(%reason, lease_id = %outcome.lease_id, epoch = outcome.lease_epoch, "authorization halted session");
+            let _ = events
+                .send(WorkerEvent::AuthorizationHalted {
+                    source: status.source,
+                    reason: outcome.reason,
+                    lease_id: outcome.lease_id,
+                    lease_epoch: outcome.lease_epoch,
+                    buffered_frames: outcome.buffered_frames,
+                    uncommitted_events: outcome.uncommitted_events,
+                })
+                .await;
+        }
+        Err(error) => {
+            warn!(%reason, error = %format!("{error:#}"), "authorization halt could not be audited");
+        }
     }
 }
 
@@ -2182,6 +2331,7 @@ mod heartbeat_pin_tests {
             reconnect_max_backoff: Duration::from_millis(20),
             connect_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             journal: None,
+            authorization: None,
         };
         let worker = tokio::spawn(run_worker(
             factory,
@@ -2514,6 +2664,7 @@ mod first_ack_pin_tests {
             reconnect_max_backoff: Duration::from_millis(20),
             connect_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             journal: None,
+            authorization: None,
         };
 
         let worker = tokio::spawn(run_worker(
@@ -2669,6 +2820,7 @@ mod first_ack_pin_tests {
             reconnect_max_backoff: Duration::from_millis(20),
             connect_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             journal: None,
+            authorization: None,
         };
 
         // Push the acknowledgement 1.2 seconds in: the ping is sent at the
@@ -2751,6 +2903,7 @@ mod first_ack_pin_tests {
             reconnect_max_backoff: Duration::from_millis(20),
             connect_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             journal: None,
+            authorization: None,
         };
 
         let worker = tokio::spawn(run_worker(
@@ -2823,6 +2976,7 @@ mod first_ack_pin_tests {
             reconnect_max_backoff: Duration::from_millis(20),
             connect_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             journal: None,
+            authorization: None,
         };
 
         let worker = tokio::spawn(run_worker(
@@ -2975,6 +3129,7 @@ mod first_ack_pin_tests {
             reconnect_max_backoff: Duration::from_millis(20),
             connect_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             journal: None,
+            authorization: None,
         };
 
         let worker = tokio::spawn(run_worker(

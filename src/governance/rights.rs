@@ -43,8 +43,8 @@ use serde::Serialize;
 
 use crate::config::Settings;
 use crate::egress_intent::{
-    AuthorityRefresh, AuthorizationSession, EgressIntent, EndpointIdentity, GrantSnapshot,
-    InMemoryAuthority, MAX_LEASE_DURATION,
+    AuthorityRefresh, AuthorizationSession, DecisionTime, EgressIntent, EndpointIdentity,
+    GrantSnapshot, InMemoryAuthority, MAX_LEASE_DURATION,
 };
 use crate::report::write_json_atomic;
 use crate::taxonomy::CountryCode;
@@ -2402,6 +2402,22 @@ pub struct DecisionAuditEvent {
     /// Side-effect boundary this decision permits, not a command name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub side_effect_boundary: Option<String>,
+    /// Stable identity of the lease this lifecycle event concerns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
+    /// Lease epoch. A committed renewal advances it; a failed one never does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_epoch: Option<u64>,
+    /// Monotonic lease deadline in microseconds since the process origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monotonic_deadline_us: Option<u64>,
+    /// Lifecycle kind: `renewal`, `checkpoint`, `revocation`, `cancellation`
+    /// or `expiry`. Plain decisions leave this absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_kind: Option<String>,
+    /// Full grant identity: snapshot id at its registry revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_identity: Option<String>,
     pub policy_version: u32,
     pub software_version: String,
 }
@@ -2418,6 +2434,11 @@ pub struct AuditContext {
     pub plan_id: Option<String>,
     pub step_id: Option<String>,
     pub side_effect_boundary: Option<String>,
+    pub lease_id: Option<String>,
+    pub lease_epoch: Option<u64>,
+    pub monotonic_deadline_us: Option<u64>,
+    pub event_kind: Option<String>,
+    pub grant_identity: Option<String>,
 }
 
 static AUDIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2560,6 +2581,11 @@ impl AuditSink {
             plan_id: context.plan_id,
             step_id: context.step_id,
             side_effect_boundary: context.side_effect_boundary,
+            lease_id: context.lease_id,
+            lease_epoch: context.lease_epoch,
+            monotonic_deadline_us: context.monotonic_deadline_us,
+            event_kind: context.event_kind,
+            grant_identity: context.grant_identity,
             policy_version: self.policy_version,
             software_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -2826,12 +2852,41 @@ struct ActiveAuthorization {
     authority: Option<Arc<dyn AuthorityRefresh>>,
 }
 
+/// Evidence retained when a lifecycle audit commit fails. The state transition
+/// still fails closed, but the reason and the exact decision are kept so a
+/// reconciler can replay or publish the event later.
+#[derive(Debug, Clone)]
+pub struct ReconciliationEvidence {
+    pub scope: AuthorizationScope,
+    pub decision: String,
+    pub reason: Option<String>,
+    pub evidence: DecisionAudit,
+    pub context: AuditContext,
+    /// The session that was stopped, retained for reconciliation.
+    pub session: AuthorizationSession,
+    pub at_us: i64,
+    pub error: String,
+}
+
 #[derive(Debug, Default)]
 struct GateState {
     active: Vec<ActiveAuthorization>,
     fallback_sink: Option<AuditSink>,
     next_session: u64,
     membership: UniverseMembershipRegistry,
+    /// Offline fault injection: when set, every audit commit fails without
+    /// writing. Fail-closed behavior is identical to a full disk or an
+    /// unwritable audit directory.
+    audit_failure: bool,
+    reconciliation: Vec<ReconciliationEvidence>,
+}
+
+/// The proposed lease values of a committed renewal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeaseRenewal {
+    pub wall_expiry_us: i64,
+    pub monotonic_deadline_us: Option<u64>,
+    pub lease_epoch: u64,
 }
 
 /// One proof queued for installation, with the plan metadata audited for
@@ -2844,6 +2899,9 @@ pub struct ProofInstallation {
     pub plan_id: Option<String>,
     pub step_id: Option<String>,
     pub side_effect_boundary: Option<String>,
+    /// Monotonic lease deadline for the long-running session path. `None`
+    /// keeps the wall-clock compatibility check used by offline preflight.
+    pub lease_deadline_monotonic_us: Option<u64>,
 }
 
 /// Instance-scoped authorization state.
@@ -2869,6 +2927,114 @@ impl AuthorizationGate {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Inject an audit-write failure for offline assurance tests. A failure can
+    /// only deny or quarantine activity; it never creates permission.
+    pub fn set_audit_failure(&self, failing: bool) {
+        self.lock().audit_failure = failing;
+    }
+
+    /// Evidence retained from lifecycle transitions whose audit could not be
+    /// committed. It is reconciliation material, never an active grant.
+    #[must_use]
+    pub fn reconciliation_evidence(&self) -> Vec<ReconciliationEvidence> {
+        self.lock().reconciliation.clone()
+    }
+
+    /// The single audit commit point for gate state transitions.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one audit commit carries the full decision context and evidence"
+    )]
+    fn commit_audit(
+        &self,
+        state: &GateState,
+        sink: &AuditSink,
+        scope: &AuthorizationScope,
+        decision: &str,
+        reason: Option<String>,
+        evidence: Option<&DecisionAudit>,
+        at_us: i64,
+        context: AuditContext,
+    ) -> anyhow::Result<DecisionAuditEvent> {
+        if state.audit_failure {
+            anyhow::bail!("audit commit failed: failing closed without state extension");
+        }
+        sink.record_with_context(scope, decision, reason, evidence, at_us, context)
+    }
+
+    /// Preserve the full decision when an audit commit fails, and remove the
+    /// session so it can never authorize further activity.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "reconciliation evidence preserves the full failed decision context"
+    )]
+    fn quarantine(
+        &self,
+        state: &mut GateState,
+        index: usize,
+        scope: &AuthorizationScope,
+        decision: &str,
+        reason: Option<String>,
+        evidence: &DecisionAudit,
+        context: &AuditContext,
+        at_us: i64,
+        error: &anyhow::Error,
+    ) {
+        let removed = state.active.remove(index);
+        state.reconciliation.push(ReconciliationEvidence {
+            scope: scope.clone(),
+            decision: decision.to_owned(),
+            reason,
+            evidence: evidence.clone(),
+            context: context.clone(),
+            session: removed.session,
+            at_us,
+            error: format!("{error:#}"),
+        });
+    }
+
+    /// One state/audit transaction rule: commit first, then let the caller
+    /// apply the state transition. On commit failure the session is
+    /// quarantined with its reconciliation evidence and the error is returned.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one transition carries the session, decision, evidence and audit context"
+    )]
+    fn audited_removal(
+        &self,
+        state: &mut GateState,
+        index: usize,
+        scope: &AuthorizationScope,
+        decision: &str,
+        reason: Option<String>,
+        evidence: &DecisionAudit,
+        context: &AuditContext,
+        at_us: i64,
+    ) -> anyhow::Result<()> {
+        let sink = state.active[index].sink.clone();
+        match self.commit_audit(
+            state,
+            &sink,
+            scope,
+            decision,
+            reason.clone(),
+            Some(evidence),
+            at_us,
+            context.clone(),
+        ) {
+            Ok(_) => {
+                state.active.remove(index);
+                Ok(())
+            }
+            Err(error) => {
+                self.quarantine(
+                    state, index, scope, decision, reason, evidence, context, at_us, &error,
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Attach recorded universe membership evidence to this gate.
@@ -2913,6 +3079,13 @@ impl AuthorizationGate {
             grant_snapshot_id: Some(item.proof.grant_snapshot_id.clone()),
             lease_expires_at_us: Some(item.session.expires_at_us),
             endpoint: Some(intent.endpoint_identity.authority()),
+            lease_id: Some(item.session.lease_id.clone()),
+            lease_epoch: Some(item.session.lease_epoch),
+            monotonic_deadline_us: item.session.lease_deadline_monotonic_us,
+            grant_identity: Some(format!(
+                "{}#{}",
+                item.proof.grant_snapshot_id, item.proof.registry_revision
+            )),
             ..AuditContext::default()
         };
         let evidence = DecisionAudit {
@@ -2936,6 +3109,13 @@ impl AuthorizationGate {
             registry_revision: Some(item.proof.registry_revision),
             grant_snapshot_id: Some(item.proof.grant_snapshot_id.clone()),
             lease_expires_at_us: Some(item.session.expires_at_us),
+            lease_id: Some(item.session.lease_id.clone()),
+            lease_epoch: Some(item.session.lease_epoch),
+            monotonic_deadline_us: item.session.lease_deadline_monotonic_us,
+            grant_identity: Some(format!(
+                "{}#{}",
+                item.proof.grant_snapshot_id, item.proof.registry_revision
+            )),
             ..AuditContext::default()
         };
         let evidence = DecisionAudit {
@@ -2983,6 +3163,7 @@ impl AuthorizationGate {
             plan_id: None,
             step_id: None,
             side_effect_boundary: None,
+            lease_deadline_monotonic_us: None,
         };
         self.install_batch(vec![installation])?
             .into_iter()
@@ -3046,6 +3227,12 @@ impl AuthorizationGate {
                     plan_id: installation.plan_id.clone(),
                     step_id: installation.step_id.clone(),
                     side_effect_boundary: installation.side_effect_boundary.clone(),
+                    lease_id: Some(snapshot.lease_id.clone()),
+                    grant_identity: Some(format!(
+                        "{}#{}",
+                        snapshot.snapshot_id, snapshot.registry_revision
+                    )),
+                    ..AuditContext::default()
                 };
                 let evidence = DecisionAudit {
                     licence_reference: installation.proof.licence_reference.clone(),
@@ -3055,17 +3242,17 @@ impl AuthorizationGate {
                     authority: installation.proof.recording_authority.clone(),
                 };
                 events.push(
-                    installation
-                        .sink
-                        .record_with_context(
-                            &installation.proof.scope,
-                            "grant",
-                            None,
-                            Some(&evidence),
-                            installation.proof.at_us,
-                            context,
-                        )
-                        .context("committing grant audit event for plan step")?,
+                    self.commit_audit(
+                        &state,
+                        &installation.sink,
+                        &installation.proof.scope,
+                        "grant",
+                        None,
+                        Some(&evidence),
+                        installation.proof.at_us,
+                        context,
+                    )
+                    .context("committing grant audit event for plan step")?,
                 );
             }
             Ok(events)
@@ -3105,6 +3292,9 @@ impl AuthorizationGate {
                     expires_at_us: snapshot.expires_at_us(),
                     snapshot: snapshot.clone(),
                     renewals: 0,
+                    lease_id: snapshot.lease_id.clone(),
+                    lease_epoch: 0,
+                    lease_deadline_monotonic_us: installation.lease_deadline_monotonic_us,
                 },
                 authority: installation.authority.clone(),
             });
@@ -3131,12 +3321,13 @@ impl AuthorizationGate {
     fn evaluate(
         &self,
         intent: &EgressIntent,
-        at_us: i64,
+        time: DecisionTime,
         audit_egress: bool,
         at: Option<MembershipTime>,
         metadata: AuditContext,
     ) -> anyhow::Result<AuthorizationProof> {
         intent.validate()?;
+        let at_us = time.wall_us;
         let scope = intent.to_scope();
         let mut state = self.lock();
         let membership = state.membership.clone();
@@ -3176,7 +3367,7 @@ impl AuthorizationGate {
             return Err(error);
         };
 
-        let (sink, context, evidence, session_id, expires_at, authority, proof) = {
+        let (sink, mut context, evidence, expires_at, deadline, authority, proof) = {
             let item = &state.active[index];
             let (sink, mut context, evidence) = Self::audit_parts(item, intent);
             context.plan_id = metadata.plan_id;
@@ -3186,8 +3377,8 @@ impl AuthorizationGate {
                 sink,
                 context,
                 evidence,
-                item.session.session_id.clone(),
                 item.session.expires_at_us,
+                item.session.lease_deadline_monotonic_us,
                 item.authority.clone(),
                 item.proof.clone(),
             )
@@ -3196,26 +3387,30 @@ impl AuthorizationGate {
         let grant_expired =
             proof.valid_from > at_us || proof.valid_until.is_some_and(|end| at_us > end);
         if grant_expired {
-            state.active.remove(index);
-            let _ = sink.record_with_context(
+            let reason = RightsError::AuthorizationExpired.to_string();
+            let _ = self.audited_removal(
+                &mut state,
+                index,
                 &scope,
                 "grant_expired",
-                Some(RightsError::AuthorizationExpired.to_string()),
-                Some(&evidence),
+                Some(reason),
+                &evidence,
+                &context,
                 at_us,
-                context,
             );
             return Err(RightsError::AuthorizationExpired.into());
         }
-        if at_us > expires_at {
-            state.active.remove(index);
-            let _ = sink.record_with_context(
+        if time.lease_expired(expires_at, deadline) {
+            let reason = RightsError::LeaseExpired.to_string();
+            let _ = self.audited_removal(
+                &mut state,
+                index,
                 &scope,
                 "lease_expired",
-                Some(RightsError::LeaseExpired.to_string()),
-                Some(&evidence),
+                Some(reason),
+                &evidence,
+                &context,
                 at_us,
-                context,
             );
             return Err(RightsError::LeaseExpired.into());
         }
@@ -3225,19 +3420,24 @@ impl AuthorizationGate {
                     if current.revision == proof.registry_revision
                         && current.valid_snapshots.contains(&proof.grant_snapshot_id) => {}
                 Ok(_) => {
-                    state.active.remove(index);
-                    let _ = sink.record_with_context(
+                    let reason = RightsError::GrantInvalidated.to_string();
+                    context.event_kind = Some("revocation".to_owned());
+                    let _ = self.audited_removal(
+                        &mut state,
+                        index,
                         &scope,
                         "grant_revoked",
-                        Some(RightsError::GrantInvalidated.to_string()),
-                        Some(&evidence),
+                        Some(reason),
+                        &evidence,
+                        &context,
                         at_us,
-                        context,
                     );
                     return Err(RightsError::GrantInvalidated.into());
                 }
                 Err(error) => {
-                    let _ = sink.record_with_context(
+                    let _ = self.commit_audit(
+                        &state,
+                        &sink,
                         &scope,
                         "egress_denied",
                         Some(format!("{}: {error}", RightsError::AuthorityRefreshFailed)),
@@ -3252,7 +3452,9 @@ impl AuthorizationGate {
 
         if audit_egress {
             // The permitted event is committed before the caller may egress.
-            sink.record_with_context(
+            self.commit_audit(
+                &state,
+                &sink,
                 &scope,
                 "egress_permitted",
                 None,
@@ -3262,7 +3464,6 @@ impl AuthorizationGate {
             )
             .context("committing egress authorization event")?;
         }
-        let _ = session_id;
         Ok(proof)
     }
 
@@ -3276,7 +3477,19 @@ impl AuthorizationGate {
         intent: &EgressIntent,
         at_us: i64,
     ) -> anyhow::Result<AuthorizationProof> {
-        self.evaluate(intent, at_us, false, None, AuditContext::default())
+        self.check_active_with_time(intent, DecisionTime::wall_only(at_us))
+    }
+
+    /// Preflight check with explicit wall/monotonic decision times.
+    ///
+    /// # Errors
+    /// Returns a fail-closed denial when no live authorization covers the intent.
+    pub fn check_active_with_time(
+        &self,
+        intent: &EgressIntent,
+        time: DecisionTime,
+    ) -> anyhow::Result<AuthorizationProof> {
+        self.evaluate(intent, time, false, None, AuditContext::default())
     }
 
     /// Preflight check with explicit universe membership evidence.
@@ -3289,7 +3502,13 @@ impl AuthorizationGate {
         at_us: i64,
         at: MembershipTime,
     ) -> anyhow::Result<AuthorizationProof> {
-        self.evaluate(intent, at_us, false, Some(at), AuditContext::default())
+        self.evaluate(
+            intent,
+            DecisionTime::wall_only(at_us),
+            false,
+            Some(at),
+            AuditContext::default(),
+        )
     }
 
     /// Check a local-data-use scope against the live gate without any endpoint
@@ -3304,17 +3523,18 @@ impl AuthorizationGate {
         self.check_scope_active_with_context(scope, at_us, AuditContext::default())
     }
 
-    /// Local-data check that audits the declaring plan, step and boundary.
+    /// Local-data check with explicit wall/monotonic decision times.
     ///
     /// # Errors
     /// Returns the same fail-closed denial as [`Self::check_scope_active`].
-    pub fn check_scope_active_with_context(
+    pub fn check_scope_active_with_time(
         &self,
         scope: &AuthorizationScope,
-        at_us: i64,
+        time: DecisionTime,
         metadata: AuditContext,
     ) -> anyhow::Result<()> {
         scope.validate()?;
+        let at_us = time.wall_us;
         let mut state = self.lock();
         let Some(index) = state
             .active
@@ -3345,8 +3565,8 @@ impl AuthorizationGate {
             }
             return Err(error);
         };
-        let item = &state.active[index];
-        let (sink, context, evidence, authority, expires, proof) = {
+        let (sink, mut context, evidence, expires, deadline, authority, proof) = {
+            let item = &state.active[index];
             let (sink, mut context, evidence) = Self::audit_parts_for_scope(item);
             context.plan_id = metadata.plan_id;
             context.step_id = metadata.step_id;
@@ -3355,32 +3575,37 @@ impl AuthorizationGate {
                 sink,
                 context,
                 evidence,
-                item.authority.clone(),
                 item.session.expires_at_us,
+                item.session.lease_deadline_monotonic_us,
+                item.authority.clone(),
                 item.proof.clone(),
             )
         };
         if proof.valid_from > at_us || proof.valid_until.is_some_and(|end| at_us > end) {
-            state.active.remove(index);
-            let _ = sink.record_with_context(
+            let reason = RightsError::AuthorizationExpired.to_string();
+            let _ = self.audited_removal(
+                &mut state,
+                index,
                 scope,
                 "grant_expired",
-                Some(RightsError::AuthorizationExpired.to_string()),
-                Some(&evidence),
+                Some(reason),
+                &evidence,
+                &context,
                 at_us,
-                context,
             );
             return Err(RightsError::AuthorizationExpired.into());
         }
-        if at_us > expires {
-            state.active.remove(index);
-            let _ = sink.record_with_context(
+        if time.lease_expired(expires, deadline) {
+            let reason = RightsError::LeaseExpired.to_string();
+            let _ = self.audited_removal(
+                &mut state,
+                index,
                 scope,
                 "lease_expired",
-                Some(RightsError::LeaseExpired.to_string()),
-                Some(&evidence),
+                Some(reason),
+                &evidence,
+                &context,
                 at_us,
-                context,
             );
             return Err(RightsError::LeaseExpired.into());
         }
@@ -3390,19 +3615,24 @@ impl AuthorizationGate {
                     if current.revision == proof.registry_revision
                         && current.valid_snapshots.contains(&proof.grant_snapshot_id) => {}
                 Ok(_) => {
-                    state.active.remove(index);
-                    let _ = sink.record_with_context(
+                    let reason = RightsError::GrantInvalidated.to_string();
+                    context.event_kind = Some("revocation".to_owned());
+                    let _ = self.audited_removal(
+                        &mut state,
+                        index,
                         scope,
                         "grant_revoked",
-                        Some(RightsError::GrantInvalidated.to_string()),
-                        Some(&evidence),
+                        Some(reason),
+                        &evidence,
+                        &context,
                         at_us,
-                        context,
                     );
                     return Err(RightsError::GrantInvalidated.into());
                 }
                 Err(error) => {
-                    let _ = sink.record_with_context(
+                    let _ = self.commit_audit(
+                        &state,
+                        &sink,
                         scope,
                         "local_denied",
                         Some(format!("{}: {error}", RightsError::AuthorityRefreshFailed)),
@@ -3414,7 +3644,9 @@ impl AuthorizationGate {
                 }
             }
         }
-        sink.record_with_context(
+        self.commit_audit(
+            &state,
+            &sink,
             scope,
             "local_permitted",
             None,
@@ -3426,6 +3658,19 @@ impl AuthorizationGate {
         Ok(())
     }
 
+    /// Local-data check that audits the declaring plan, step and boundary.
+    ///
+    /// # Errors
+    /// Returns the same fail-closed denial as [`Self::check_scope_active`].
+    pub fn check_scope_active_with_context(
+        &self,
+        scope: &AuthorizationScope,
+        at_us: i64,
+        metadata: AuditContext,
+    ) -> anyhow::Result<()> {
+        self.check_scope_active_with_time(scope, DecisionTime::wall_only(at_us), metadata)
+    }
+
     /// Reauthorize one egress attempt and commit its event before returning.
     /// No network side effect may begin until this returns `Ok`.
     ///
@@ -3433,7 +3678,24 @@ impl AuthorizationGate {
     /// Returns an error on denial and when a permitted egress event cannot be
     /// committed. Denial events are written when a sink is available.
     pub fn require_egress(&self, intent: &EgressIntent, at_us: i64) -> anyhow::Result<()> {
-        self.evaluate(intent, at_us, true, None, AuditContext::default())
+        self.require_egress_with_time(
+            intent,
+            DecisionTime::wall_only(at_us),
+            AuditContext::default(),
+        )
+    }
+
+    /// Egress reauthorization with explicit wall/monotonic decision times.
+    ///
+    /// # Errors
+    /// Returns the fail-closed denial or an audit-commit failure.
+    pub fn require_egress_with_time(
+        &self,
+        intent: &EgressIntent,
+        time: DecisionTime,
+        metadata: AuditContext,
+    ) -> anyhow::Result<()> {
+        self.evaluate(intent, time, true, None, metadata)
             .map(|_| ())
     }
 
@@ -3448,8 +3710,7 @@ impl AuthorizationGate {
         at_us: i64,
         metadata: AuditContext,
     ) -> anyhow::Result<()> {
-        self.evaluate(intent, at_us, true, None, metadata)
-            .map(|_| ())
+        self.require_egress_with_time(intent, DecisionTime::wall_only(at_us), metadata)
     }
 
     /// Reauthorize an egress with explicit universe membership evidence.
@@ -3463,8 +3724,14 @@ impl AuthorizationGate {
         at_us: i64,
         at: MembershipTime,
     ) -> anyhow::Result<()> {
-        self.evaluate(intent, at_us, true, Some(at), AuditContext::default())
-            .map(|_| ())
+        self.evaluate(
+            intent,
+            DecisionTime::wall_only(at_us),
+            true,
+            Some(at),
+            AuditContext::default(),
+        )
+        .map(|_| ())
     }
 
     /// Renew the lease of an active session after a successful authority refresh.
@@ -3473,24 +3740,35 @@ impl AuthorizationGate {
     /// Returns an error when the intent is not covered or the authority cannot
     /// be refreshed.
     pub fn renew_lease(&self, intent: &EgressIntent, at_us: i64) -> anyhow::Result<()> {
-        self.renew_lease_with(intent, at_us, None)
+        self.renew_lease_with_time(
+            intent,
+            DecisionTime::wall_only(at_us),
+            AuditContext::default(),
+        )
+        .map(|_| ())
     }
 
-    fn renew_lease_with(
+    /// Renew with explicit decision times and one ordered state/audit
+    /// transaction: validate authority, calculate the proposed lease, commit
+    /// the renewal audit, then apply the state transition. A failed audit
+    /// leaves the lease untouched.
+    ///
+    /// # Errors
+    /// Returns a fail-closed denial, or the audit error with no extension.
+    pub fn renew_lease_with_time(
         &self,
         intent: &EgressIntent,
-        at_us: i64,
-        at: Option<MembershipTime>,
-    ) -> anyhow::Result<()> {
+        time: DecisionTime,
+        metadata: AuditContext,
+    ) -> anyhow::Result<LeaseRenewal> {
         intent.validate()?;
+        let at_us = time.wall_us;
         let scope = intent.to_scope();
         let mut state = self.lock();
-        let membership = state.membership.clone();
-        let evidence = at.map(|instant| (&membership, instant));
         let Some(index) = state
             .active
             .iter()
-            .position(|item| Self::matches(item, intent, evidence))
+            .position(|item| Self::matches(item, intent, None))
         else {
             return Err(RightsError::ScopeMismatch {
                 operation: intent.operation.as_str().to_owned(),
@@ -3499,7 +3777,7 @@ impl AuthorizationGate {
             }
             .into());
         };
-        let (sink, mut context, evidence, authority, expiry, duration) = {
+        let (sink, mut context, evidence, authority, duration) = {
             let item = &state.active[index];
             let (sink, context, evidence) = Self::audit_parts(item, intent);
             (
@@ -3507,10 +3785,15 @@ impl AuthorizationGate {
                 context,
                 evidence,
                 item.authority.clone(),
-                item.session.expires_at_us,
                 item.proof.lease_duration_us,
             )
         };
+        context.plan_id = metadata.plan_id;
+        context.step_id = metadata.step_id;
+        context.side_effect_boundary = metadata.side_effect_boundary;
+
+        // 1. Validate authority. A changed registry or a revoked snapshot
+        // revokes the session transactionally before any lease is proposed.
         if let Some(authority) = authority {
             let current = authority
                 .refresh()
@@ -3520,25 +3803,35 @@ impl AuthorizationGate {
                     .valid_snapshots
                     .contains(&state.active[index].proof.grant_snapshot_id)
             {
-                let _ = sink.record_with_context(
+                context.event_kind = Some("revocation".to_owned());
+                let reason = RightsError::GrantInvalidated.to_string();
+                let _ = self.audited_removal(
+                    &mut state,
+                    index,
                     &scope,
                     "grant_revoked",
-                    Some(RightsError::GrantInvalidated.to_string()),
-                    Some(&evidence),
+                    Some(reason),
+                    &evidence,
+                    &context,
                     at_us,
-                    context,
                 );
-                state.active.remove(index);
                 return Err(RightsError::GrantInvalidated.into());
             }
         }
+
+        // 2. Calculate the proposed lease without mutating state.
         let new_expiry = at_us.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
-        state.active[index].session.expires_at_us = new_expiry;
-        state.active[index].session.renewals =
-            state.active[index].session.renewals.saturating_add(1);
+        let new_deadline = time.monotonic_us.map(|now| now.saturating_add(duration));
+        let new_epoch = state.active[index].session.lease_epoch.saturating_add(1);
         context.lease_expires_at_us = Some(new_expiry);
-        let _ = expiry;
-        sink.record_with_context(
+        context.monotonic_deadline_us = new_deadline;
+        context.lease_epoch = Some(new_epoch);
+        context.event_kind = Some("renewal".to_owned());
+
+        // 3. Commit the audit event before the state transition.
+        self.commit_audit(
+            &state,
+            &sink,
             &scope,
             "lease_renewed",
             None,
@@ -3547,7 +3840,19 @@ impl AuthorizationGate {
             context,
         )
         .context("committing lease renewal event")?;
-        Ok(())
+
+        // 4. Apply the transition only after the commit succeeded.
+        let session = &mut state.active[index].session;
+        session.expires_at_us = new_expiry;
+        session.lease_deadline_monotonic_us = new_deadline;
+        session.lease_epoch = new_epoch;
+        session.renewals = session.renewals.saturating_add(1);
+
+        Ok(LeaseRenewal {
+            wall_expiry_us: new_expiry,
+            monotonic_deadline_us: new_deadline,
+            lease_epoch: new_epoch,
+        })
     }
 
     /// Cancel the session covering `intent`, emitting a cancellation event.
@@ -3593,15 +3898,17 @@ impl AuthorizationGate {
             }
             .into());
         };
-        let (sink, context, evidence) = Self::audit_parts(&state.active[index], intent);
-        state.active.remove(index);
-        sink.record_with_context(
+        let (_, mut context, evidence) = Self::audit_parts(&state.active[index], intent);
+        context.event_kind = Some("cancellation".to_owned());
+        self.audited_removal(
+            &mut state,
+            index,
             &scope,
             "session_cancelled",
             Some(reason.to_owned()),
-            Some(&evidence),
+            &evidence,
+            &context,
             at_us,
-            context,
         )
         .context("committing session cancellation event")?;
         Ok(())
@@ -3611,6 +3918,21 @@ impl AuthorizationGate {
     #[must_use]
     pub fn is_active(&self) -> bool {
         !self.lock().active.is_empty()
+    }
+
+    /// Read the live session for an intent. Used by the session runtime to
+    /// report the lease identity and monotonic deadline in its final audit.
+    ///
+    /// # Errors
+    /// Returns a fail-closed denial when no live session covers the intent.
+    pub fn session_lease(&self, intent: &EgressIntent) -> anyhow::Result<AuthorizationSession> {
+        let state = self.lock();
+        state
+            .active
+            .iter()
+            .find(|item| Self::matches(item, intent, None))
+            .map(|item| item.session.clone())
+            .ok_or_else(|| RightsError::NoActiveAuthorization.into())
     }
 }
 
@@ -3732,6 +4054,7 @@ pub fn authorize_requests(
             plan_id: None,
             step_id: None,
             side_effect_boundary: None,
+            lease_deadline_monotonic_us: None,
         });
     }
     // One atomic commit: a later duplicate or invalid proof denies the whole
@@ -6043,6 +6366,7 @@ mod tests {
                 plan_id: Some("plan-abstract".to_owned()),
                 step_id: Some("capture".to_owned()),
                 side_effect_boundary: Some("provider_contact".to_owned()),
+                lease_deadline_monotonic_us: None,
             },
             ProofInstallation {
                 proof: make_proof(&second),
@@ -6051,6 +6375,7 @@ mod tests {
                 plan_id: Some("plan-abstract".to_owned()),
                 step_id: Some("storage".to_owned()),
                 side_effect_boundary: Some("durable_storage".to_owned()),
+                lease_deadline_monotonic_us: None,
             },
         ];
         assert!(

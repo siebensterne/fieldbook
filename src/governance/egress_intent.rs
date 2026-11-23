@@ -17,13 +17,19 @@ use std::{
     collections::BTreeSet,
     fmt,
     path::Path,
-    sync::{Mutex, MutexGuard},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicI64, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use anyhow::Context as _;
 use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
+
+use std::sync::LazyLock;
 
 use crate::{
     config::Settings,
@@ -42,11 +48,60 @@ use crate::{
 /// grant snapshot is issued. Revocation propagation is bounded by this value
 /// (15 minutes) unless a faster, tested notification channel exists. There is
 /// no instantaneous-revocation claim in this module.
-pub const MAX_LEASE_DURATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+pub const MAX_LEASE_DURATION: Duration = Duration::from_secs(15 * 60);
+
+/// Maximum interval between two authorization checkpoints in a receive loop.
+///
+/// A continuously ready socket never postpones a checkpoint: the worker checks
+/// its monotonic deadline at the top of every iteration and again after each
+/// read, before the frame is processed. This duration also bounds the time a
+/// revocation can stay unnoticed when the authority responds promptly.
+pub const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Longest permitted single authority refresh at a checkpoint.
+///
+/// A refresh that consumes more monotonic time than this fails closed even if
+/// it eventually returns a valid state; a hung authority cannot hold a session
+/// open past the bound.
+pub const AUTHORITY_REFRESH_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Assumed upper bound for scheduling the worker's stop action after a denial.
+pub const MAX_SCHEDULER_LATENCY: Duration = Duration::from_millis(250);
+
+/// Assumed upper bound for closing transport and publishing the final audit
+/// state after the stop action is scheduled.
+pub const MAX_CANCEL_LATENCY: Duration = Duration::from_millis(250);
+
+/// Renew a lease when this much monotonic time remains before its deadline.
+pub const LEASE_RENEWAL_MARGIN: Duration = Duration::from_secs(30);
 
 /// Maximum number of HTTP redirect hops followed under one intent before the
 /// caller must submit a fresh intent.
 pub const MAX_REDIRECTS: usize = 3;
+
+fn bounded_sum(parts: impl IntoIterator<Item = Duration>) -> Duration {
+    parts
+        .into_iter()
+        .try_fold(Duration::ZERO, |sum, part| sum.checked_add(part))
+        .unwrap_or(Duration::MAX)
+}
+
+/// Maximum revocation propagation bound `T_stop`.
+///
+/// `T_stop <= T_checkpoint + T_refresh + T_scheduler + T_cancel`, clipped to the
+/// declared lease duration: a lease that expires earlier stops the session by
+/// itself, so no longer bound is claimed. All four terms are monotonic client
+/// policy, not venue guarantees.
+#[must_use]
+pub fn revocation_propagation_bound() -> Duration {
+    bounded_sum([
+        CHECKPOINT_INTERVAL,
+        AUTHORITY_REFRESH_TIMEOUT,
+        MAX_SCHEDULER_LATENCY,
+        MAX_CANCEL_LATENCY,
+    ])
+    .min(MAX_LEASE_DURATION)
+}
 
 /// The concrete network authority a request will contact.
 ///
@@ -554,6 +609,9 @@ pub struct GrantSnapshot {
     pub snapshot_id: String,
     pub lease_duration_us: u64,
     pub issued_at_us: i64,
+    /// Stable identity of the lease issued from this snapshot. It is recorded
+    /// in every lifecycle audit event and does not change on renewal.
+    pub lease_id: String,
 }
 
 impl GrantSnapshot {
@@ -572,11 +630,13 @@ impl GrantSnapshot {
         if lease_duration_us == 0 || lease_duration_us > ceiling {
             return Err(RightsError::LeaseTooLong);
         }
+        let lease_id = format!("lease-{snapshot_id}-{registry_revision}-{issued_at_us}");
         Ok(Self {
             registry_revision,
             snapshot_id,
             lease_duration_us,
             issued_at_us,
+            lease_id,
         })
     }
 
@@ -595,6 +655,13 @@ pub struct AuthorizationSession {
     pub snapshot: GrantSnapshot,
     pub expires_at_us: i64,
     pub renewals: u64,
+    /// Lease identity and epoch carried by lifecycle audit events. The epoch
+    /// advances once per committed renewal; a failed renewal never advances it.
+    pub lease_id: String,
+    pub lease_epoch: u64,
+    /// Authoritative monotonic lease deadline. `None` marks a legacy proof that
+    /// is checked against the wall-clock expiry only.
+    pub lease_deadline_monotonic_us: Option<u64>,
 }
 
 /// The authority state observed at a reauthorization checkpoint.
@@ -628,13 +695,34 @@ impl InMemoryAuthority {
     /// Create an authority holding one valid snapshot at `revision`.
     #[must_use]
     pub fn new(revision: u64, snapshot_id: impl Into<String>) -> Self {
+        Self::new_with_snapshots(revision, [snapshot_id.into()])
+    }
+
+    /// Create an authority holding several valid snapshots at `revision`.
+    ///
+    /// A whole operation plan shares one handle, so revoking one snapshot or
+    /// advancing the revision is observed by every step at the next checkpoint.
+    #[must_use]
+    pub fn new_with_snapshots(revision: u64, snapshots: impl IntoIterator<Item = String>) -> Self {
         Self {
             state: Mutex::new(AuthorityState {
                 revision,
-                valid_snapshots: BTreeSet::from([snapshot_id.into()]),
+                valid_snapshots: snapshots.into_iter().collect(),
             }),
             failing: Mutex::new(false),
         }
+    }
+
+    /// Current registry revision held by this authority.
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.state().revision
+    }
+
+    /// Snapshot identities currently held as valid by this authority.
+    #[must_use]
+    pub fn snapshot_ids(&self) -> BTreeSet<String> {
+        self.state().valid_snapshots.clone()
     }
 
     fn state(&self) -> MutexGuard<'_, AuthorityState> {
@@ -692,4 +780,137 @@ pub fn declared_intent(settings: &Settings) -> Option<&EgressIntent> {
 /// Returns an error when the system clock cannot be read.
 pub fn checkpoint_now() -> anyhow::Result<i64> {
     now_us().context("reading the clock for authorization checkpoint")
+}
+
+/// Clock pair used by the authorization lifecycle.
+///
+/// Wall-clock microseconds decide *contract validity*: a rights record's
+/// effective interval is a calendar fact. Monotonic microseconds decide *lease
+/// deadlines*: moving the wall clock backwards or forwards can never extend or
+/// shorten a lease. Keeping the two in one injected trait lets offline tests
+/// advance either timeline independently while production uses
+/// [`SystemClock`].
+pub trait Clock: fmt::Debug + Send + Sync {
+    /// Wall-clock microseconds since the Unix epoch.
+    ///
+    /// # Errors
+    /// Returns an error when the system clock cannot be read.
+    fn wall_us(&self) -> anyhow::Result<i64>;
+
+    /// Monotonic microseconds since an arbitrary process-local origin.
+    fn monotonic_us(&self) -> u64;
+}
+
+/// Production clock: system wall time plus a process-monotonic origin.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn wall_us(&self) -> anyhow::Result<i64> {
+        now_us().context("reading the wall clock for authorization")
+    }
+
+    fn monotonic_us(&self) -> u64 {
+        static ORIGIN: LazyLock<Instant> = LazyLock::new(Instant::now);
+        ORIGIN
+            .elapsed()
+            .as_micros()
+            .min(u64::MAX as u128)
+            .try_into()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+/// Deterministic clock for abstract-value tests and fault injection.
+///
+/// Both timelines start at caller-declared values and change only when a test
+/// advances them. No real waiting or wall-clock adjustment is involved.
+#[derive(Debug, Default)]
+pub struct AbstractClock {
+    wall_us: AtomicI64,
+    monotonic_us: AtomicU64,
+}
+
+impl AbstractClock {
+    /// Create a clock at explicit abstract wall and monotonic instants.
+    #[must_use]
+    pub fn new(wall_us: i64, monotonic_us: u64) -> Self {
+        Self {
+            wall_us: AtomicI64::new(wall_us),
+            monotonic_us: AtomicU64::new(monotonic_us),
+        }
+    }
+
+    /// Set the abstract wall-clock instant.
+    pub fn set_wall_us(&self, value: i64) {
+        self.wall_us.store(value, Ordering::SeqCst);
+    }
+
+    /// Move the abstract wall clock by `delta`, in either direction.
+    pub fn advance_wall_us(&self, delta: i64) {
+        self.wall_us.fetch_add(delta, Ordering::SeqCst);
+    }
+
+    /// Set the abstract monotonic instant.
+    pub fn set_monotonic_us(&self, value: u64) {
+        self.monotonic_us.store(value, Ordering::SeqCst);
+    }
+
+    /// Move only the monotonic timeline forward.
+    pub fn advance_monotonic_us(&self, delta: u64) {
+        self.monotonic_us.fetch_add(delta, Ordering::SeqCst);
+    }
+}
+
+impl Clock for AbstractClock {
+    fn wall_us(&self) -> anyhow::Result<i64> {
+        Ok(self.wall_us.load(Ordering::SeqCst))
+    }
+
+    fn monotonic_us(&self) -> u64 {
+        self.monotonic_us.load(Ordering::SeqCst)
+    }
+}
+
+/// One authorization decision's two clock readings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecisionTime {
+    /// Wall-clock instant used for contract validity and audit recording.
+    pub wall_us: i64,
+    /// Monotonic instant used for lease deadlines. `None` keeps the legacy
+    /// wall-clock expiry check for proofs installed without a monotonic lease.
+    pub monotonic_us: Option<u64>,
+}
+
+impl DecisionTime {
+    /// A decision with only a wall-clock reading (legacy preflight callers).
+    #[must_use]
+    pub const fn wall_only(wall_us: i64) -> Self {
+        Self {
+            wall_us,
+            monotonic_us: None,
+        }
+    }
+
+    /// Sample both timelines from an injected clock.
+    ///
+    /// # Errors
+    /// Returns an error when the wall clock cannot be read.
+    pub fn from_clock(clock: &dyn Clock) -> anyhow::Result<Self> {
+        Ok(Self {
+            wall_us: clock.wall_us()?,
+            monotonic_us: Some(clock.monotonic_us()),
+        })
+    }
+
+    /// Whether a lease is over at this decision instant. A monotonic deadline,
+    /// when present, is authoritative; wall-clock expiry is the compatibility
+    /// fallback and is never allowed to extend a monotonic lease.
+    #[must_use]
+    pub fn lease_expired(&self, wall_expiry_us: i64, monotonic_deadline_us: Option<u64>) -> bool {
+        match (self.monotonic_us, monotonic_deadline_us) {
+            (Some(now), Some(deadline)) => now >= deadline,
+            _ => self.wall_us > wall_expiry_us,
+        }
+    }
 }
