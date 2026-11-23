@@ -17,7 +17,6 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::{
-    config::ExchangeKind,
     quality::QualityReport,
     rights::{AuthorizationScope, LicensingRegistry, UsageRight},
     taxonomy::{AssetClass, CountryCode, DataCategory, DepthModel, Frequency},
@@ -485,11 +484,22 @@ impl CoverageRecord {
     }
 
     /// Build the fully identified rights query for this coverage record.
-    #[must_use]
-    pub fn rights_query(&self, right: UsageRight) -> crate::rights::AuthorizationQuery {
-        use crate::rights::Licensee;
-        use crate::rights::Operation;
-        use crate::rights::ScopeSet;
+    ///
+    /// The record supplies the identities it owns. The remaining values are
+    /// declared explicitly here, never inferred from a command name or an
+    /// exchange, and the explicit builder rejects any omission. These are
+    /// abstract certification identities; a written permission must supply the
+    /// real values before a release can rely on this query.
+    /// # Errors
+    /// Returns the builder error when a required value cannot be supplied.
+    pub fn rights_query(
+        &self,
+        right: UsageRight,
+    ) -> Result<crate::rights::AuthorizationQuery, crate::rights::RightsError> {
+        use crate::rights::{
+            DeliveryMethod, Licensee, Operation, Purpose, Recipient, Retention, ScopeSet,
+            TimeWindow, UsageMode,
+        };
         let operation = match right {
             UsageRight::RealTimeAccess => Operation::RealTimeCapture,
             UsageRight::HistoricalStorage => Operation::HistoricalDataRetrieval,
@@ -497,25 +507,43 @@ impl CoverageRecord {
             UsageRight::DerivedData => Operation::DerivedDataCreation,
             UsageRight::Redistribution => Operation::ExternalRedistribution,
         };
-        // The declared command scope supplies the contract vocabulary; the
-        // coverage record overrides only the identities it genuinely owns.
-        AuthorizationScope::for_exchange(ExchangeKind::Kalshi, operation).with(|scope| {
-            scope.licensee = Licensee::system();
-            scope.venue = self.provider_id.clone();
-            scope.provider_id = self.provider_id.clone();
-            scope.source_id = self.source_id.clone();
-            scope.dataset_id = self.dataset.clone();
-            scope.product_id = self
-                .scope
-                .product
-                .clone()
-                .unwrap_or_else(|| self.dataset.clone());
-            scope.territory = self.scope.country.clone();
-            scope.usage_right = right;
-            scope.instruments = ScopeSet::All;
-            scope.fields = ScopeSet::All;
-            scope.modalities = ScopeSet::All;
-        })
+        let purpose = match right {
+            UsageRight::RealTimeAccess | UsageRight::InternalProcessing => {
+                Purpose::InternalAnalysis
+            }
+            UsageRight::HistoricalStorage => Purpose::HistoricalArchive,
+            UsageRight::DerivedData => Purpose::DerivedProduct,
+            UsageRight::Redistribution => Purpose::Redistribution,
+        };
+        AuthorizationScope::request()
+            .licensee(Licensee::system())
+            .venue(self.provider_id.clone())
+            .provider_id(self.provider_id.clone())
+            .source_id(self.source_id.clone())
+            .dataset_id(self.dataset.clone())
+            .product_id(
+                self.scope
+                    .product
+                    .clone()
+                    .unwrap_or_else(|| self.dataset.clone()),
+            )
+            .segment("certification-scope")
+            .territory(self.scope.country.clone())
+            .operation(operation)
+            .usage_right(right)
+            .usage_mode(UsageMode::NonDisplay)
+            .recipient(Recipient::Internal)
+            .purpose(purpose)
+            .delivery_method(DeliveryMethod::File)
+            .retention(Retention::NONE)
+            .instruments(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .fields(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .modalities(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .data_time_window(TimeWindow {
+                from_us: Some(0),
+                to_us: Some(4_102_444_800_000_000),
+            })
+            .build()
     }
 }
 
@@ -742,9 +770,10 @@ pub fn evaluate(
     if record.provider_id.trim().is_empty() {
         reject("provider_identity");
     }
-    let rights_proof = rights
-        .authorize(&record.rights_query(UsageRight::InternalProcessing), at_us)
-        .ok();
+    let rights_proof = record
+        .rights_query(UsageRight::InternalProcessing)
+        .ok()
+        .and_then(|query| rights.authorize(&query, at_us).ok());
     if rights_proof.is_none() {
         reject("licensing");
     }
@@ -851,22 +880,39 @@ mod tests {
     use crate::{
         quality::Reconciliation,
         rights::{
-            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, Operation, RightDecision,
+            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, DeliveryMethod, Licensee,
+            Operation, Purpose, Recipient, Retention, RightDecision, ScopeSet, TimeWindow,
+            UsageMode,
         },
     };
     use std::collections::BTreeMap;
 
     fn rights_scope() -> AuthorizationScope {
-        AuthorizationScope::for_exchange(ExchangeKind::Kalshi, Operation::InternalAnalytics).with(
-            |scope| {
-                scope.venue = "source".to_owned();
-                scope.provider_id = "source".to_owned();
-                scope.source_id = "source".to_owned();
-                scope.dataset_id = "quotes".to_owned();
-                scope.product_id = "quotes".to_owned();
-                scope.usage_right = UsageRight::InternalProcessing;
-            },
-        )
+        AuthorizationScope::request()
+            .licensee(Licensee::system())
+            .venue("source")
+            .provider_id("source")
+            .source_id("source")
+            .dataset_id("quotes")
+            .product_id("quotes")
+            .segment("certification-scope")
+            .territory(CountryCode::new("US").expect("country code"))
+            .operation(Operation::InternalAnalytics)
+            .usage_right(UsageRight::InternalProcessing)
+            .usage_mode(UsageMode::NonDisplay)
+            .recipient(Recipient::Internal)
+            .purpose(Purpose::InternalAnalysis)
+            .delivery_method(DeliveryMethod::File)
+            .retention(Retention::NONE)
+            .instruments(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .fields(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .modalities(ScopeSet::Universe("certification-universe-1".to_owned()))
+            .data_time_window(TimeWindow {
+                from_us: Some(0),
+                to_us: Some(4_102_444_800_000_000),
+            })
+            .build()
+            .expect("explicit rights fixture")
     }
 
     fn universe() -> ExpectedUniverse {

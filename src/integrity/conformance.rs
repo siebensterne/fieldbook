@@ -421,6 +421,56 @@ fn expected_signature(fixture: &ConformanceFixture) -> Vec<(String, String, Stri
 
 /// Test a declaration against a fixture and the supplied codec and rights
 /// registries.
+/// Build the explicit rights query for one declared conformance right.
+///
+/// Identities come from the declaration; every other value is supplied
+/// explicitly. Nothing is inferred from a command name or an exchange.
+fn declared_rights_query(
+    declaration: &ConformanceDeclaration,
+    right: UsageRight,
+) -> Result<AuthorizationScope, crate::rights::RightsError> {
+    use crate::rights::{
+        DeliveryMethod, Licensee, Purpose, Recipient, Retention, TimeWindow, UsageMode,
+    };
+    let operation = match right {
+        UsageRight::RealTimeAccess => Operation::RealTimeCapture,
+        UsageRight::HistoricalStorage => Operation::HistoricalDataRetrieval,
+        UsageRight::InternalProcessing => Operation::InternalAnalytics,
+        UsageRight::DerivedData => Operation::DerivedDataCreation,
+        UsageRight::Redistribution => Operation::ExternalRedistribution,
+    };
+    let purpose = match right {
+        UsageRight::RealTimeAccess | UsageRight::InternalProcessing => Purpose::InternalAnalysis,
+        UsageRight::HistoricalStorage => Purpose::HistoricalArchive,
+        UsageRight::DerivedData => Purpose::DerivedProduct,
+        UsageRight::Redistribution => Purpose::Redistribution,
+    };
+    AuthorizationScope::request()
+        .licensee(Licensee::system())
+        .venue(declaration.provider_id.clone())
+        .provider_id(declaration.provider_id.clone())
+        .source_id(declaration.source_id.clone())
+        .dataset_id(declaration.dataset.clone())
+        .product_id(declaration.product_id.clone())
+        .segment("conformance-scope")
+        .territory(declaration.manifest.country.clone())
+        .operation(operation)
+        .usage_right(right)
+        .usage_mode(UsageMode::NonDisplay)
+        .recipient(Recipient::Internal)
+        .purpose(purpose)
+        .delivery_method(DeliveryMethod::File)
+        .retention(Retention::NONE)
+        .instruments(ScopeSet::Universe("conformance-universe-1".to_owned()))
+        .fields(ScopeSet::Universe("conformance-universe-1".to_owned()))
+        .modalities(ScopeSet::Universe("conformance-universe-1".to_owned()))
+        .data_time_window(TimeWindow {
+            from_us: Some(0),
+            to_us: Some(4_102_444_800_000_000),
+        })
+        .build()
+}
+
 pub fn run_conformance(
     declaration: &ConformanceDeclaration,
     fixture: &ConformanceFixture,
@@ -562,29 +612,10 @@ pub fn run_conformance(
         denied_rights.push("no rights requirements declared".to_owned());
     }
     for right in &declaration.rights_required {
-        let operation = match right {
-            UsageRight::RealTimeAccess => Operation::RealTimeCapture,
-            UsageRight::HistoricalStorage => Operation::HistoricalDataRetrieval,
-            UsageRight::InternalProcessing => Operation::InternalAnalytics,
-            UsageRight::DerivedData => Operation::DerivedDataCreation,
-            UsageRight::Redistribution => Operation::ExternalRedistribution,
-        };
-        let query =
-            AuthorizationScope::for_exchange(crate::config::ExchangeKind::Kalshi, operation).with(
-                |scope| {
-                    scope.venue = declaration.provider_id.clone();
-                    scope.provider_id = declaration.provider_id.clone();
-                    scope.source_id = declaration.source_id.clone();
-                    scope.dataset_id = declaration.dataset.clone();
-                    scope.product_id = declaration.product_id.clone();
-                    scope.territory = declaration.manifest.country.clone();
-                    scope.usage_right = *right;
-                    scope.instruments = ScopeSet::All;
-                    scope.fields = ScopeSet::All;
-                    scope.modalities = ScopeSet::All;
-                },
-            );
-        if rights.authorize(&query, at_us).is_err() {
+        let granted = declared_rights_query(declaration, *right)
+            .ok()
+            .is_some_and(|query| rights.authorize(&query, at_us).is_ok());
+        if !granted {
             denied_rights.push(right.as_str().to_owned());
         }
     }
@@ -736,7 +767,6 @@ mod tests {
         DecodedObservation, //
         FeedCodec,          //
     };
-    use crate::config::ExchangeKind;
     use crate::governance::adapter::{
         AccessStatus, HistoricalCapability, Protocol, RecoveryCapability, TimestampCapability,
         Transport,
@@ -754,18 +784,8 @@ mod tests {
 
     fn rights_identity() -> AuthorizationIdentity {
         AuthorizationIdentity {
-            scope: AuthorizationScope::for_exchange(
-                ExchangeKind::Kalshi,
-                Operation::InternalAnalytics,
-            )
-            .with(|scope| {
-                scope.venue = "provider".to_owned();
-                scope.provider_id = "provider".to_owned();
-                scope.source_id = "source".to_owned();
-                scope.dataset_id = "quotes".to_owned();
-                scope.product_id = "quotes".to_owned();
-                scope.usage_right = UsageRight::InternalProcessing;
-            }),
+            scope: declared_rights_query(&declaration(), UsageRight::InternalProcessing)
+                .expect("explicit conformance fixture"),
             valid_from: 0,
             valid_until: Some(200),
         }

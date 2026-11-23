@@ -40,12 +40,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::{
-    config::{ExchangeKind, Settings},
-    report::write_json_atomic,
-    taxonomy::CountryCode,
-    time::now_us,
-};
+use crate::{config::Settings, report::write_json_atomic, taxonomy::CountryCode, time::now_us};
 
 /// Right being exercised over a dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -137,6 +132,12 @@ pub enum Purpose {
     DerivedProduct,
     HistoricalArchive,
     Compliance,
+    /// The exact reviewed wording `proprietary_own_account_trading_research`.
+    /// This is a distinct contract value. It is never an alias for
+    /// `internal_analysis`, academic research, non-commercial research or
+    /// `historical_archive`, and no value in an agreement may be substituted
+    /// for it by inference.
+    ProprietaryOwnAccountTradingResearch,
 }
 
 impl Purpose {
@@ -149,6 +150,9 @@ impl Purpose {
             Self::DerivedProduct => "derived_product",
             Self::HistoricalArchive => "historical_archive",
             Self::Compliance => "compliance",
+            Self::ProprietaryOwnAccountTradingResearch => {
+                "proprietary_own_account_trading_research"
+            }
         }
     }
 }
@@ -274,33 +278,87 @@ impl DeliveryMethod {
     }
 }
 
-/// Retention rule attached to a decision. A blank rule permits no retention.
+/// Explicit retention limit. `None` is a state, not an ambiguous absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum RetentionLimit {
+    /// No retention is granted. This is not the same as indefinite retention.
+    None,
+    /// Retention up to and including the stated maximum number of seconds.
+    Bounded(u64),
+    /// Indefinite retention, granted explicitly by the written permission.
+    Indefinite,
+}
+
+/// Typed retention policy: an explicit limit plus an explicit purge rule.
+///
+/// A grant covers a request when the requested limit is no wider and the
+/// requested purge rule is no weaker. Consequently a narrower request is
+/// permitted, an indefinite request can never be covered by a bounded grant,
+/// and an absent duration is unambiguously [`RetentionLimit::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Retention {
-    /// Maximum permitted age in seconds; absent means no retention is granted.
-    pub max_age_secs: Option<u64>,
-    /// Whether the data must be purged at the end of the interval.
+    pub limit: RetentionLimit,
+    /// Whether covered data must be purged at the end of the interval.
     pub purge_required: bool,
 }
 
 impl Retention {
     /// The fail-closed rule: no retention is permitted.
     pub const NONE: Self = Self {
-        max_age_secs: None,
+        limit: RetentionLimit::None,
         purge_required: true,
     };
+
+    /// A bounded retention rule with a mandatory purge.
+    #[must_use]
+    pub const fn bounded(max_age_secs: u64) -> Self {
+        Self {
+            limit: RetentionLimit::Bounded(max_age_secs),
+            purge_required: true,
+        }
+    }
+
+    /// Whether this grant's policy covers the requested policy.
+    #[must_use]
+    pub fn contains(&self, requested: &Self) -> bool {
+        let limit_ok = match (self.limit, requested.limit) {
+            (RetentionLimit::Indefinite, _) => true,
+            (RetentionLimit::Bounded(permitted), RetentionLimit::Bounded(asked)) => {
+                asked <= permitted
+            }
+            (RetentionLimit::Bounded(_), RetentionLimit::None) => true,
+            (RetentionLimit::None, RetentionLimit::None) => true,
+            (RetentionLimit::None, _) => false,
+            (RetentionLimit::Bounded(_), RetentionLimit::Indefinite) => false,
+        };
+        // A purge requirement in the grant cannot be weakened by the request.
+        let purge_ok = !self.purge_required || requested.purge_required;
+        limit_ok && purge_ok
+    }
 }
 
-/// A permitted set or an explicit unbounded set.
+/// A scope dimension with four explicit states.
 ///
-/// `Only` is restrictive: a requested subset is covered only when every
-/// requested member appears in the permitted list. `All` is only ever written
-/// by an operator in a rights record; it is never inferred from a command.
+/// `NotApplicable` records that the dimension has no meaning for the
+/// operation (for example, instruments for a source contact). `Named` is an
+/// explicit enumerated set; an empty `Named` set contains no members and is
+/// never converted into `All`. `Universe` names an explicitly versioned
+/// universe and is the only unbounded-but-defined set a capture may use.
+/// `All` is unrestricted and may only be written explicitly in an operator
+/// rights record; it is never a runtime default or an inferred wildcard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScopeSet<T> {
+    /// The dimension does not apply to this operation.
+    NotApplicable,
+    /// An explicit set of named members. Empty means "no members".
+    Named(Vec<T>),
+    /// Every member of a named, versioned universe.
+    Universe(String),
+    /// Unrestricted; operator-written only, never inferred.
     All,
-    Only(Vec<T>),
 }
 
 impl<T: PartialEq + Eq> ScopeSet<T> {
@@ -309,17 +367,34 @@ impl<T: PartialEq + Eq> ScopeSet<T> {
     pub fn contains_all(&self, requested: &Self) -> bool {
         match (self, requested) {
             (Self::All, _) => true,
-            (Self::Only(_), Self::All) => false,
-            (Self::Only(permitted), Self::Only(asked)) => {
+            (Self::NotApplicable, Self::NotApplicable) => true,
+            (Self::Named(permitted), Self::Named(asked)) => {
                 asked.iter().all(|item| permitted.contains(item))
             }
+            // A named request is a subset of the declared versioned universe.
+            (Self::Universe(_), Self::Named(_)) => true,
+            (Self::Universe(permitted), Self::Universe(asked)) => permitted == asked,
+            // A bounded grant never covers an unbounded or inapplicable request.
+            (Self::Named(_) | Self::Universe(_) | Self::NotApplicable, _) => false,
         }
+    }
+
+    /// Whether this set is bounded by an explicit enumeration or universe.
+    #[must_use]
+    pub const fn is_bounded(&self) -> bool {
+        !matches!(self, Self::All)
+    }
+
+    /// Whether the dimension applies to the operation.
+    #[must_use]
+    pub const fn is_applicable(&self) -> bool {
+        !matches!(self, Self::NotApplicable)
     }
 }
 
 impl<T> Default for ScopeSet<T> {
     fn default() -> Self {
-        Self::Only(Vec::new())
+        Self::Named(Vec::new())
     }
 }
 
@@ -335,25 +410,49 @@ pub struct TimeWindow {
 
 impl TimeWindow {
     /// Whether this permitted window covers every instant of `requested`.
+    ///
+    /// `None` is mathematical infinity: `from_us = None` is `-inf` and
+    /// `to_us = None` is `+inf`. A bounded endpoint therefore cannot cover an
+    /// unbounded request endpoint, while an unbounded grant endpoint covers
+    /// any bounded request endpoint.
     #[must_use]
     pub fn contains(&self, requested: &Self) -> bool {
         start_covered(self.from_us, requested.from_us) && end_covered(self.to_us, requested.to_us)
     }
+
+    /// Reject a window whose start is after its end.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidTimeWindow`] for a reversed window.
+    pub fn validate(&self) -> Result<(), RightsError> {
+        match (self.from_us, self.to_us) {
+            (Some(from), Some(to)) if from > to => Err(RightsError::InvalidTimeWindow),
+            _ => Ok(()),
+        }
+    }
 }
 
 fn start_covered(permitted: Option<i64>, requested: Option<i64>) -> bool {
-    match (permitted, requested) {
-        (_, None) => true,
-        (None, Some(_)) => false,
-        (Some(permitted), Some(requested)) => permitted <= requested,
+    match permitted {
+        // -inf covers every requested start, including another -inf.
+        None => true,
+        Some(permitted) => match requested {
+            // A finite bound cannot cover -inf.
+            None => false,
+            Some(requested) => permitted <= requested,
+        },
     }
 }
 
 fn end_covered(permitted: Option<i64>, requested: Option<i64>) -> bool {
-    match (permitted, requested) {
-        (_, None) => true,
-        (None, Some(_)) => false,
-        (Some(permitted), Some(requested)) => permitted >= requested,
+    match permitted {
+        // +inf covers every requested end, including another +inf.
+        None => true,
+        Some(permitted) => match requested {
+            // A finite bound cannot cover +inf.
+            None => false,
+            Some(requested) => permitted >= requested,
+        },
     }
 }
 
@@ -386,11 +485,11 @@ pub struct AuthorizationScope {
 }
 
 impl AuthorizationScope {
-    /// Reject a scope with an incomplete identity. A missing venue, provider,
-    /// source, product, segment or dataset is never an unrestricted wildcard.
+    /// Reject a scope with an incomplete identity, a placeholder segment, a
+    /// reversed interval or a scope set that is invalid for its operation.
     ///
     /// # Errors
-    /// Returns a [`RightsError`] describing the first absent identity field.
+    /// Returns a [`RightsError`] describing the first invalid field.
     pub fn validate(&self) -> Result<(), RightsError> {
         if self.venue.trim().is_empty() {
             return Err(RightsError::VenueAbsent);
@@ -399,14 +498,17 @@ impl AuthorizationScope {
             || self.source_id.trim().is_empty()
             || self.dataset_id.trim().is_empty()
             || self.product_id.trim().is_empty()
-            || self.segment.trim().is_empty()
         {
             return Err(RightsError::InvalidQuery);
         }
+        validate_segment(&self.segment)?;
+        self.data_time_window.validate()?;
+        validate_scope_sets(self)?;
         Ok(())
     }
 
     /// Whether every exact dimension of `requested` equals this grant.
+    /// Retention is scoped, not exact: a narrower retention request is allowed.
     #[must_use]
     pub fn exact_match(&self, requested: &Self) -> bool {
         self.licensee == requested.licensee
@@ -423,7 +525,6 @@ impl AuthorizationScope {
             && self.recipient == requested.recipient
             && self.purpose == requested.purpose
             && self.delivery_method == requested.delivery_method
-            && self.retention == requested.retention
     }
 
     /// Whether every scoped dimension of `requested` lies inside this grant.
@@ -433,6 +534,7 @@ impl AuthorizationScope {
             && self.fields.contains_all(&requested.fields)
             && self.modalities.contains_all(&requested.modalities)
             && self.data_time_window.contains(&requested.data_time_window)
+            && self.retention.contains(&requested.retention)
     }
 
     /// Full comparison used by authorization and by every egress recheck.
@@ -441,17 +543,18 @@ impl AuthorizationScope {
         self.exact_match(requested) && self.scope_contains(requested)
     }
 
-    /// A minimal scope used only to record a denial that had no proof.
+    /// A minimal diagnostic scope used only to record a denial that had no
+    /// proof. It is not a grant and is never installed as a permission.
     #[must_use]
     pub fn denial_scope(venue: &str, operation: Operation) -> Self {
         Self {
             licensee: Licensee::system(),
             venue: venue.to_owned(),
-            provider_id: "*".to_owned(),
-            source_id: "*".to_owned(),
-            dataset_id: "*".to_owned(),
-            product_id: "*".to_owned(),
-            segment: "*".to_owned(),
+            provider_id: "diagnostic-no-provider".to_owned(),
+            source_id: "diagnostic-no-source".to_owned(),
+            dataset_id: "diagnostic-no-dataset".to_owned(),
+            product_id: "diagnostic-no-product".to_owned(),
+            segment: "diagnostic-no-segment".to_owned(),
             territory: CountryCode::new("US").unwrap_or_default(),
             operation,
             usage_right: UsageRight::RealTimeAccess,
@@ -460,12 +563,60 @@ impl AuthorizationScope {
             purpose: Purpose::InternalAnalysis,
             delivery_method: DeliveryMethod::Query,
             retention: Retention::NONE,
-            instruments: ScopeSet::Only(Vec::new()),
-            fields: ScopeSet::Only(Vec::new()),
-            modalities: ScopeSet::Only(Vec::new()),
+            instruments: ScopeSet::NotApplicable,
+            fields: ScopeSet::NotApplicable,
+            modalities: ScopeSet::NotApplicable,
             data_time_window: TimeWindow::default(),
         }
     }
+}
+
+/// Legacy operational labels are not market segments and must never become a
+/// wildcard by inference from a command name.
+const LEGACY_SEGMENTS: [&str; 7] = [
+    "source-contact",
+    "reference",
+    "history",
+    "live-capture",
+    "analytics",
+    "display",
+    "distribution",
+];
+
+/// Validate that a segment names a real venue market segment from the written
+/// permission, not a placeholder or wildcard.
+fn validate_segment(segment: &str) -> Result<(), RightsError> {
+    let value = segment.trim();
+    if value.is_empty()
+        || value == "*"
+        || LEGACY_SEGMENTS.contains(&value.to_ascii_lowercase().as_str())
+    {
+        return Err(RightsError::InvalidSegment);
+    }
+    Ok(())
+}
+
+/// Operation-aware validation of scope sets. A source contact has no data
+/// scope; capture requires named members or an explicitly versioned universe
+/// and can never rely on an unrestricted `All`.
+fn validate_scope_sets(scope: &AuthorizationScope) -> Result<(), RightsError> {
+    if scope.operation == Operation::SourceContact {
+        if scope.instruments.is_applicable()
+            || scope.fields.is_applicable()
+            || scope.modalities.is_applicable()
+        {
+            return Err(RightsError::InvalidScopeSet);
+        }
+        return Ok(());
+    }
+    if scope.operation == Operation::RealTimeCapture
+        && (scope.instruments == ScopeSet::All
+            || scope.fields == ScopeSet::All
+            || scope.modalities == ScopeSet::All)
+    {
+        return Err(RightsError::InvalidScopeSet);
+    }
+    Ok(())
 }
 
 /// The scope requested by an operation. This is the type formerly called
@@ -474,145 +625,217 @@ pub type AuthorizationQuery = AuthorizationScope;
 /// The scope requested by a provider-facing command.
 pub type AuthorizationRequest = AuthorizationScope;
 
-impl AuthorizationScope {
-    /// Build the declared request for one provider-facing command.
-    ///
-    /// The product and segment are logical data-product identifiers, never
-    /// the command name. Each operation carries its own usage right, purpose,
-    /// delivery method and retention rule so one grant cannot stand in for a
-    /// different lifecycle step.
+/// Explicit builder for an authorization request.
+///
+/// No value is inferred from a command name, an exchange, an environment
+/// variable or a previous proof. Every required field must be supplied and
+/// [`AuthorizationRequestBuilder::build`] fails closed on the first omission.
+#[derive(Debug, Default)]
+pub struct AuthorizationRequestBuilder {
+    licensee: Option<Licensee>,
+    venue: Option<String>,
+    provider_id: Option<String>,
+    source_id: Option<String>,
+    dataset_id: Option<String>,
+    product_id: Option<String>,
+    segment: Option<String>,
+    territory: Option<CountryCode>,
+    operation: Option<Operation>,
+    usage_right: Option<UsageRight>,
+    usage_mode: Option<UsageMode>,
+    recipient: Option<Recipient>,
+    purpose: Option<Purpose>,
+    delivery_method: Option<DeliveryMethod>,
+    retention: Option<Retention>,
+    instruments: Option<ScopeSet<String>>,
+    fields: Option<ScopeSet<String>>,
+    modalities: Option<ScopeSet<Modality>>,
+    data_time_window: Option<TimeWindow>,
+}
+
+impl AuthorizationRequestBuilder {
+    /// Create an empty builder. No field has a default.
     #[must_use]
-    pub fn for_exchange(exchange: ExchangeKind, operation: Operation) -> Self {
-        let venue = exchange.to_string();
-        let (segment, usage_right, usage_mode, recipient, purpose, delivery, retention) =
-            match operation {
-                Operation::SourceContact => (
-                    "source-contact",
-                    UsageRight::RealTimeAccess,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::Compliance,
-                    DeliveryMethod::Query,
-                    Retention::NONE,
-                ),
-                Operation::ReferenceDataRetrieval => (
-                    "reference",
-                    UsageRight::RealTimeAccess,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::InternalAnalysis,
-                    DeliveryMethod::Snapshot,
-                    Retention::NONE,
-                ),
-                Operation::HistoricalDataRetrieval => (
-                    "history",
-                    UsageRight::HistoricalStorage,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::HistoricalArchive,
-                    DeliveryMethod::Batch,
-                    Retention {
-                        max_age_secs: Some(86_400),
-                        purge_required: true,
-                    },
-                ),
-                Operation::RealTimeCapture | Operation::RawStorage | Operation::Normalization => (
-                    "live-capture",
-                    UsageRight::RealTimeAccess,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::InternalAnalysis,
-                    DeliveryMethod::Stream,
-                    Retention {
-                        max_age_secs: Some(86_400),
-                        purge_required: true,
-                    },
-                ),
-                Operation::Replay | Operation::Backup | Operation::Retention => (
-                    "live-capture",
-                    UsageRight::HistoricalStorage,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::HistoricalArchive,
-                    DeliveryMethod::File,
-                    Retention {
-                        max_age_secs: Some(604_800),
-                        purge_required: true,
-                    },
-                ),
-                Operation::InternalAnalytics => (
-                    "analytics",
-                    UsageRight::InternalProcessing,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::InternalAnalysis,
-                    DeliveryMethod::File,
-                    Retention::NONE,
-                ),
-                Operation::DerivedDataCreation => (
-                    "analytics",
-                    UsageRight::DerivedData,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::DerivedProduct,
-                    DeliveryMethod::File,
-                    Retention {
-                        max_age_secs: Some(86_400),
-                        purge_required: true,
-                    },
-                ),
-                Operation::Display => (
-                    "display",
-                    UsageRight::InternalProcessing,
-                    UsageMode::Display,
-                    Recipient::Customer,
-                    Purpose::Display,
-                    DeliveryMethod::Stream,
-                    Retention::NONE,
-                ),
-                Operation::ExternalRedistribution => (
-                    "distribution",
-                    UsageRight::Redistribution,
-                    UsageMode::NonDisplay,
-                    Recipient::Customer,
-                    Purpose::Redistribution,
-                    DeliveryMethod::File,
-                    Retention {
-                        max_age_secs: Some(86_400),
-                        purge_required: true,
-                    },
-                ),
-                Operation::Deletion => (
-                    "live-capture",
-                    UsageRight::InternalProcessing,
-                    UsageMode::NonDisplay,
-                    Recipient::Internal,
-                    Purpose::Compliance,
-                    DeliveryMethod::Query,
-                    Retention::NONE,
-                ),
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the exact named licensee.
+    #[must_use]
+    pub fn licensee(mut self, value: Licensee) -> Self {
+        self.licensee = Some(value);
+        self
+    }
+
+    /// Set the exact venue identity.
+    #[must_use]
+    pub fn venue(mut self, value: impl Into<String>) -> Self {
+        self.venue = Some(value.into());
+        self
+    }
+
+    /// Set the exact provider identity.
+    #[must_use]
+    pub fn provider_id(mut self, value: impl Into<String>) -> Self {
+        self.provider_id = Some(value.into());
+        self
+    }
+
+    /// Set the exact source identity.
+    #[must_use]
+    pub fn source_id(mut self, value: impl Into<String>) -> Self {
+        self.source_id = Some(value.into());
+        self
+    }
+
+    /// Set the exact dataset identity.
+    #[must_use]
+    pub fn dataset_id(mut self, value: impl Into<String>) -> Self {
+        self.dataset_id = Some(value.into());
+        self
+    }
+
+    /// Set the exact source-product identity.
+    #[must_use]
+    pub fn product_id(mut self, value: impl Into<String>) -> Self {
+        self.product_id = Some(value.into());
+        self
+    }
+
+    /// Set the exact venue market segment.
+    #[must_use]
+    pub fn segment(mut self, value: impl Into<String>) -> Self {
+        self.segment = Some(value.into());
+        self
+    }
+
+    /// Set the exact contractual territory.
+    #[must_use]
+    pub fn territory(mut self, value: CountryCode) -> Self {
+        self.territory = Some(value);
+        self
+    }
+
+    /// Set the exact lifecycle operation.
+    #[must_use]
+    pub fn operation(mut self, value: Operation) -> Self {
+        self.operation = Some(value);
+        self
+    }
+
+    /// Set the exact usage right.
+    #[must_use]
+    pub fn usage_right(mut self, value: UsageRight) -> Self {
+        self.usage_right = Some(value);
+        self
+    }
+
+    /// Set the exact display mode.
+    #[must_use]
+    pub fn usage_mode(mut self, value: UsageMode) -> Self {
+        self.usage_mode = Some(value);
+        self
+    }
+
+    /// Set the exact recipient class.
+    #[must_use]
+    pub fn recipient(mut self, value: Recipient) -> Self {
+        self.recipient = Some(value);
+        self
+    }
+
+    /// Set the exact reviewed purpose.
+    #[must_use]
+    pub fn purpose(mut self, value: Purpose) -> Self {
+        self.purpose = Some(value);
+        self
+    }
+
+    /// Set the exact delivery method.
+    #[must_use]
+    pub fn delivery_method(mut self, value: DeliveryMethod) -> Self {
+        self.delivery_method = Some(value);
+        self
+    }
+
+    /// Set the exact typed retention policy.
+    #[must_use]
+    pub fn retention(mut self, value: Retention) -> Self {
+        self.retention = Some(value);
+        self
+    }
+
+    /// Set the exact instrument scope set.
+    #[must_use]
+    pub fn instruments(mut self, value: ScopeSet<String>) -> Self {
+        self.instruments = Some(value);
+        self
+    }
+
+    /// Set the exact field scope set.
+    #[must_use]
+    pub fn fields(mut self, value: ScopeSet<String>) -> Self {
+        self.fields = Some(value);
+        self
+    }
+
+    /// Set the exact modality scope set.
+    #[must_use]
+    pub fn modalities(mut self, value: ScopeSet<Modality>) -> Self {
+        self.modalities = Some(value);
+        self
+    }
+
+    /// Set the exact data-time window.
+    #[must_use]
+    pub fn data_time_window(mut self, value: TimeWindow) -> Self {
+        self.data_time_window = Some(value);
+        self
+    }
+
+    /// Finish the request, failing closed on the first missing value or
+    /// invalid scope. Nothing is defaulted and no wildcard is inferred.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::MissingField`] for an absent required value, or
+    /// the validation error for an invalid value.
+    pub fn build(self) -> Result<AuthorizationScope, RightsError> {
+        macro_rules! required {
+            ($field:literal, $value:expr) => {
+                $value.ok_or(RightsError::MissingField { field: $field })?
             };
-        Self {
-            licensee: Licensee::system(),
-            venue: venue.clone(),
-            provider_id: venue,
-            source_id: "provider-source".to_owned(),
-            dataset_id: "market-data".to_owned(),
-            product_id: "market-data-feed".to_owned(),
-            segment: segment.to_owned(),
-            territory: CountryCode::new("US").unwrap_or_default(),
-            operation,
-            usage_right,
-            usage_mode,
-            recipient,
-            purpose,
-            delivery_method: delivery,
-            retention,
-            instruments: ScopeSet::All,
-            fields: ScopeSet::All,
-            modalities: ScopeSet::All,
-            data_time_window: TimeWindow::default(),
         }
+        let scope = AuthorizationScope {
+            licensee: required!("licensee", self.licensee),
+            venue: required!("venue", self.venue),
+            provider_id: required!("provider_id", self.provider_id),
+            source_id: required!("source_id", self.source_id),
+            dataset_id: required!("dataset_id", self.dataset_id),
+            product_id: required!("product_id", self.product_id),
+            segment: required!("segment", self.segment),
+            territory: required!("territory", self.territory),
+            operation: required!("operation", self.operation),
+            usage_right: required!("usage_right", self.usage_right),
+            usage_mode: required!("usage_mode", self.usage_mode),
+            recipient: required!("recipient", self.recipient),
+            purpose: required!("purpose", self.purpose),
+            delivery_method: required!("delivery_method", self.delivery_method),
+            retention: required!("retention", self.retention),
+            instruments: required!("instruments", self.instruments),
+            fields: required!("fields", self.fields),
+            modalities: required!("modalities", self.modalities),
+            data_time_window: required!("data_time_window", self.data_time_window),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+}
+
+impl AuthorizationScope {
+    /// Start an explicit request. Every value must be supplied by the caller.
+    #[must_use]
+    pub fn request() -> AuthorizationRequestBuilder {
+        AuthorizationRequestBuilder::new()
     }
 }
 
@@ -666,7 +889,7 @@ impl AuthorizationIdentity {
     pub fn decision_key(&self) -> String {
         let scope = &self.scope;
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}",
             scope.licensee.as_str(),
             scope.venue,
             scope.provider_id,
@@ -681,10 +904,16 @@ impl AuthorizationIdentity {
             scope.recipient.as_str(),
             scope.purpose.as_str(),
             scope.delivery_method.as_str(),
-            scope
-                .retention
-                .max_age_secs
-                .map_or_else(|| "none".to_owned(), |age| age.to_string()),
+            match scope.retention.limit {
+                RetentionLimit::None => "retention-none".to_owned(),
+                RetentionLimit::Bounded(age) => format!("retention-{age}"),
+                RetentionLimit::Indefinite => "retention-indefinite".to_owned(),
+            },
+            if scope.retention.purge_required {
+                "purge"
+            } else {
+                "no-purge"
+            },
             scope.instruments,
             scope.fields,
             scope.modalities,
@@ -798,6 +1027,18 @@ pub enum RightsError {
     /// The query itself is incomplete.
     #[error("authorization query is incomplete")]
     InvalidQuery,
+    /// An explicit request is missing a required value; nothing was inferred.
+    #[error("authorization request is missing required field `{field}`")]
+    MissingField { field: &'static str },
+    /// A segment is a placeholder or wildcard, not a real market segment.
+    #[error("authorization segment is not a real market segment")]
+    InvalidSegment,
+    /// A time window has a start after its end.
+    #[error("authorization time window has from > to")]
+    InvalidTimeWindow,
+    /// A scope set is not valid for the requested operation.
+    #[error("authorization scope set is not valid for the operation")]
+    InvalidScopeSet,
     /// A record or query has no venue, so no egress can be authorized.
     #[error("authorization identity has no venue")]
     VenueAbsent,
@@ -1535,46 +1776,78 @@ pub fn require_provider_egress(venue: &str, operation: Operation) -> anyhow::Res
     default_gate().require_egress(venue, operation, now)
 }
 
-/// Authorize one provider-facing command from the runtime rights file.
+/// Authorize fully specified requests from the runtime rights file.
 ///
-/// Called by CLI dispatch before any library implementation runs, so a denial
-/// happens before a client, a socket, or a published file exists. A missing
-/// rights file or audit directory is a denial, never a default grant.
-///
-/// # Errors
-/// Returns an error for every fail-closed authorization condition.
-pub fn authorize_command(settings: &Settings, operation: Operation) -> anyhow::Result<()> {
-    authorize_operations(settings, &[operation])
-}
-
-/// Authorize every declared operation of one command before installing any
-/// proof, so a partial grant cannot survive a later denial.
+/// The caller supplies every exact value through
+/// [`AuthorizationScope::request`]; nothing is reconstructed from a command
+/// name, an exchange, an environment variable or an existing proof.
 ///
 /// # Errors
 /// Returns an error for every fail-closed authorization condition.
-pub fn authorize_operations(settings: &Settings, operations: &[Operation]) -> anyhow::Result<()> {
+pub fn authorize_requests(
+    settings: &Settings,
+    requests: &[AuthorizationRequest],
+) -> anyhow::Result<()> {
     let path = settings.governance.rights_file.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "{} requires a runtime authorization file: set [governance].rights_file or --rights-file",
-            operations.first().map_or("operation", |operation| operation.as_str())
+            "provider egress requires a runtime authorization file: set [governance].rights_file or --rights-file"
         )
     })?;
     let audit_dir = settings.governance.audit_dir.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
-            "{} requires a configured audit directory: set [governance].audit_dir or --rights-audit-dir",
-            operations.first().map_or("operation", |operation| operation.as_str())
+            "provider egress requires a configured audit directory: set [governance].audit_dir or --rights-audit-dir"
         )
     })?;
     let context = RightsContext::load(path, audit_dir)?;
-    let mut proofs = Vec::with_capacity(operations.len());
-    for &operation in operations {
-        let request = AuthorizationRequest::for_exchange(settings.exchange, operation);
-        proofs.push(context.authorize(&request, now_us()?)?);
+    let mut proofs = Vec::with_capacity(requests.len());
+    for request in requests {
+        proofs.push(context.authorize(request, now_us()?)?);
     }
     for proof in proofs {
         install_active_authorization(proof, context.sink().clone())?;
     }
     Ok(())
+}
+
+/// Authorize one provider-facing command from the runtime rights file.
+///
+/// Kept for callers that already hold an explicit [`AuthorizationRequest`].
+/// No generic command-derived request exists.
+///
+/// # Errors
+/// Returns an error for every fail-closed authorization condition.
+pub fn authorize_command(settings: &Settings, request: AuthorizationRequest) -> anyhow::Result<()> {
+    authorize_requests(settings, &[request])
+}
+
+/// Command-derived authorization is not permitted.
+///
+/// A command names an operation, not a provider, source product, venue
+/// segment, licensee, territory, purpose, recipient or scope. W1.1 introduces
+/// the explicit request builder; supplying the actual request from an
+/// `EgressIntent` belongs to the next work item. Until then a gated command
+/// denies rather than inventing a permission.
+///
+/// # Errors
+/// Always returns a fail-closed denial; the rights-file and audit-directory
+/// preconditions are checked first so a missing configuration is reported.
+pub fn authorize_operations(settings: &Settings, operations: &[Operation]) -> anyhow::Result<()> {
+    let first = operations
+        .first()
+        .map_or("operation", |operation| operation.as_str());
+    if settings.governance.rights_file.is_none() {
+        anyhow::bail!(
+            "{first} requires a runtime authorization file: set [governance].rights_file or --rights-file"
+        );
+    }
+    if settings.governance.audit_dir.is_none() {
+        anyhow::bail!(
+            "{first} requires a configured audit directory: set [governance].audit_dir or --rights-audit-dir"
+        );
+    }
+    anyhow::bail!(
+        "{first} requires an explicit AuthorizationRequest from the caller; generic command-derived scopes are not permitted"
+    )
 }
 
 /// Whether an authorization decision has been installed for this process.
@@ -1624,34 +1897,37 @@ impl AuthorizationGate {
 mod tests {
     use super::*;
 
+    /// Abstract exact request used as the base for mismatch probes. Every
+    /// value is supplied explicitly; no command-derived default exists.
     fn scope() -> AuthorizationScope {
-        AuthorizationScope {
-            licensee: Licensee::new("licensee-a").expect("licensee"),
-            venue: "venue-a".to_owned(),
-            provider_id: "provider-a".to_owned(),
-            source_id: "source-a".to_owned(),
-            dataset_id: "quotes".to_owned(),
-            product_id: "product-a".to_owned(),
-            segment: "live-capture".to_owned(),
-            territory: CountryCode::new("US").expect("country code"),
-            operation: Operation::RealTimeCapture,
-            usage_right: UsageRight::HistoricalStorage,
-            usage_mode: UsageMode::NonDisplay,
-            recipient: Recipient::Internal,
-            purpose: Purpose::HistoricalArchive,
-            delivery_method: DeliveryMethod::Stream,
-            retention: Retention {
-                max_age_secs: Some(86_400),
-                purge_required: true,
-            },
-            instruments: ScopeSet::Only(vec!["inst-a".to_owned(), "inst-b".to_owned()]),
-            fields: ScopeSet::Only(vec!["bid".to_owned(), "ask".to_owned()]),
-            modalities: ScopeSet::Only(vec![Modality::L2]),
-            data_time_window: TimeWindow {
+        AuthorizationScope::request()
+            .licensee(Licensee::new("licensee-a").expect("licensee"))
+            .venue("venue-a")
+            .provider_id("provider-a")
+            .source_id("source-a")
+            .dataset_id("quotes")
+            .product_id("product-a")
+            .segment("venue-a-equity-cash")
+            .territory(CountryCode::new("US").expect("country code"))
+            .operation(Operation::RealTimeCapture)
+            .usage_right(UsageRight::HistoricalStorage)
+            .usage_mode(UsageMode::NonDisplay)
+            .recipient(Recipient::Internal)
+            .purpose(Purpose::HistoricalArchive)
+            .delivery_method(DeliveryMethod::Stream)
+            .retention(Retention::bounded(86_400))
+            .instruments(ScopeSet::Named(vec![
+                "inst-a".to_owned(),
+                "inst-b".to_owned(),
+            ]))
+            .fields(ScopeSet::Named(vec!["bid".to_owned(), "ask".to_owned()]))
+            .modalities(ScopeSet::Named(vec![Modality::L2]))
+            .data_time_window(TimeWindow {
                 from_us: Some(1_000),
                 to_us: Some(9_000),
-            },
-        }
+            })
+            .build()
+            .expect("explicit abstract request")
     }
 
     fn record(
@@ -2064,6 +2340,9 @@ mod tests {
         registry.register(grant).expect("grant registered");
         let mut probe = scope();
         probe.operation = Operation::SourceContact;
+        probe.instruments = ScopeSet::NotApplicable;
+        probe.fields = ScopeSet::NotApplicable;
+        probe.modalities = ScopeSet::NotApplicable;
         assert!(
             matches!(
                 registry.authorize(&probe, 1),
@@ -2076,9 +2355,7 @@ mod tests {
     #[test]
     fn operation_mismatch_is_enforced_at_the_egress_boundary() {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let request =
-            AuthorizationScope::for_exchange(ExchangeKind::Kalshi, Operation::RealTimeCapture)
-                .with(|item| item.venue = "venue-a".to_owned());
+        let request = scope();
         let gate = AuthorizationGate::new();
         gate.install_scope(
             request.clone(),
@@ -2126,19 +2403,19 @@ mod tests {
         registry.register(grant).expect("grant registered");
         let mut extra_instrument = scope();
         extra_instrument.instruments =
-            ScopeSet::Only(vec!["inst-a".to_owned(), "inst-c".to_owned()]);
+            ScopeSet::Named(vec!["inst-a".to_owned(), "inst-c".to_owned()]);
         assert!(
             registry.authorize(&extra_instrument, 1).is_err(),
             "extra instrument denied"
         );
         let mut extra_field = scope();
-        extra_field.fields = ScopeSet::Only(vec!["bid".to_owned(), "mid".to_owned()]);
+        extra_field.fields = ScopeSet::Named(vec!["bid".to_owned(), "mid".to_owned()]);
         assert!(
             registry.authorize(&extra_field, 1).is_err(),
             "extra field denied"
         );
         let mut extra_modality = scope();
-        extra_modality.modalities = ScopeSet::Only(vec![Modality::L2, Modality::L3]);
+        extra_modality.modalities = ScopeSet::Named(vec![Modality::L2, Modality::L3]);
         assert!(
             registry.authorize(&extra_modality, 1).is_err(),
             "extra modality denied"
@@ -2343,7 +2620,7 @@ mod tests {
             "assertion context at line 2321"
         );
         assert_eq!(
-            event.segment, "live-capture",
+            event.segment, "venue-a-equity-cash",
             "assertion context at line 2322"
         );
         assert_eq!(
@@ -2449,7 +2726,7 @@ mod tests {
         let second = scope_with(|item| {
             item.provider_id = "provider-b".to_owned();
             item.product_id = "product-b".to_owned();
-            item.segment = "reference".to_owned();
+            item.segment = "venue-a-equity-derivatives".to_owned();
             item.operation = Operation::ReferenceDataRetrieval;
         });
         gate.install_scope(
@@ -2496,32 +2773,47 @@ mod tests {
     }
 
     #[test]
-    fn declared_command_scope_never_uses_the_command_name_as_product() {
-        for operation in [
-            Operation::RealTimeCapture,
-            Operation::SourceContact,
-            Operation::ReferenceDataRetrieval,
-            Operation::DerivedDataCreation,
-        ] {
-            let request = AuthorizationScope::for_exchange(ExchangeKind::Kalshi, operation);
-            assert_eq!(
-                request.product_id, "market-data-feed",
-                "assertion context at line 2465"
-            );
-            assert_ne!(
-                request.product_id,
-                operation.as_str(),
-                "assertion context at line 2466"
-            );
-            assert_eq!(
-                request.operation, operation,
-                "assertion context at line 2467"
-            );
-            assert!(
-                !request.segment.is_empty(),
-                "assertion context at line 2468"
-            );
-        }
+    fn explicit_request_builder_never_infers_values() {
+        let request = AuthorizationScope::request()
+            .licensee(Licensee::new("licensee-a").expect("licensee"))
+            .venue("venue-a")
+            .provider_id("provider-a")
+            .source_id("source-a")
+            .dataset_id("quotes")
+            .product_id("exact-source-product")
+            .segment("venue-a-equity-cash")
+            .territory(CountryCode::new("US").expect("country code"))
+            .operation(Operation::RealTimeCapture)
+            .usage_right(UsageRight::HistoricalStorage)
+            .usage_mode(UsageMode::NonDisplay)
+            .recipient(Recipient::Internal)
+            .purpose(Purpose::ProprietaryOwnAccountTradingResearch)
+            .delivery_method(DeliveryMethod::Stream)
+            .retention(Retention::bounded(86_400))
+            .instruments(ScopeSet::Named(vec!["inst-a".to_owned()]))
+            .fields(ScopeSet::Named(vec!["bid".to_owned()]))
+            .modalities(ScopeSet::Named(vec![Modality::L2]))
+            .data_time_window(TimeWindow {
+                from_us: Some(10),
+                to_us: Some(20),
+            })
+            .build()
+            .expect("explicit request");
+        assert_eq!(request.product_id, "exact-source-product");
+        assert_ne!(request.product_id, request.operation.as_str());
+        assert_eq!(
+            request.purpose.as_str(),
+            "proprietary_own_account_trading_research"
+        );
+        assert_ne!(request.territory, CountryCode::default());
+
+        // Every required value is mandatory; nothing is inferred.
+        let missing = AuthorizationScope::request().build();
+        assert!(matches!(missing, Err(RightsError::MissingField { .. })));
+
+        // Legacy operational labels are not market segments.
+        let legacy_segment = scope_with(|item| item.segment = "live-capture".to_owned());
+        assert_eq!(legacy_segment.validate(), Err(RightsError::InvalidSegment));
     }
 
     #[test]
@@ -2535,5 +2827,364 @@ mod tests {
         );
         let expected_right = scope().usage_right;
         assert_eq!(display.usage_right, expected_right, "usage right unchanged");
+    }
+
+    fn registry_for(request: &AuthorizationScope) -> LicensingRegistry {
+        let mut registry = LicensingRegistry::new();
+        registry
+            .register(permitted_record(request))
+            .expect("grant registered");
+        registry
+    }
+
+    #[test]
+    fn time_window_containment_truth_table() {
+        let bounded = TimeWindow {
+            from_us: Some(10),
+            to_us: Some(20),
+        };
+        let unbounded = TimeWindow::default();
+        let half_open_start = TimeWindow {
+            from_us: None,
+            to_us: Some(20),
+        };
+        let half_open_end = TimeWindow {
+            from_us: Some(10),
+            to_us: None,
+        };
+        assert!(
+            !bounded.contains(&unbounded),
+            "bounded cannot cover unbounded"
+        );
+        assert!(
+            !half_open_start.contains(&unbounded),
+            "half-bounded end cannot cover unbounded"
+        );
+        assert!(
+            !half_open_end.contains(&unbounded),
+            "half-bounded start cannot cover unbounded"
+        );
+        assert!(unbounded.contains(&bounded), "unbounded covers bounded");
+        assert!(unbounded.contains(&unbounded), "unbounded covers unbounded");
+        assert!(
+            half_open_start.contains(&bounded),
+            "-inf start covers a finite start"
+        );
+        assert!(
+            half_open_end.contains(&bounded),
+            "+inf end covers a finite end"
+        );
+        assert!(
+            !bounded.contains(&half_open_start),
+            "finite start cannot cover -inf"
+        );
+        assert!(
+            !bounded.contains(&half_open_end),
+            "finite end cannot cover +inf"
+        );
+    }
+
+    #[test]
+    fn data_time_window_from_must_not_exceed_to() {
+        let reversed = TimeWindow {
+            from_us: Some(20),
+            to_us: Some(10),
+        };
+        assert_eq!(reversed.validate(), Err(RightsError::InvalidTimeWindow));
+        let mut request = scope();
+        request.data_time_window = reversed;
+        assert!(
+            matches!(request.validate(), Err(RightsError::InvalidTimeWindow)),
+            "a reversed data window is rejected"
+        );
+        let mut record = permitted_record(&scope());
+        record.identity.valid_from = 20;
+        record.identity.valid_until = Some(10);
+        assert!(
+            matches!(
+                record.identity.validate_interval(),
+                Err(RightsError::InvalidInterval)
+            ),
+            "a reversed operational interval is rejected"
+        );
+    }
+
+    #[test]
+    fn unbounded_request_requires_unbounded_grant() {
+        let unbounded = TimeWindow::default();
+        let bounded_grant = registry_for(&scope_with(|item| {
+            item.data_time_window = TimeWindow {
+                from_us: Some(10),
+                to_us: Some(20),
+            };
+        }));
+        let mut unbounded_request = scope();
+        unbounded_request.data_time_window = unbounded;
+        assert!(
+            bounded_grant.authorize(&unbounded_request, 1).is_err(),
+            "bounded grant cannot authorize an unbounded data window"
+        );
+
+        let half_bounded_grant = registry_for(&scope_with(|item| {
+            item.data_time_window = TimeWindow {
+                from_us: None,
+                to_us: Some(20),
+            };
+        }));
+        assert!(
+            half_bounded_grant.authorize(&unbounded_request, 1).is_err(),
+            "half-bounded grant cannot authorize an unbounded data window"
+        );
+
+        let unbounded_grant = registry_for(&scope_with(|item| {
+            item.data_time_window = unbounded;
+        }));
+        assert!(
+            unbounded_grant.authorize(&unbounded_request, 1).is_ok(),
+            "unbounded grant covers an unbounded request"
+        );
+        assert!(
+            unbounded_grant.authorize(&scope(), 1).is_ok(),
+            "unbounded grant also covers a bounded request"
+        );
+    }
+
+    #[test]
+    fn scope_set_states_are_distinct() {
+        let empty_named = ScopeSet::Named(Vec::<String>::new());
+        let named_a = ScopeSet::Named(vec!["inst-a".to_owned()]);
+        assert!(
+            !empty_named.contains_all(&named_a),
+            "an empty Named set is not All"
+        );
+        assert!(ScopeSet::All.contains_all(&named_a), "All covers Named");
+        assert!(
+            !named_a.contains_all(&ScopeSet::All),
+            "Named cannot cover All"
+        );
+        let universe_v1 = ScopeSet::<String>::Universe("v1".to_owned());
+        let universe_v2 = ScopeSet::<String>::Universe("v2".to_owned());
+        assert!(
+            !universe_v1.contains_all(&universe_v2),
+            "a versioned universe does not cover another version"
+        );
+        assert!(
+            universe_v1.contains_all(&named_a),
+            "a named subset is inside the declared universe"
+        );
+        let na = ScopeSet::<String>::NotApplicable;
+        assert!(
+            na.contains_all(&na) && !named_a.contains_all(&na),
+            "NotApplicable is a distinct state"
+        );
+        let default = ScopeSet::<String>::default();
+        assert_eq!(default, empty_named, "default is empty Named, never All");
+    }
+
+    #[test]
+    fn capture_requires_named_or_versioned_universe() {
+        let all = scope_with(|item| {
+            item.instruments = ScopeSet::All;
+            item.fields = ScopeSet::All;
+            item.modalities = ScopeSet::All;
+        });
+        assert_eq!(
+            all.validate(),
+            Err(RightsError::InvalidScopeSet),
+            "capture cannot rely on an unrestricted All"
+        );
+        let universe = scope_with(|item| {
+            item.instruments = ScopeSet::Universe("v1".to_owned());
+            item.fields = ScopeSet::Universe("v1".to_owned());
+            item.modalities = ScopeSet::Universe("v1".to_owned());
+        });
+        assert!(universe.validate().is_ok(), "a versioned universe is valid");
+    }
+
+    #[test]
+    fn source_contact_uses_not_applicable_scope_sets() {
+        let contact = scope_with(|item| {
+            item.operation = Operation::SourceContact;
+            item.instruments = ScopeSet::NotApplicable;
+            item.fields = ScopeSet::NotApplicable;
+            item.modalities = ScopeSet::NotApplicable;
+        });
+        assert!(
+            contact.validate().is_ok(),
+            "source contact has no data scope"
+        );
+        let named = scope_with(|item| {
+            item.operation = Operation::SourceContact;
+        });
+        assert_eq!(
+            named.validate(),
+            Err(RightsError::InvalidScopeSet),
+            "source contact cannot name a data scope"
+        );
+    }
+
+    #[test]
+    fn retention_policy_containment_and_narrower_requests() {
+        let grant = Retention::bounded(100);
+        let mut registry = LicensingRegistry::new();
+        registry
+            .register(permitted_record(&scope_with(|item| {
+                item.retention = grant;
+            })))
+            .expect("bounded grant registered");
+        let narrower = scope_with(|item| item.retention = Retention::bounded(50));
+        assert!(
+            registry.authorize(&narrower, 1).is_ok(),
+            "a narrower retention request is permitted"
+        );
+        let none = scope_with(|item| item.retention = Retention::NONE);
+        assert!(
+            registry.authorize(&none, 1).is_ok(),
+            "no retention is narrower than bounded retention"
+        );
+        let indefinite = scope_with(|item| {
+            item.retention = Retention {
+                limit: RetentionLimit::Indefinite,
+                purge_required: false,
+            };
+        });
+        assert!(
+            registry.authorize(&indefinite, 1).is_err(),
+            "an indefinite request cannot exceed a bounded grant"
+        );
+        assert!(
+            !grant.contains(&Retention::bounded(200)),
+            "bounded grant does not cover a wider bounded request"
+        );
+        assert!(
+            !Retention::NONE.contains(&Retention::bounded(1)),
+            "None is unambiguously no retention, not unbounded"
+        );
+        assert!(
+            Retention {
+                limit: RetentionLimit::Indefinite,
+                purge_required: false,
+            }
+            .contains(&Retention::bounded(1_000)),
+            "an explicit indefinite grant covers a bounded request"
+        );
+    }
+
+    #[test]
+    fn missing_licensee_is_denied() {
+        let missing = AuthorizationScope::request().venue("venue-a").build();
+        assert!(
+            matches!(
+                missing,
+                Err(RightsError::MissingField { field: "licensee" })
+            ),
+            "a request without a licensee is rejected"
+        );
+        let registry = registry_for(&scope());
+        let other = scope_with(|item| {
+            item.licensee = Licensee::new("licensee-b").expect("other licensee");
+        });
+        assert!(
+            registry.authorize(&other, 1).is_err(),
+            "a different licensee is not covered by the grant"
+        );
+    }
+
+    #[test]
+    fn wrong_purpose_is_denied_and_exact_wording_is_preserved() {
+        let registry = registry_for(&scope());
+        let other = scope_with(|item| {
+            item.purpose = Purpose::ProprietaryOwnAccountTradingResearch;
+        });
+        assert!(
+            registry.authorize(&other, 1).is_err(),
+            "a different purpose is not covered by the grant"
+        );
+        assert_eq!(
+            Purpose::ProprietaryOwnAccountTradingResearch.as_str(),
+            "proprietary_own_account_trading_research",
+            "the declared wording is preserved verbatim"
+        );
+        assert_ne!(
+            Purpose::ProprietaryOwnAccountTradingResearch,
+            Purpose::InternalAnalysis,
+            "the declared purpose is never aliased to internal analysis"
+        );
+        assert_ne!(
+            "proprietary_own_account_trading_research", "academic_research",
+            "the declared purpose is never aliased to academic research"
+        );
+        assert_ne!(
+            "proprietary_own_account_trading_research", "non_commercial_research",
+            "the declared purpose is never aliased to non-commercial research"
+        );
+    }
+
+    #[test]
+    fn wrong_recipient_is_denied() {
+        let registry = registry_for(&scope());
+        let other = scope_with(|item| item.recipient = Recipient::Customer);
+        assert!(
+            registry.authorize(&other, 1).is_err(),
+            "a different recipient class is not covered by the grant"
+        );
+    }
+
+    #[test]
+    fn ambiguous_grants_fail_closed() {
+        let mut registry = LicensingRegistry::new();
+        registry
+            .register(permitted_record(&scope()))
+            .expect("permitted grant registered");
+        let mut conflicting = permitted_record(&scope());
+        conflicting.decision = RightDecision::Prohibited;
+        conflicting.audit.contract_revision = 2;
+        conflicting.audit.licence_document_hash = "b".repeat(64);
+        assert!(
+            matches!(
+                registry.register(conflicting),
+                Err(RightsError::Conflict { .. })
+            ),
+            "an overlapping contradictory grant is refused"
+        );
+        assert!(
+            registry.authorize(&scope(), 1).is_ok(),
+            "the original unambiguous grant remains"
+        );
+    }
+
+    #[test]
+    fn every_exact_identity_dimension_mismatch_denies() {
+        let registry = registry_for(&scope());
+        type Mutation = (&'static str, fn(&mut AuthorizationScope));
+        let mutations: [Mutation; 8] = [
+            ("provider", |item| {
+                item.provider_id = "provider-b".to_owned()
+            }),
+            ("source", |item| item.source_id = "source-b".to_owned()),
+            ("dataset", |item| {
+                item.dataset_id = "other-dataset".to_owned()
+            }),
+            ("product", |item| {
+                item.product_id = "other-product".to_owned()
+            }),
+            ("segment", |item| {
+                item.segment = "venue-a-other-segment".to_owned()
+            }),
+            ("venue", |item| item.venue = "venue-b".to_owned()),
+            ("territory", |item| {
+                item.territory = CountryCode::new("GB").expect("GB")
+            }),
+            ("delivery", |item| {
+                item.delivery_method = DeliveryMethod::File
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let request = scope_with(mutate);
+            assert!(
+                registry.authorize(&request, 1).is_err(),
+                "{name} mismatch must deny"
+            );
+        }
     }
 }

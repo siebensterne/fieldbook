@@ -34,7 +34,7 @@ use fieldbook::{
     config::{ExchangeKind, KalshiSettings, Settings},
     exchange::{Exchange, KalshiExchange},
     model::{ExchangeEvent, SourceId},
-    rights::{Operation, authorize_command},
+    rights::{Operation, authorize_operations},
 };
 use tokio::time::{Instant, timeout, timeout_at};
 
@@ -53,7 +53,7 @@ fn network() -> &'static fieldbook::config::NetworkSettings {
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("target/live-audit")),
         );
-        authorize_command(&settings, Operation::RealTimeCapture)
+        authorize_operations(&settings, &[Operation::RealTimeCapture])
             .expect("rights must authorize this venue and operation");
         settings.network
     })

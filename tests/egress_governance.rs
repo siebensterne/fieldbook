@@ -26,7 +26,7 @@ use fieldbook::{
     distribution::cli::Cli,
     egress::http_client,
     exchange::{CoinbaseExchange, KrakenExchange},
-    rights::{Operation, authorize_command, has_active_authorization, require_provider_egress},
+    rights::{Operation, authorize_operations, has_active_authorization, require_provider_egress},
     ws::{self, ConnectOptions},
 };
 
@@ -46,7 +46,7 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          source_id = \"provider-source\"\n\
          dataset_id = \"market-data\"\n\
          product_id = \"market-data-feed\"\n\
-         segment = \"live-capture\"\n\
+         segment = \"venue-equity-cash\"\n\
          territory = \"US\"\n\
          operation = \"real_time_capture\"\n\
          usage_right = \"real_time_access\"\n\
@@ -54,14 +54,14 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          recipient = \"internal\"\n\
          purpose = \"internal_analysis\"\n\
          delivery_method = \"stream\"\n\
-         instruments = \"all\"\n\
-         fields = \"all\"\n\
-         modalities = \"all\"\n\
+         instruments = {{ universe = \"governance-universe-1\" }}\n\
+         fields = {{ universe = \"governance-universe-1\" }}\n\
+         modalities = {{ universe = \"governance-universe-1\" }}\n\
          valid_from = 0\n\
          valid_until = {valid_until}\n\
          \n\
          [rights.identity.retention]\n\
-         max_age_secs = 86400\n\
+         limit = {{ bounded = 86400 }}\n\
          purge_required = true\n\
          \n\
          [rights.identity.data_time_window]\n\
@@ -106,7 +106,7 @@ fn collect_without_rights_file_denies_before_egress() {
     );
     let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
     settings.governance.rights_file = None;
-    let error = authorize_command(&settings, Operation::RealTimeCapture)
+    let error = authorize_operations(&settings, &[Operation::RealTimeCapture])
         .expect_err("collection without a rights file must deny");
     assert!(
         error.to_string().contains("runtime authorization file"),
@@ -135,17 +135,17 @@ fn collect_without_rights_file_denies_before_egress() {
 fn expired_and_unknown_rights_deny_every_gated_command() {
     let (_expired_dir, expired) = settings_with_rights(&rights_toml("kalshi", "permitted", 1));
     assert!(
-        authorize_command(&expired, Operation::RealTimeCapture).is_err(),
+        authorize_operations(&expired, &[Operation::RealTimeCapture]).is_err(),
         "an expired right denies collection"
     );
     assert!(
-        authorize_command(&expired, Operation::ReferenceDataRetrieval).is_err(),
+        authorize_operations(&expired, &[Operation::ReferenceDataRetrieval]).is_err(),
         "an expired right denies discovery"
     );
     let (_unknown_dir, unknown) =
         settings_with_rights(&rights_toml("kalshi", "contract_required", i64::MAX));
     assert!(
-        authorize_command(&unknown, Operation::SourceContact).is_err(),
+        authorize_operations(&unknown, &[Operation::SourceContact]).is_err(),
         "an UNKNOWN right denies a network probe"
     );
     assert!(
@@ -158,7 +158,7 @@ fn expired_and_unknown_rights_deny_every_gated_command() {
 fn right_without_a_venue_is_refused_at_load() {
     let (_directory, settings) = settings_with_rights(&rights_toml("", "permitted", i64::MAX));
     assert!(
-        authorize_command(&settings, Operation::RealTimeCapture).is_err(),
+        authorize_operations(&settings, &[Operation::RealTimeCapture]).is_err(),
         "a record without a venue is never a grant"
     );
     assert!(
@@ -212,7 +212,7 @@ fn analytics_export_denial_publishes_nothing() {
     let mut settings = Settings::for_exchange(ExchangeKind::Kalshi);
     settings.governance.rights_file = None;
     assert!(
-        authorize_command(&settings, Operation::DerivedDataCreation).is_err(),
+        authorize_operations(&settings, &[Operation::DerivedDataCreation]).is_err(),
         "derived-data publication requires a right"
     );
     let published: Vec<_> = std::fs::read_dir(&staging)
