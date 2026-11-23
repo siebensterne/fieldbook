@@ -30,7 +30,7 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        LazyLock, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -41,9 +41,14 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::config::Settings;
+use crate::egress_intent::{
+    AuthorityRefresh, AuthorizationSession, EgressIntent, EndpointIdentity, GrantSnapshot,
+    InMemoryAuthority, MAX_LEASE_DURATION,
+};
 use crate::report::write_json_atomic;
 use crate::taxonomy::CountryCode;
 use crate::time::now_us;
+use crate::util::sha256_hex;
 
 /// Right being exercised over a dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -485,6 +490,11 @@ pub struct AuthorizationScope {
     pub fields: ScopeSet<String>,
     pub modalities: ScopeSet<Modality>,
     pub data_time_window: TimeWindow,
+    /// Rights-file-approved endpoint authorities. This is a grant-only field:
+    /// an empty set denies every real egress. It is compared with an intent's
+    /// endpoint separately from the exact and scoped dimensions.
+    #[serde(default)]
+    pub approved_endpoints: Vec<EndpointIdentity>,
 }
 
 impl AuthorizationScope {
@@ -546,6 +556,13 @@ impl AuthorizationScope {
         self.exact_match(requested) && self.scope_contains(requested)
     }
 
+    /// Whether the requested endpoint is inside the rights-file-approved set.
+    /// An empty set authorizes no endpoint; there is no implicit host wildcard.
+    #[must_use]
+    pub fn contains_endpoint(&self, endpoint: &EndpointIdentity) -> bool {
+        self.approved_endpoints.contains(endpoint)
+    }
+
     /// A minimal diagnostic scope used only to record a denial that had no
     /// proof. It is not a grant and is never installed as a permission.
     #[must_use]
@@ -570,6 +587,7 @@ impl AuthorizationScope {
             fields: ScopeSet::NotApplicable,
             modalities: ScopeSet::NotApplicable,
             data_time_window: TimeWindow::default(),
+            approved_endpoints: Vec::new(),
         }
     }
 }
@@ -654,6 +672,7 @@ pub struct AuthorizationRequestBuilder {
     fields: Option<ScopeSet<String>>,
     modalities: Option<ScopeSet<Modality>>,
     data_time_window: Option<TimeWindow>,
+    approved_endpoints: Option<Vec<EndpointIdentity>>,
 }
 
 impl AuthorizationRequestBuilder {
@@ -796,6 +815,25 @@ impl AuthorizationRequestBuilder {
         self
     }
 
+    /// Add one rights-file-approved endpoint authority to the grant.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidEndpoint`] for an unparseable URL.
+    pub fn endpoint(mut self, url: &str) -> Result<Self, RightsError> {
+        let endpoint = EndpointIdentity::from_url(url)?;
+        self.approved_endpoints
+            .get_or_insert_with(Vec::new)
+            .push(endpoint);
+        Ok(self)
+    }
+
+    /// Set the whole approved endpoint set explicitly.
+    #[must_use]
+    pub fn approved_endpoints(mut self, endpoints: Vec<EndpointIdentity>) -> Self {
+        self.approved_endpoints = Some(endpoints);
+        self
+    }
+
     /// Finish the request, failing closed on the first missing value or
     /// invalid scope. Nothing is defaulted and no wildcard is inferred.
     ///
@@ -828,6 +866,9 @@ impl AuthorizationRequestBuilder {
             fields: required!("fields", self.fields),
             modalities: required!("modalities", self.modalities),
             data_time_window: required!("data_time_window", self.data_time_window),
+            // An unwritten approved set denies every real endpoint; there is
+            // no implicit wildcard host.
+            approved_endpoints: self.approved_endpoints.unwrap_or_default(),
         };
         scope.validate()?;
         Ok(scope)
@@ -892,7 +933,7 @@ impl AuthorizationIdentity {
     pub fn decision_key(&self) -> String {
         let scope = &self.scope;
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
             scope.licensee.as_str(),
             scope.venue,
             scope.provider_id,
@@ -921,6 +962,7 @@ impl AuthorizationIdentity {
             scope.fields,
             scope.modalities,
             scope.data_time_window,
+            scope.approved_endpoints,
         )
     }
 
@@ -1022,6 +1064,15 @@ pub struct AuthorizationProof {
     pub licence_reference: String,
     pub licence_document_hash: String,
     pub contract_revision: u32,
+    /// Rights-registry revision at issuance. A later revision invalidates the
+    /// grant snapshot at the next checkpoint.
+    pub registry_revision: u64,
+    /// Immutable identity of the grant snapshot that produced this proof.
+    pub grant_snapshot_id: String,
+    /// Declared maximum lease duration in microseconds.
+    pub lease_duration_us: u64,
+    /// Recording authority from the rights file, never a literal placeholder.
+    pub recording_authority: String,
 }
 
 /// Failure to authorize a dataset.
@@ -1091,6 +1142,27 @@ pub enum RightsError {
         dataset_id: String,
         reason: &'static str,
     },
+    /// An endpoint has no parseable host or port.
+    #[error("endpoint identity is incomplete")]
+    InvalidEndpoint,
+    /// A requested lease exceeds the declared maximum or is zero.
+    #[error("authorization lease exceeds the declared maximum duration")]
+    LeaseTooLong,
+    /// The lease of the active session has expired.
+    #[error("authorization lease expired; egress denied until reauthorization")]
+    LeaseExpired,
+    /// The registry revision advanced or the grant snapshot was invalidated.
+    #[error("authorization grant snapshot is no longer valid")]
+    GrantInvalidated,
+    /// The authority could not be consulted at a reauthorization checkpoint.
+    #[error("authority could not be refreshed; failing closed")]
+    AuthorityRefreshFailed,
+    /// The endpoint is not in the approved endpoint set of the grant.
+    #[error("endpoint {endpoint} is not approved for this grant")]
+    EndpointNotApproved { endpoint: String },
+    /// The active session was cancelled.
+    #[error("authorization session was cancelled: {reason}")]
+    SessionCancelled { reason: String },
 }
 
 /// Fail-closed registry of effective-dated authorization records.
@@ -1098,12 +1170,21 @@ pub enum RightsError {
 pub struct LicensingRegistry {
     records: Vec<AuthorizationRecord>,
     decisions: BTreeMap<String, DecisionAudit>,
+    /// Monotonically increasing rights-registry revision. Every registration
+    /// advances it, so an installed proof can be invalidated by policy change.
+    revision: u64,
 }
 
 impl LicensingRegistry {
     /// Create an empty registry.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Current rights-registry revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Register an authorization record.
@@ -1144,6 +1225,7 @@ impl LicensingRegistry {
         }
         self.decisions.insert(revision_key, record.audit.clone());
         self.records.push(record);
+        self.revision = self.revision.saturating_add(1);
         Ok(())
     }
 
@@ -1196,6 +1278,13 @@ impl LicensingRegistry {
                 right: request.usage_right.as_str(),
             });
         }
+        let snapshot_input = format!(
+            "grant-snapshot/v1|{}|{}|{}|{}",
+            self.revision,
+            winning.identity.decision_key(),
+            winning.audit.licence_document_hash,
+            winning.audit.authority
+        );
         Ok(AuthorizationProof {
             scope: request.clone(),
             at_us,
@@ -1204,6 +1293,10 @@ impl LicensingRegistry {
             licence_reference: winning.audit.licence_reference.clone(),
             licence_document_hash: winning.audit.licence_document_hash.clone(),
             contract_revision: winning.audit.contract_revision,
+            registry_revision: self.revision,
+            grant_snapshot_id: sha256_hex(snapshot_input.as_bytes()),
+            lease_duration_us: MAX_LEASE_DURATION.as_micros() as u64,
+            recording_authority: winning.audit.authority.clone(),
         })
     }
 }
@@ -1266,8 +1359,37 @@ pub struct DecisionAuditEvent {
     pub reference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_digest: Option<String>,
+    /// Recording authority from the rights file, when the event is tied to a grant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_authority: Option<String>,
+    /// Active session id for lifecycle events.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Rights registry revision observed at the event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registry_revision: Option<u64>,
+    /// Immutable grant snapshot identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_snapshot_id: Option<String>,
+    /// Lease expiry instant in microseconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at_us: Option<i64>,
+    /// Endpoint authority checked by this event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub policy_version: u32,
     pub software_version: String,
+}
+
+/// Optional lifecycle metadata attached to an audit event.
+#[derive(Debug, Clone, Default)]
+pub struct AuditContext {
+    pub recording_authority: Option<String>,
+    pub session_id: Option<String>,
+    pub registry_revision: Option<u64>,
+    pub grant_snapshot_id: Option<String>,
+    pub lease_expires_at_us: Option<i64>,
+    pub endpoint: Option<String>,
 }
 
 static AUDIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -1326,6 +1448,20 @@ impl AuditSink {
         })
     }
 
+    /// Construct a sink without probing the directory.
+    ///
+    /// Production code uses [`Self::new`]. This constructor exists so offline
+    /// tests can verify that an unwritable destination fails closed; it does
+    /// not itself grant or record anything.
+    #[must_use]
+    pub fn without_probe(directory: &Path, policy_version: u32) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            run_id: format!("fieldbook-{}-{}", std::process::id(), policy_version),
+            policy_version,
+        }
+    }
+
     /// Construct the full event for one decision.
     #[must_use]
     fn build_event(
@@ -1335,6 +1471,7 @@ impl AuditSink {
         reason: Option<String>,
         evidence: Option<&DecisionAudit>,
         at_us: i64,
+        context: AuditContext,
     ) -> DecisionAuditEvent {
         let sequence = AUDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         DecisionAuditEvent {
@@ -1368,6 +1505,12 @@ impl AuditSink {
             reason,
             reference: evidence.map(|audit| audit.licence_reference.clone()),
             evidence_digest: evidence.map(|audit| audit.licence_document_hash.clone()),
+            recording_authority: context.recording_authority,
+            session_id: context.session_id,
+            registry_revision: context.registry_revision,
+            grant_snapshot_id: context.grant_snapshot_id,
+            lease_expires_at_us: context.lease_expires_at_us,
+            endpoint: context.endpoint,
             policy_version: self.policy_version,
             software_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -1385,7 +1528,30 @@ impl AuditSink {
         evidence: Option<&DecisionAudit>,
         at_us: i64,
     ) -> anyhow::Result<DecisionAuditEvent> {
-        let event = self.build_event(scope, decision, reason, evidence, at_us);
+        self.record_with_context(
+            scope,
+            decision,
+            reason,
+            evidence,
+            at_us,
+            AuditContext::default(),
+        )
+    }
+
+    /// Commit one lifecycle event with its session, revision and lease metadata.
+    ///
+    /// # Errors
+    /// Returns an error when the event cannot be durably written.
+    pub fn record_with_context(
+        &self,
+        scope: &AuthorizationScope,
+        decision: &str,
+        reason: Option<String>,
+        evidence: Option<&DecisionAudit>,
+        at_us: i64,
+        context: AuditContext,
+    ) -> anyhow::Result<DecisionAuditEvent> {
+        let event = self.build_event(scope, decision, reason, evidence, at_us, context);
         let safe = |value: &str| -> String {
             value
                 .chars()
@@ -1446,7 +1612,7 @@ impl RightsContext {
             "unsupported rights schema version {}",
             file.schema_version
         );
-        Licensee::new(file.licensee.as_str())
+        let file_licensee = Licensee::new(file.licensee.as_str())
             .map_err(|_| anyhow::anyhow!("invalid licensee in rights file"))?;
         let territory = CountryCode::new(&file.territory)
             .with_context(|| format!("invalid territory in rights file `{}`", path.display()))?;
@@ -1455,6 +1621,21 @@ impl RightsContext {
         let now = now_us().context("reading the clock for rights validation")?;
         let mut registry = LicensingRegistry::new();
         for record in file.rights {
+            // Root consistency: the file-level licensee and territory are not
+            // decorative. A record that contradicts them is refused rather
+            // than silently widening the root declaration.
+            anyhow::ensure!(
+                record.identity.scope.licensee == file_licensee,
+                "record licensee `{}` contradicts the rights-file licensee `{}`",
+                record.identity.scope.licensee.as_str(),
+                file_licensee.as_str()
+            );
+            anyhow::ensure!(
+                record.identity.scope.territory == territory,
+                "record territory `{}` contradicts the rights-file territory `{}`",
+                record.identity.scope.territory.as_str(),
+                territory.as_str()
+            );
             // An expired interval is never a grant. It is dropped here so it
             // cannot win a later decision even if the clock moves backwards.
             if record.identity.valid_until.is_some_and(|end| end < now) {
@@ -1516,15 +1697,34 @@ impl RightsContext {
             licence_document_hash: proof.licence_document_hash.clone(),
             contract_revision: proof.contract_revision,
             recorded_at_us: proof.at_us,
-            authority: "rights-file".to_owned(),
+            // Preserve the recording authority written in the rights file.
+            authority: proof.recording_authority.clone(),
         });
         let (decision, reason) = match &outcome {
-            Ok(_) => (RightDecision::Permitted.as_str().to_owned(), None),
+            Ok(_) => ("grant".to_owned(), None),
             Err(error) => (error.to_string(), Some(error.to_string())),
         };
-        let audit_result = self
-            .sink
-            .record(request, &decision, reason, evidence.as_ref(), at_us);
+        let lifecycle =
+            outcome
+                .as_ref()
+                .ok()
+                .map_or_else(AuditContext::default, |proof| AuditContext {
+                    recording_authority: Some(proof.recording_authority.clone()),
+                    registry_revision: Some(proof.registry_revision),
+                    grant_snapshot_id: Some(proof.grant_snapshot_id.clone()),
+                    lease_expires_at_us: Some(proof.at_us.saturating_add(
+                        i64::try_from(proof.lease_duration_us).unwrap_or(i64::MAX),
+                    )),
+                    ..AuditContext::default()
+                });
+        let audit_result = self.sink.record_with_context(
+            request,
+            &decision,
+            reason,
+            evidence.as_ref(),
+            at_us,
+            lifecycle,
+        );
         match (outcome, audit_result) {
             (Ok(proof), Ok(_)) => Ok(proof),
             // A permitted decision without a committed event is not usable.
@@ -1538,24 +1738,32 @@ impl RightsContext {
     }
 }
 
-/// One installed proof together with the sink that committed its decision.
+/// One installed proof, its active session and the authority it refreshes from.
 #[derive(Debug, Clone)]
 struct ActiveAuthorization {
     proof: AuthorizationProof,
     sink: AuditSink,
+    session: AuthorizationSession,
+    authority: Option<Arc<dyn AuthorityRefresh>>,
+}
+
+#[derive(Debug, Default)]
+struct GateState {
+    active: Vec<ActiveAuthorization>,
+    fallback_sink: Option<AuditSink>,
+    next_session: u64,
 }
 
 /// Instance-scoped authorization state.
 ///
-/// One gate can hold many independent authorizations for different providers,
+/// One gate holds many independent authorizations for different providers,
 /// source products, segments and operations. Nothing is installed by default:
-/// an empty gate denies every egress. Library consumers should construct their
-/// own gate; the binary uses a single process-wide instance only as a
-/// convenience for its one-command-per-process entry point.
-#[derive(Debug, Default)]
+/// an empty gate denies every egress. The gate is cheaply cloneable so the same
+/// instance can be shared with transport layers while remaining independent of
+/// any other gate in the process.
+#[derive(Debug, Clone, Default)]
 pub struct AuthorizationGate {
-    active: Mutex<Vec<ActiveAuthorization>>,
-    fallback_sink: Mutex<Option<AuditSink>>,
+    state: Arc<Mutex<GateState>>,
 }
 
 impl AuthorizationGate {
@@ -1565,118 +1773,161 @@ impl AuthorizationGate {
         Self::default()
     }
 
-    /// Install one proof into this gate.
+    fn lock(&self) -> std::sync::MutexGuard<'_, GateState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the installed authorization covers the whole caller-supplied
+    /// intent, including its endpoint. Time and lifecycle are checked separately.
+    fn matches(item: &ActiveAuthorization, intent: &EgressIntent) -> bool {
+        item.proof.scope.matches_request(&intent.to_scope())
+            && item
+                .proof
+                .scope
+                .contains_endpoint(&intent.endpoint_identity)
+    }
+
+    fn audit_parts(
+        item: &ActiveAuthorization,
+        intent: &EgressIntent,
+    ) -> (AuditSink, AuditContext, DecisionAudit) {
+        let context = AuditContext {
+            recording_authority: Some(item.proof.recording_authority.clone()),
+            session_id: Some(item.session.session_id.clone()),
+            registry_revision: Some(item.proof.registry_revision),
+            grant_snapshot_id: Some(item.proof.grant_snapshot_id.clone()),
+            lease_expires_at_us: Some(item.session.expires_at_us),
+            endpoint: Some(intent.endpoint_identity.authority()),
+        };
+        let evidence = DecisionAudit {
+            licence_reference: item.proof.licence_reference.clone(),
+            licence_document_hash: item.proof.licence_document_hash.clone(),
+            contract_revision: item.proof.contract_revision,
+            recorded_at_us: item.proof.at_us,
+            authority: item.proof.recording_authority.clone(),
+        };
+        (item.sink.clone(), context, evidence)
+    }
+
+    /// Install one proof and start its active session.
     ///
     /// A second proof for the same full identity fails closed instead of
     /// widening an existing grant. Proofs for other providers, products,
     /// segments or operations coexist independently.
     ///
     /// # Errors
-    /// Returns an error for an incomplete scope or a duplicate identity.
+    /// Returns an error for an incomplete scope, an invalid lease or a duplicate.
     pub fn install(&self, proof: AuthorizationProof, sink: AuditSink) -> anyhow::Result<()> {
+        self.install_with_authority(proof, sink, None).map(|_| ())
+    }
+
+    /// Install one proof with a refreshable authority for checkpoint checks.
+    ///
+    /// Returns the new active session id.
+    ///
+    /// # Errors
+    /// Returns an error for an incomplete scope, an invalid lease or a duplicate.
+    pub fn install_with_authority(
+        &self,
+        proof: AuthorizationProof,
+        sink: AuditSink,
+        authority: Option<Arc<dyn AuthorityRefresh>>,
+    ) -> anyhow::Result<String> {
         proof.scope.validate()?;
-        let mut active = self
+        let at_us = proof.at_us;
+        let snapshot = GrantSnapshot::new(
+            proof.registry_revision,
+            proof.grant_snapshot_id.clone(),
+            proof.lease_duration_us,
+            at_us,
+        )?;
+        let mut state = self.lock();
+        if state
             .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if active.iter().any(|item| item.proof.scope == proof.scope) {
+            .iter()
+            .any(|item| item.proof.scope == proof.scope)
+        {
             anyhow::bail!("an identical authorization is already installed in this gate");
         }
-        let mut fallback = self
-            .fallback_sink
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if fallback.is_none() {
-            *fallback = Some(sink.clone());
+        let session_id = format!("session-{}", state.next_session);
+        state.next_session = state.next_session.saturating_add(1);
+        let session = AuthorizationSession {
+            session_id: session_id.clone(),
+            expires_at_us: snapshot.expires_at_us(),
+            snapshot: snapshot.clone(),
+            renewals: 0,
+        };
+        if state.fallback_sink.is_none() {
+            state.fallback_sink = Some(sink.clone());
         }
-        active.push(ActiveAuthorization { proof, sink });
-        Ok(())
+        let context = AuditContext {
+            recording_authority: Some(proof.recording_authority.clone()),
+            session_id: Some(session_id.clone()),
+            registry_revision: Some(snapshot.registry_revision),
+            grant_snapshot_id: Some(snapshot.snapshot_id.clone()),
+            lease_expires_at_us: Some(session.expires_at_us),
+            ..AuditContext::default()
+        };
+        let evidence = DecisionAudit {
+            licence_reference: proof.licence_reference.clone(),
+            licence_document_hash: proof.licence_document_hash.clone(),
+            contract_revision: proof.contract_revision,
+            recorded_at_us: proof.at_us,
+            authority: proof.recording_authority.clone(),
+        };
+        sink.record_with_context(&proof.scope, "grant", None, Some(&evidence), at_us, context)
+            .context("committing grant audit event")?;
+        state.active.push(ActiveAuthorization {
+            proof,
+            sink,
+            session,
+            authority,
+        });
+        Ok(session_id)
     }
 
-    /// Compare the full requested scope and validity against installed proofs.
+    /// Evaluate the caller's intent against the gate.
     ///
-    /// # Errors
-    /// Returns a [`RightsError`] when no live proof covers the whole request.
-    pub fn check_active(
+    /// This is the single decision point used by every egress and checkpoint.
+    /// The request is the caller's [`EgressIntent`]; it is never reconstructed
+    /// from an installed proof.
+    fn evaluate(
         &self,
-        request: &AuthorizationRequest,
+        intent: &EgressIntent,
         at_us: i64,
+        audit_egress: bool,
     ) -> anyhow::Result<AuthorizationProof> {
-        request.validate()?;
-        let active = self
+        intent.validate()?;
+        let scope = intent.to_scope();
+        let mut state = self.lock();
+        let Some(index) = state
             .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let matching = active.iter().find(|item| {
-            item.proof.scope.matches_request(request)
-                && item.proof.valid_from <= at_us
-                && item.proof.valid_until.is_none_or(|end| at_us <= end)
-        });
-        match matching {
-            Some(item) => Ok(item.proof.clone()),
-            None => {
-                let expired = active.iter().any(|item| {
-                    item.proof.scope.matches_request(request)
-                        && item.proof.valid_until.is_some_and(|end| at_us > end)
-                });
-                if expired {
-                    return Err(RightsError::AuthorizationExpired.into());
-                }
-                Err(RightsError::ScopeMismatch {
-                    operation: request.operation.as_str().to_owned(),
-                    venue: request.venue.clone(),
-                    reason: "no live proof covers the full requested scope",
-                }
-                .into())
-            }
-        }
-    }
-
-    /// Reauthorize one egress attempt and commit its event before returning.
-    ///
-    /// # Errors
-    /// Returns an error on denial and when a permitted egress event cannot be
-    /// committed. Denial events are written when a sink is available.
-    pub fn require_egress(
-        &self,
-        venue: &str,
-        operation: Operation,
-        at_us: i64,
-    ) -> anyhow::Result<()> {
-        let probe = AuthorizationScope::denial_scope(venue, operation);
-        let active = self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let selected = active.iter().find(|item| {
-            item.proof.scope.venue == venue
-                && item.proof.scope.operation == operation
-                && item.proof.valid_from <= at_us
-                && item.proof.valid_until.is_none_or(|end| at_us <= end)
-        });
-        let Some(selected) = selected else {
-            let error: anyhow::Error = if active.iter().any(|item| {
-                item.proof.scope.venue == venue
-                    && item.proof.scope.operation == operation
-                    && item.proof.valid_until.is_some_and(|end| at_us > end)
+            .iter()
+            .position(|item| Self::matches(item, intent))
+        else {
+            let error = if state.active.iter().any(|item| {
+                item.proof.scope.matches_request(&scope)
+                    && !item
+                        .proof
+                        .scope
+                        .contains_endpoint(&intent.endpoint_identity)
             }) {
-                RightsError::AuthorizationExpired.into()
+                RightsError::EndpointNotApproved {
+                    endpoint: intent.endpoint_identity.authority(),
+                }
             } else {
                 RightsError::ScopeMismatch {
-                    operation: operation.as_str().to_owned(),
-                    venue: venue.to_owned(),
-                    reason: "no live proof for the requested operation",
+                    operation: intent.operation.as_str().to_owned(),
+                    venue: intent.venue_id.clone(),
+                    reason: "no live proof covers the full caller-supplied intent",
                 }
-                .into()
             };
-            if let Some(sink) = self
-                .fallback_sink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .as_ref()
-            {
+            let error: anyhow::Error = error.into();
+            if let Some(sink) = state.fallback_sink.clone() {
                 let _ = sink.record(
-                    &probe,
+                    &scope,
                     "egress_denied",
                     Some(error.to_string()),
                     None,
@@ -1685,55 +1936,224 @@ impl AuthorizationGate {
             }
             return Err(error);
         };
-        // The egress request is the proof's own scope with the caller's typed
-        // operation. A mismatch is caught by the same full comparison used at
-        // authorization time, so no transport action can widen a grant.
-        let mut egress_request = selected.proof.scope.clone();
-        egress_request.operation = operation;
-        if !selected.proof.scope.matches_request(&egress_request) {
-            let error: anyhow::Error = RightsError::ScopeMismatch {
-                operation: operation.as_str().to_owned(),
-                venue: venue.to_owned(),
-                reason: "operation does not match the installed proof",
-            }
-            .into();
-            let _ = selected.sink.record(
-                &probe,
-                "egress_denied",
-                Some(error.to_string()),
-                None,
-                at_us,
-            );
-            return Err(error);
-        }
-        let evidence = DecisionAudit {
-            licence_reference: selected.proof.licence_reference.clone(),
-            licence_document_hash: selected.proof.licence_document_hash.clone(),
-            contract_revision: selected.proof.contract_revision,
-            recorded_at_us: selected.proof.at_us,
-            authority: "rights-file".to_owned(),
+
+        let (sink, context, evidence, session_id, expires_at, authority, proof) = {
+            let item = &state.active[index];
+            let (sink, context, evidence) = Self::audit_parts(item, intent);
+            (
+                sink,
+                context,
+                evidence,
+                item.session.session_id.clone(),
+                item.session.expires_at_us,
+                item.authority.clone(),
+                item.proof.clone(),
+            )
         };
-        selected
-            .sink
-            .record(
-                &egress_request,
+
+        let grant_expired =
+            proof.valid_from > at_us || proof.valid_until.is_some_and(|end| at_us > end);
+        if grant_expired {
+            state.active.remove(index);
+            let _ = sink.record_with_context(
+                &scope,
+                "grant_expired",
+                Some(RightsError::AuthorizationExpired.to_string()),
+                Some(&evidence),
+                at_us,
+                context,
+            );
+            return Err(RightsError::AuthorizationExpired.into());
+        }
+        if at_us > expires_at {
+            state.active.remove(index);
+            let _ = sink.record_with_context(
+                &scope,
+                "lease_expired",
+                Some(RightsError::LeaseExpired.to_string()),
+                Some(&evidence),
+                at_us,
+                context,
+            );
+            return Err(RightsError::LeaseExpired.into());
+        }
+        if let Some(authority) = authority {
+            match authority.refresh() {
+                Ok(current)
+                    if current.revision == proof.registry_revision
+                        && current.valid_snapshots.contains(&proof.grant_snapshot_id) => {}
+                Ok(_) => {
+                    state.active.remove(index);
+                    let _ = sink.record_with_context(
+                        &scope,
+                        "grant_revoked",
+                        Some(RightsError::GrantInvalidated.to_string()),
+                        Some(&evidence),
+                        at_us,
+                        context,
+                    );
+                    return Err(RightsError::GrantInvalidated.into());
+                }
+                Err(error) => {
+                    let _ = sink.record_with_context(
+                        &scope,
+                        "egress_denied",
+                        Some(format!("{}: {error}", RightsError::AuthorityRefreshFailed)),
+                        Some(&evidence),
+                        at_us,
+                        context,
+                    );
+                    return Err(RightsError::AuthorityRefreshFailed.into());
+                }
+            }
+        }
+
+        if audit_egress {
+            // The permitted event is committed before the caller may egress.
+            sink.record_with_context(
+                &scope,
                 "egress_permitted",
                 None,
                 Some(&evidence),
                 at_us,
+                context,
             )
             .context("committing egress authorization event")?;
+        }
+        let _ = session_id;
+        Ok(proof)
+    }
+
+    /// Check the full request against a live authorization without auditing
+    /// an egress. Used by callers that need a preflight decision only.
+    ///
+    /// # Errors
+    /// Returns a fail-closed denial when no live authorization covers the intent.
+    pub fn check_active(
+        &self,
+        intent: &EgressIntent,
+        at_us: i64,
+    ) -> anyhow::Result<AuthorizationProof> {
+        self.evaluate(intent, at_us, false)
+    }
+
+    /// Reauthorize one egress attempt and commit its event before returning.
+    /// No network side effect may begin until this returns `Ok`.
+    ///
+    /// # Errors
+    /// Returns an error on denial and when a permitted egress event cannot be
+    /// committed. Denial events are written when a sink is available.
+    pub fn require_egress(&self, intent: &EgressIntent, at_us: i64) -> anyhow::Result<()> {
+        self.evaluate(intent, at_us, true).map(|_| ())
+    }
+
+    /// Renew the lease of an active session after a successful authority refresh.
+    ///
+    /// # Errors
+    /// Returns an error when the intent is not covered or the authority cannot
+    /// be refreshed.
+    pub fn renew_lease(&self, intent: &EgressIntent, at_us: i64) -> anyhow::Result<()> {
+        intent.validate()?;
+        let scope = intent.to_scope();
+        let mut state = self.lock();
+        let Some(index) = state
+            .active
+            .iter()
+            .position(|item| Self::matches(item, intent))
+        else {
+            return Err(RightsError::ScopeMismatch {
+                operation: intent.operation.as_str().to_owned(),
+                venue: intent.venue_id.clone(),
+                reason: "no session to renew for this intent",
+            }
+            .into());
+        };
+        let (sink, mut context, evidence, authority, expiry, duration) = {
+            let item = &state.active[index];
+            let (sink, context, evidence) = Self::audit_parts(item, intent);
+            (
+                sink,
+                context,
+                evidence,
+                item.authority.clone(),
+                item.session.expires_at_us,
+                item.proof.lease_duration_us,
+            )
+        };
+        if let Some(authority) = authority {
+            let current = authority
+                .refresh()
+                .map_err(|_| RightsError::AuthorityRefreshFailed)?;
+            if current.revision != state.active[index].proof.registry_revision
+                || !current
+                    .valid_snapshots
+                    .contains(&state.active[index].proof.grant_snapshot_id)
+            {
+                let _ = sink.record_with_context(
+                    &scope,
+                    "grant_revoked",
+                    Some(RightsError::GrantInvalidated.to_string()),
+                    Some(&evidence),
+                    at_us,
+                    context,
+                );
+                state.active.remove(index);
+                return Err(RightsError::GrantInvalidated.into());
+            }
+        }
+        let new_expiry = at_us.saturating_add(i64::try_from(duration).unwrap_or(i64::MAX));
+        state.active[index].session.expires_at_us = new_expiry;
+        state.active[index].session.renewals =
+            state.active[index].session.renewals.saturating_add(1);
+        context.lease_expires_at_us = Some(new_expiry);
+        let _ = expiry;
+        sink.record_with_context(
+            &scope,
+            "lease_renewed",
+            None,
+            Some(&evidence),
+            at_us,
+            context,
+        )
+        .context("committing lease renewal event")?;
         Ok(())
     }
 
-    /// Whether this gate holds at least one proof.
+    /// Cancel the session covering `intent`, emitting a cancellation event.
+    ///
+    /// # Errors
+    /// Returns an error when no active session covers the intent.
+    pub fn cancel(&self, intent: &EgressIntent, reason: &str, at_us: i64) -> anyhow::Result<()> {
+        let scope = intent.to_scope();
+        let mut state = self.lock();
+        let Some(index) = state
+            .active
+            .iter()
+            .position(|item| Self::matches(item, intent))
+        else {
+            return Err(RightsError::SessionCancelled {
+                reason: "no matching session".to_owned(),
+            }
+            .into());
+        };
+        let (sink, context, evidence) = Self::audit_parts(&state.active[index], intent);
+        state.active.remove(index);
+        sink.record_with_context(
+            &scope,
+            "session_cancelled",
+            Some(reason.to_owned()),
+            Some(&evidence),
+            at_us,
+            context,
+        )
+        .context("committing session cancellation event")?;
+        Ok(())
+    }
+
+    /// Whether this gate holds at least one live proof.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        !self
-            .active
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty()
+        !self.lock().active.is_empty()
     }
 }
 
@@ -1743,7 +2163,9 @@ impl AuthorizationGate {
 // one-shot installation slot. Library consumers construct their own gates.
 static DEFAULT_GATE: LazyLock<AuthorizationGate> = LazyLock::new(AuthorizationGate::new);
 
-fn default_gate() -> &'static AuthorizationGate {
+/// The binary's shared gate. Library callers should construct their own.
+#[must_use]
+pub fn default_gate() -> &'static AuthorizationGate {
     &DEFAULT_GATE
 }
 
@@ -1760,23 +2182,60 @@ pub fn install_active_authorization(
 }
 
 /// Enforce authorization at the common provider egress boundary. No HTTP
-/// client or websocket is opened unless a live, operation-scoped proof is
-/// active in the process gate.
+/// client or websocket is opened unless the caller-supplied [`EgressIntent`]
+/// is covered by a live authorization in the shared gate.
 ///
 /// # Errors
 /// Returns the fail-closed denial; the network side effect must not proceed.
-pub fn require_provider_egress(venue: &str, operation: Operation) -> anyhow::Result<()> {
+pub fn require_provider_egress(intent: &EgressIntent) -> anyhow::Result<()> {
     // Loopback test transports are not provider egress. This identity can never
-    // be derived from a configured exchange, and websocket callers further
-    // require the target host itself to be loopback.
-    if venue.eq_ignore_ascii_case("loopback") {
+    // be derived from a configured exchange, and the endpoint must itself be
+    // loopback; a provider host is never covered by this exception.
+    if intent.venue_id.eq_ignore_ascii_case("loopback") && intent.endpoint_identity.is_loopback() {
         return Ok(());
     }
     let now = now_us().context("reading the clock for egress authorization")?;
     if !default_gate().is_active() {
         return Err(RightsError::NoActiveAuthorization.into());
     }
-    default_gate().require_egress(venue, operation, now)
+    default_gate().require_egress(intent, now)
+}
+
+/// Authorize one caller-supplied egress intent from the runtime rights file
+/// and install it into the shared gate with a refreshable authority.
+///
+/// Returns the authority handle so the owner can invalidate the grant during
+/// a session; the gate observes the change at its next checkpoint.
+///
+/// # Errors
+/// Returns an error for every fail-closed authorization condition.
+pub fn authorize_egress_intent(
+    settings: &Settings,
+    intent: &EgressIntent,
+) -> anyhow::Result<Arc<dyn AuthorityRefresh>> {
+    intent.validate()?;
+    let path = settings.governance.rights_file.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "provider egress requires a runtime authorization file: set [governance].rights_file or --rights-file"
+        )
+    })?;
+    let audit_dir = settings.governance.audit_dir.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "provider egress requires a configured audit directory: set [governance].audit_dir or --rights-audit-dir"
+        )
+    })?;
+    let context = RightsContext::load(path, audit_dir)?;
+    let proof = context.authorize(&intent.to_scope(), now_us()?)?;
+    let authority = Arc::new(InMemoryAuthority::new(
+        proof.registry_revision,
+        proof.grant_snapshot_id.clone(),
+    ));
+    default_gate().install_with_authority(
+        proof,
+        context.sink().clone(),
+        Some(authority.clone()),
+    )?;
+    Ok(authority)
 }
 
 /// Authorize fully specified requests from the runtime rights file.
@@ -1807,7 +2266,15 @@ pub fn authorize_requests(
         proofs.push(context.authorize(request, now_us()?)?);
     }
     for proof in proofs {
-        install_active_authorization(proof, context.sink().clone())?;
+        let authority: Arc<dyn AuthorityRefresh> = Arc::new(InMemoryAuthority::new(
+            proof.registry_revision,
+            proof.grant_snapshot_id.clone(),
+        ));
+        default_gate().install_with_authority(
+            proof,
+            context.sink().clone(),
+            Some(authority.clone()),
+        )?;
     }
     Ok(())
 }
@@ -1825,11 +2292,11 @@ pub fn authorize_command(settings: &Settings, request: AuthorizationRequest) -> 
 
 /// Command-derived authorization is not permitted.
 ///
-/// A command names an operation, not a provider, source product, venue
-/// segment, licensee, territory, purpose, recipient or scope. W1.1 introduces
-/// the explicit request builder; supplying the actual request from an
-/// `EgressIntent` belongs to the next work item. Until then a gated command
-/// denies rather than inventing a permission.
+/// A command names an operation, not a provider, source product, venue,
+/// segment, licensee, territory, purpose, recipient, endpoint or scope. A gated
+/// command must supply an explicit `EgressIntent`; callers use
+/// [`authorize_egress_intent`]. This function remains a fail-closed denial for
+/// callers that still pass only operations.
 ///
 /// # Errors
 /// Always returns a fail-closed denial; the rights-file and audit-directory
@@ -1849,7 +2316,7 @@ pub fn authorize_operations(settings: &Settings, operations: &[Operation]) -> an
         );
     }
     anyhow::bail!(
-        "{first} requires an explicit AuthorizationRequest from the caller; generic command-derived scopes are not permitted"
+        "{first} requires an explicit EgressIntent from the caller; generic command-derived scopes are not permitted"
     )
 }
 
@@ -1891,6 +2358,12 @@ impl AuthorizationGate {
             licence_reference: evidence.licence_reference.clone(),
             licence_document_hash: evidence.licence_document_hash.clone(),
             contract_revision: evidence.contract_revision,
+            registry_revision: 0,
+            grant_snapshot_id: sha256_hex(
+                format!("installed-scope|{}", evidence.licence_document_hash).as_bytes(),
+            ),
+            lease_duration_us: MAX_LEASE_DURATION.as_micros() as u64,
+            recording_authority: evidence.authority.clone(),
         };
         self.install(proof, sink)
     }
@@ -1931,6 +2404,50 @@ mod tests {
             })
             .build()
             .expect("explicit abstract request")
+            .with(|scope| {
+                scope.approved_endpoints = vec![
+                    EndpointIdentity::from_url("wss://venue-a.example:443")
+                        .expect("abstract approved endpoint"),
+                ];
+            })
+    }
+
+    /// Build the caller's explicit test request from a declared abstract scope.
+    /// This is a test fixture convenience, not gate logic: the gate never
+    /// derives a request from a proof.
+    fn intent_for(scope: &AuthorizationScope) -> EgressIntent {
+        let endpoint = scope
+            .approved_endpoints
+            .first()
+            .cloned()
+            .unwrap_or_else(|| EndpointIdentity {
+                scheme: "wss".to_owned(),
+                host: "venue-a.example".to_owned(),
+                port: 443,
+            });
+        EgressIntent::builder()
+            .provider_id(scope.provider_id.clone())
+            .source_id(scope.source_id.clone())
+            .source_product_id(scope.product_id.clone())
+            .venue_id(scope.venue.clone())
+            .segment_id(scope.segment.clone())
+            .dataset_id(scope.dataset_id.clone())
+            .operation(scope.operation)
+            .purpose(scope.purpose)
+            .usage_mode(scope.usage_mode)
+            .usage_right(scope.usage_right)
+            .licensee(scope.licensee.clone())
+            .recipient(scope.recipient)
+            .territory(scope.territory.clone())
+            .instruments(scope.instruments.clone())
+            .fields(scope.fields.clone())
+            .modalities(scope.modalities.clone())
+            .data_time_window(scope.data_time_window)
+            .retention_request(scope.retention)
+            .delivery_method(scope.delivery_method)
+            .endpoint_identity(endpoint)
+            .build()
+            .expect("explicit abstract egress intent")
     }
 
     fn record(
@@ -1974,7 +2491,7 @@ mod tests {
     fn rights_file(records: Vec<AuthorizationRecord>) -> RightsFile {
         RightsFile {
             schema_version: 1,
-            licensee: Licensee::new("fieldbook-operator").expect("licensee"),
+            licensee: Licensee::new("licensee-a").expect("licensee"),
             territory: "US".to_owned(),
             recipient: Recipient::Internal,
             rights: records,
@@ -2368,14 +2885,18 @@ mod tests {
             sink(directory.path()),
         )
         .expect("proof installed");
+        let contact = intent_for(&scope_with(|item| {
+            item.operation = Operation::SourceContact;
+            item.instruments = ScopeSet::NotApplicable;
+            item.fields = ScopeSet::NotApplicable;
+            item.modalities = ScopeSet::NotApplicable;
+        }));
         assert!(
-            gate.require_egress("venue-a", Operation::SourceContact, 1)
-                .is_err(),
+            gate.require_egress(&contact, 1).is_err(),
             "a capture proof must never authorize a source-contact egress"
         );
         assert!(
-            gate.require_egress("venue-a", Operation::RealTimeCapture, 1)
-                .is_ok(),
+            gate.require_egress(&intent_for(&request), 1).is_ok(),
             "the matching operation is permitted"
         );
     }
@@ -2514,23 +3035,33 @@ mod tests {
             policy_version: 1,
         };
         let broken_gate = AuthorizationGate::new();
-        broken_gate
-            .install_scope(
-                request.clone(),
-                0,
-                None,
-                &permitted_record(&request).audit,
-                broken,
-            )
-            .expect("proof installed");
-        let denied = broken_gate
-            .require_egress("venue-a", Operation::RealTimeCapture, 1)
-            .is_err();
-        assert!(denied, "audit write failure denies egress");
         assert!(
-            gate.require_egress("venue-a", Operation::RealTimeCapture, 1)
-                .is_ok(),
-            "assertion context at line 2249"
+            broken_gate
+                .install_scope(
+                    request.clone(),
+                    0,
+                    None,
+                    &permitted_record(&request).audit,
+                    broken,
+                )
+                .is_err(),
+            "an unwritable sink refuses the grant"
+        );
+        // An unwritable audit sink prevents installation of the grant itself,
+        // so no egress can be permitted under it.
+        assert!(
+            !broken_gate.is_active(),
+            "a failed install leaves the gate empty"
+        );
+        assert!(
+            broken_gate
+                .require_egress(&intent_for(&request), 1)
+                .is_err(),
+            "audit write failure denies egress"
+        );
+        assert!(
+            gate.require_egress(&intent_for(&request), 1).is_ok(),
+            "a writable audit sink permits the matching egress"
         );
     }
 
@@ -2549,7 +3080,7 @@ mod tests {
         )
         .expect("proof installed");
         let before = std::fs::read_dir(&audit).expect("audit directory").count();
-        gate.require_egress("venue-a", Operation::RealTimeCapture, 1)
+        gate.require_egress(&intent_for(&request), 1)
             .expect("egress permitted");
         let after: Vec<_> = std::fs::read_dir(&audit)
             .expect("audit directory")
@@ -2614,10 +3145,7 @@ mod tests {
             "assertion context at line 2318"
         );
         assert_eq!(event.venue, "venue-a", "assertion context at line 2319");
-        assert_eq!(
-            event.decision, "permitted",
-            "assertion context at line 2320"
-        );
+        assert_eq!(event.decision, "grant", "the grant event is audited");
         assert_eq!(
             event.product_id, "product-a",
             "assertion context at line 2321"
@@ -2668,21 +3196,19 @@ mod tests {
         )
         .expect("proof installed");
         assert!(
-            gate.check_active(&request, 100).is_ok(),
-            "assertion context at line 2350"
+            gate.check_active(&intent_for(&request), 100).is_ok(),
+            "the grant is live at instant 100"
         );
         assert!(
-            gate.require_egress("venue-a", Operation::RealTimeCapture, 100)
-                .is_ok(),
-            "assertion context at line 2354"
+            gate.require_egress(&intent_for(&request), 100).is_ok(),
+            "the matching operation is permitted"
         );
         assert!(
-            matches!(gate.check_active(&request, 201), Err(error) if error.to_string().contains("expired")),
+            matches!(gate.check_active(&intent_for(&request), 201), Err(error) if error.to_string().contains("expired")),
             "expiry during a session denies further checks"
         );
         assert!(
-            gate.require_egress("venue-a", Operation::RealTimeCapture, 201)
-                .is_err(),
+            gate.require_egress(&intent_for(&request), 201).is_err(),
             "expiry during a session denies further egress"
         );
         let revoked_gate = AuthorizationGate::new();
@@ -2697,9 +3223,9 @@ mod tests {
             .expect("proof installed");
         assert!(
             revoked_gate
-                .require_egress("venue-a", Operation::RealTimeCapture, 1)
+                .require_egress(&intent_for(&request), 1)
                 .is_ok(),
-            "assertion context at line 2377"
+            "the grant is live before revocation"
         );
         let mut revoked = permitted_record(&request);
         revoked.decision = RightDecision::Revoked;
@@ -2750,27 +3276,25 @@ mod tests {
         .expect("second installed");
         assert!(gate.is_active(), "assertion context at line 2429");
         assert!(
-            gate.check_active(&first, 1).is_ok(),
+            gate.check_active(&intent_for(&first), 1).is_ok(),
             "first proof is usable"
         );
         assert!(
-            gate.check_active(&second, 1).is_ok(),
+            gate.check_active(&intent_for(&second), 1).is_ok(),
             "second proof is usable"
         );
         assert!(
-            gate.require_egress("venue-a", Operation::RealTimeCapture, 1)
-                .is_ok(),
+            gate.require_egress(&intent_for(&first), 1).is_ok(),
             "first provider egress permitted"
         );
         assert!(
-            gate.require_egress("venue-a", Operation::ReferenceDataRetrieval, 1)
-                .is_ok(),
+            gate.require_egress(&intent_for(&second), 1).is_ok(),
             "second provider egress permitted"
         );
         let mut swapped = second.clone();
         swapped.provider_id = "provider-a".to_owned();
         assert!(
-            gate.check_active(&swapped, 1).is_err(),
+            gate.check_active(&intent_for(&swapped), 1).is_err(),
             "one provider's proof cannot authorize another provider's source"
         );
     }

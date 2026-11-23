@@ -2,6 +2,10 @@
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,10 +23,38 @@ use url::Url;
 
 use crate::{
     egress::{self, EgressRoute, ProxyEndpoint, ProxyScheme},
-    rights::Operation,
+    egress_intent::{EgressIntent, EndpointIdentity},
+    rights::{AuthorizationGate, Operation},
+    time::now_us,
 };
 
 pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Test-only transport counters injected through [`ConnectOptions`].
+///
+/// Every hook fails closed. If a denial test observes a non-zero counter, the
+/// gate was bypassed and DNS, TCP, TLS or the protocol upgrade was attempted.
+#[derive(Debug, Clone, Default)]
+pub struct DenialTransport {
+    pub dns_calls: Arc<AtomicU64>,
+    pub tcp_calls: Arc<AtomicU64>,
+    pub tls_calls: Arc<AtomicU64>,
+}
+
+impl DenialTransport {
+    /// Whether no network layer was reached.
+    #[must_use]
+    pub fn untouched(&self) -> bool {
+        self.dns_calls.load(Ordering::SeqCst) == 0
+            && self.tcp_calls.load(Ordering::SeqCst) == 0
+            && self.tls_calls.load(Ordering::SeqCst) == 0
+    }
+
+    fn reached(&self, counter: &Arc<AtomicU64>, layer: &str) -> anyhow::Result<()> {
+        counter.fetch_add(1, Ordering::SeqCst);
+        bail!("injected transport reached the {layer} layer during a denied egress")
+    }
+}
 
 /// One websocket frame read from the transport.
 ///
@@ -87,6 +119,13 @@ pub struct ConnectOptions {
     /// captures a feed is `real_time_capture`; a diagnostic probe is
     /// `source_contact`. The gate compares this with the installed proof.
     pub operation: Operation,
+    /// Caller-supplied request for this connection. No provider websocket is
+    /// opened without one. It binds provider, product, venue, segment and
+    /// subscription scope as well as the endpoint authority.
+    pub intent: Option<EgressIntent>,
+    /// Fail-closed transport probe used by denial tests. Production leaves it
+    /// unset; a set probe denies every attempt that reaches a network layer.
+    pub denial_transport: Option<DenialTransport>,
 }
 
 /// One recorded phase of a connection attempt.
@@ -158,6 +197,8 @@ impl std::fmt::Debug for ConnectOptions {
             .field("connect_timeout", &self.connect_timeout)
             .field("egress", &self.egress)
             .field("venue", &self.venue)
+            .field("operation", &self.operation)
+            .field("intent", &self.intent)
             .finish()
     }
 }
@@ -174,6 +215,8 @@ impl Default for ConnectOptions {
             trace: None,
             venue: "loopback".to_owned(),
             operation: Operation::RealTimeCapture,
+            intent: None,
+            denial_transport: None,
         }
     }
 }
@@ -223,7 +266,12 @@ pub async fn connect(
     headers: &[(http::HeaderName, http::HeaderValue)],
     options: &ConnectOptions,
 ) -> anyhow::Result<WsStream> {
-    authorize_connect(&options.venue, url, options.operation)?;
+    authorize_connect(
+        &options.venue,
+        url,
+        options.operation,
+        options.intent.as_ref(),
+    )?;
     match tokio::time::timeout(
         options.connect_timeout,
         connect_inner(url, headers, options),
@@ -242,29 +290,68 @@ pub async fn connect(
 /// venue-scoped right covers it. The `loopback` identity is the library's test
 /// default and is accepted only for a loopback target, so it can never be used
 /// to reach a provider.
-fn authorize_connect(venue: &str, url: &str, operation: Operation) -> anyhow::Result<()> {
+fn authorize_connect(
+    venue: &str,
+    url: &str,
+    operation: Operation,
+    intent: Option<&EgressIntent>,
+) -> anyhow::Result<()> {
+    // The endpoint is parsed before any resolver, socket or TLS call. An
+    // unparseable target therefore fails closed at the same boundary.
+    let endpoint = EndpointIdentity::from_url(url)
+        .map_err(|error| anyhow::anyhow!("websocket target has no usable endpoint: {error}"))?;
     if venue.eq_ignore_ascii_case("loopback") {
-        let host = Url::parse(url).ok().and_then(|parsed| {
-            parsed
-                .host_str()
-                .map(|host| egress::strip_brackets(host).to_owned())
-        });
         anyhow::ensure!(
-            host.as_deref().is_some_and(is_loopback_host),
+            endpoint.is_loopback(),
             "loopback authorization cannot open a websocket to a provider host"
         );
         return Ok(());
     }
-    // The caller declares the actual lifecycle operation. It is compared with
-    // the installed proof; no transport action string can widen a grant.
-    crate::rights::require_provider_egress(venue, operation)
+    let intent = intent.ok_or_else(|| {
+        anyhow::anyhow!("provider websocket egress requires an explicit EgressIntent")
+    })?;
+    anyhow::ensure!(
+        intent.venue_id == venue && intent.operation == operation,
+        "egress intent does not describe this websocket venue and operation"
+    );
+    anyhow::ensure!(
+        intent.endpoint_identity == endpoint,
+        "egress intent endpoint `{}` does not match websocket target `{}`",
+        intent.endpoint_identity.authority(),
+        endpoint.authority()
+    );
+    // The entire caller-supplied request is compared with the grant before DNS,
+    // TCP, TLS or the protocol upgrade is attempted.
+    crate::rights::require_provider_egress(intent)
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+/// Recheck a websocket session after its subscription scope widens.
+///
+/// The widened request still comes from the caller; only the modality set is
+/// replaced. A denial must stop the session before the new subscription is sent.
+///
+/// # Errors
+/// Returns the fail-closed denial when the gate no longer covers the widened
+/// request, for example after lease expiry or policy revision invalidation.
+pub fn recheck_subscription(
+    intent: &EgressIntent,
+    modalities: crate::rights::ScopeSet<crate::rights::Modality>,
+    gate: &AuthorizationGate,
+    at_us: i64,
+) -> anyhow::Result<()> {
+    gate.require_egress(&intent.with_modalities(modalities), at_us)
+}
+
+/// Perform one mid-session authorization checkpoint against a gate.
+///
+/// A websocket session stops when this returns an error; the error is the
+/// lease-expiry, revocation or refresh failure and must never be downgraded.
+///
+/// # Errors
+/// Returns the fail-closed denial from the gate.
+pub fn session_checkpoint(intent: &EgressIntent, gate: &AuthorizationGate) -> anyhow::Result<()> {
+    let at_us = now_us().context("reading the clock for websocket authorization checkpoint")?;
+    gate.require_egress(intent, at_us)
 }
 
 async fn connect_inner(
@@ -285,11 +372,11 @@ async fn connect_inner(
     // (direct) or the proxy endpoint. The venue's own hostname is resolved
     // by the proxy when SOCKS5 remote DNS is in effect.
     let addresses: Vec<SocketAddr> = match &options.egress {
-        EgressRoute::Direct => resolve_host(host, port, options.source_ip)
+        EgressRoute::Direct => resolve_host(options, host, port)
             .await
             .with_context(|| format!("resolving {host}:{port}"))?,
         EgressRoute::ExplicitProxy(endpoint) => {
-            resolve_host(&endpoint.host, endpoint.port, options.source_ip)
+            resolve_host(options, &endpoint.host, endpoint.port)
                 .await
                 .with_context(|| {
                     format!("resolving proxy host {}:{}", endpoint.host, endpoint.port)
@@ -348,12 +435,15 @@ fn record_stage(options: &ConnectOptions, stage: &str) {
 }
 
 async fn resolve_host(
+    options: &ConnectOptions,
     host: &str,
     port: u16,
-    source_ip: Option<IpAddr>,
 ) -> anyhow::Result<Vec<SocketAddr>> {
+    if let Some(probe) = options.denial_transport.as_ref() {
+        probe.reached(&probe.dns_calls, "DNS")?;
+    }
     let mut addresses: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
-    if let Some(source_ip) = source_ip {
+    if let Some(source_ip) = options.source_ip {
         addresses.retain(|address| address.is_ipv4() == source_ip.is_ipv4());
         anyhow::ensure!(
             !addresses.is_empty(),
@@ -370,6 +460,9 @@ async fn resolve_host(
 /// Bind and connect the client-side socket to `address`, applying the
 /// configured local bind and `TCP_NODELAY`.
 async fn establish_tcp(address: SocketAddr, options: &ConnectOptions) -> anyhow::Result<TcpStream> {
+    if let Some(probe) = options.denial_transport.as_ref() {
+        probe.reached(&probe.tcp_calls, "TCP")?;
+    }
     let socket = match address {
         SocketAddr::V4(_) => TcpSocket::new_v4(),
         SocketAddr::V6(_) => TcpSocket::new_v6(),
@@ -591,6 +684,9 @@ async fn connect_once(
     options: &ConnectOptions,
     stream: TcpStream,
 ) -> anyhow::Result<WsStream> {
+    if let Some(probe) = options.denial_transport.as_ref() {
+        probe.reached(&probe.tls_calls, "TLS/upgrade")?;
+    }
     let mut request = url
         .into_client_request()
         .with_context(|| format!("building websocket request for {url}"))?;

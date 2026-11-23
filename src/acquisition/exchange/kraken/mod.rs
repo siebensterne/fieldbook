@@ -39,6 +39,7 @@ impl KrakenExchange {
             concat!("fieldbook-collector/", env!("CARGO_PKG_VERSION")),
             std::time::Duration::from_secs(settings.request_timeout_secs.max(1)),
             &network,
+            network.declared_intent.as_ref(),
         )
         .context("building Kraken HTTP client")?;
         Ok(Self { settings, client })

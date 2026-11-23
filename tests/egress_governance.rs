@@ -25,15 +25,21 @@ use fieldbook::{
     config::{CoinbaseSettings, ExchangeKind, KrakenSettings, NetworkSettings, Settings},
     distribution::cli::Cli,
     egress::http_client,
+    egress_intent::EgressIntent,
     exchange::{CoinbaseExchange, KrakenExchange},
-    rights::{Operation, authorize_operations, has_active_authorization, require_provider_egress},
+    rights::{
+        DeliveryMethod, Licensee, Operation, Purpose, Recipient, Retention, ScopeSet, TimeWindow,
+        UsageMode, UsageRight, authorize_operations, has_active_authorization,
+        require_provider_egress,
+    },
+    taxonomy::CountryCode,
     ws::{self, ConnectOptions},
 };
 
 fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
     format!(
         "schema_version = 1\n\
-         licensee = \"fieldbook-operator\"\n\
+         licensee = \"licensee-a\"\n\
          territory = \"US\"\n\
          recipient = \"internal\"\n\
          \n\
@@ -41,6 +47,7 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          decision = \"{decision}\"\n\
          \n\
          [rights.identity]\n\
+         licensee = \"licensee-a\"\n\
          venue = \"{venue}\"\n\
          provider_id = \"kalshi\"\n\
          source_id = \"provider-source\"\n\
@@ -73,6 +80,35 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          recorded_at_us = 0\n\
          authority = \"contract-registry\"\n"
     )
+}
+
+/// Explicit caller-supplied request matching the abstract rights fixture.
+fn egress_intent(venue: &str, operation: Operation) -> EgressIntent {
+    let universe = ScopeSet::Universe("governance-universe-1".to_owned());
+    EgressIntent::builder()
+        .provider_id("kalshi")
+        .source_id("provider-source")
+        .source_product_id("market-data-feed")
+        .venue_id(venue)
+        .segment_id("venue-equity-cash")
+        .dataset_id("market-data")
+        .operation(operation)
+        .purpose(Purpose::InternalAnalysis)
+        .usage_mode(UsageMode::NonDisplay)
+        .usage_right(UsageRight::RealTimeAccess)
+        .licensee(Licensee::new("licensee-a").expect("licensee"))
+        .recipient(Recipient::Internal)
+        .territory(CountryCode::new("US").expect("country"))
+        .instruments(universe.clone())
+        .fields(universe.clone())
+        .modalities(ScopeSet::Universe("governance-universe-1".to_owned()))
+        .data_time_window(TimeWindow::default())
+        .retention_request(Retention::bounded(86_400))
+        .delivery_method(DeliveryMethod::Stream)
+        .endpoint("wss://venue-a.example:443")
+        .expect("endpoint")
+        .build()
+        .expect("explicit egress intent")
 }
 
 fn settings_with_rights(text: &str) -> (tempfile::TempDir, Settings) {
@@ -117,7 +153,8 @@ fn collect_without_rights_file_denies_before_egress() {
         "a denied command installs no authorization"
     );
     assert!(
-        require_provider_egress("kalshi", Operation::ReferenceDataRetrieval).is_err(),
+        require_provider_egress(&egress_intent("kalshi", Operation::ReferenceDataRetrieval))
+            .is_err(),
         "no proof means no HTTP client"
     );
     assert!(
@@ -125,6 +162,7 @@ fn collect_without_rights_file_denies_before_egress() {
             "governance-test/1",
             Duration::from_secs(1),
             &settings.network,
+            None,
         )
         .is_err(),
         "no HTTP client may be built without authorization"
@@ -176,6 +214,11 @@ async fn websocket_connect_denies_before_resolution_without_a_right() {
     let options = ConnectOptions {
         venue: "venue-a".to_owned(),
         connect_timeout: Duration::from_millis(100),
+        intent: Some(
+            egress_intent("venue-a", Operation::RealTimeCapture)
+                .for_endpoint("ws://venue-a.invalid:443")
+                .expect("target endpoint"),
+        ),
         ..ConnectOptions::default()
     };
     let error = ws::connect("ws://venue-a.invalid:443", &[], &options)
@@ -255,7 +298,7 @@ fn unconfigured_transport_default_is_not_a_provider_venue() {
         "a standalone transport is loopback-only"
     );
     assert!(
-        http_client("governance-test/1", Duration::from_secs(1), &network).is_ok(),
+        http_client("governance-test/1", Duration::from_secs(1), &network, None).is_ok(),
         "a standalone loopback transport may build a client without rights"
     );
     let live = Settings::for_exchange(ExchangeKind::Kalshi).network;
@@ -264,7 +307,7 @@ fn unconfigured_transport_default_is_not_a_provider_venue() {
         "settings derive the venue from the exchange"
     );
     assert!(
-        http_client("governance-test/1", Duration::from_secs(1), &live).is_err(),
+        http_client("governance-test/1", Duration::from_secs(1), &live, None).is_err(),
         "a venue transport needs a right even to build a client"
     );
 }

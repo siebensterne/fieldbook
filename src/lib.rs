@@ -34,6 +34,7 @@ pub use domain::taxonomy;
 pub use governance::adapter;
 pub use governance::config;
 pub use governance::coverage_certification;
+pub use governance::egress_intent;
 pub use governance::modality;
 pub use governance::rights;
 pub use integrity::completeness;

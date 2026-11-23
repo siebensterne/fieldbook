@@ -37,7 +37,8 @@ use url::Url;
 
 use crate::{
     config::NetworkSettings,
-    rights::{Operation, require_provider_egress},
+    egress_intent::{EgressIntent, MAX_REDIRECTS},
+    rights::{AuthorizationGate, require_provider_egress},
     util::sha256_hex,
 };
 
@@ -370,8 +371,9 @@ pub fn http_client(
     user_agent: &str,
     timeout: std::time::Duration,
     network: &NetworkSettings,
+    intent: Option<&EgressIntent>,
 ) -> anyhow::Result<reqwest::Client> {
-    http_client_with(user_agent, timeout, network, |name| {
+    http_client_with(user_agent, timeout, network, intent, |name| {
         std::env::var(name).ok()
     })
 }
@@ -391,17 +393,44 @@ pub fn http_client_with(
     user_agent: &str,
     timeout: std::time::Duration,
     network: &NetworkSettings,
+    intent: Option<&EgressIntent>,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<reqwest::Client> {
     // Fail closed before a client exists: no provider HTTP client is built
-    // without a live, venue-scoped authorization for this process.
-    // A REST client performs reference-data retrieval. The typed operation is
-    // checked against the installed proof; a transport action name never is.
-    require_provider_egress(&network.venue, Operation::ReferenceDataRetrieval)?;
+    // without a live authorization covering the caller's full intent. The
+    // request is supplied by the caller; it is never rebuilt from a proof.
+    let declared = match intent {
+        Some(intent) => intent.clone(),
+        None if network.venue.eq_ignore_ascii_case("loopback") => EgressIntent::loopback_test(),
+        None => anyhow::bail!(
+            "provider HTTP egress requires an explicit EgressIntent for venue `{}`",
+            network.venue
+        ),
+    };
+    anyhow::ensure!(
+        declared.venue_id == network.venue,
+        "egress intent venue `{}` does not match transport venue `{}`",
+        declared.venue_id,
+        network.venue
+    );
+    require_provider_egress(&declared)?;
     let route = EgressRoute::from_network_with(network, lookup)?;
+    let redirect_intent = declared;
+    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.stop();
+        }
+        // Every redirect destination is reauthorized before it is followed.
+        // A permitted host cannot carry a request into a different unchecked authority.
+        if !authorize_redirect(&redirect_intent, attempt.url().as_str()) {
+            return attempt.stop();
+        }
+        attempt.follow()
+    });
     let mut builder = reqwest::Client::builder()
         .user_agent(user_agent.to_owned())
         .timeout(timeout)
+        .redirect(redirect_policy)
         .no_proxy();
     if let EgressRoute::ExplicitProxy(endpoint) = &route {
         let proxy = proxy_url(endpoint)?;
@@ -410,6 +439,38 @@ pub fn http_client_with(
         builder = builder.proxy(http_proxy);
     }
     builder.build().context("building HTTP client")
+}
+
+/// Reauthorize one redirect destination against a specific gate.
+///
+/// The derived request keeps every caller-declared dimension and replaces only
+/// the endpoint with the redirect target. Any mismatch, unparseable URL or
+/// denial stops the redirect; no authority is followed unchecked.
+#[must_use]
+pub fn authorize_redirect_on(
+    intent: &EgressIntent,
+    url: &str,
+    gate: &AuthorizationGate,
+    at_us: i64,
+) -> bool {
+    let Ok(next) = intent.for_endpoint(url) else {
+        return false;
+    };
+    // A redirect that changes the venue is a different authorization, not a
+    // narrower form of the current one.
+    if next.venue_id != intent.venue_id {
+        return false;
+    }
+    gate.require_egress(&next, at_us).is_ok()
+}
+
+/// Reauthorize a redirect destination against the process-wide gate.
+#[must_use]
+fn authorize_redirect(intent: &EgressIntent, url: &str) -> bool {
+    let Ok(at_us) = crate::time::now_us() else {
+        return false;
+    };
+    authorize_redirect_on(intent, url, crate::rights::default_gate(), at_us)
 }
 
 /// Render the proxy URL handed to the HTTP client crate. The value carries

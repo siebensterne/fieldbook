@@ -62,6 +62,9 @@ name = "egress_governance"
 name = "egress_lab"
 
 [[test]]
+name = "egress_intent_lifecycle"
+
+[[test]]
 name = "bounded_batch"
 
 [[test]]

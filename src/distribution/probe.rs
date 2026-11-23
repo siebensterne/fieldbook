@@ -122,6 +122,14 @@ pub async fn run_with_route(
 ) -> anyhow::Result<ProbeReport> {
     let target = target.map_or_else(|| default_target(settings), str::to_owned);
     let provenance = route.provenance(&settings.network);
+    // The probe declares a source-contact request from the caller-supplied
+    // intent and the actual target. No permission is inferred from the target.
+    let intent = settings
+        .network
+        .declared_intent
+        .as_ref()
+        .map(|declared| declared.for_source_contact(&target))
+        .transpose()?;
 
     let mut options = ConnectOptions {
         tcp_nodelay: settings.network.tcp_nodelay,
@@ -136,6 +144,8 @@ pub async fn run_with_route(
         venue: settings.network.venue.clone(),
         // A network probe only contacts the source; it never captures data.
         operation: Operation::SourceContact,
+        intent,
+        denial_transport: None,
     };
 
     let started = Instant::now();
