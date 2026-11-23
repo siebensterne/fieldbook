@@ -15,8 +15,6 @@ binding rules are the repository's own checkers and lint configuration.
 | Google shell guide | `scripts/check_shellcheck.py`, `bash -n` over `scripts/` |
 | Google JSON/C++ guide | `scripts/check_style.py` for JSON, Makefile and structured text |
 | Google documentation guide | `scripts/check_style.py` for Markdown, `scripts/assurance/english_audit.py --strict` |
-| Verilog guide | No Verilog sources exist; retained because it is mandated |
-| Awesome style guide | Discovery index only; no rule is adopted from it without a reviewed change to `docs/coding-standard.md` |
 
 ## Change rule
 
