@@ -18,7 +18,7 @@ through ordinary `git rm`; no commit was rewritten. Each row below carries the m
 Only D11-A (generator/fixture), D11-B (market-shaped integration targets and stress
 support) and D11-C (synthetic benchmarks) `DELETE` rows were executed. The seven
 crypto/prediction-market venue adapters, their configs, scripts and measurements
-(D11-D/D11-E) are deliberately **not** removed here; they belong to RRP-003. Generic
+(D11-D/D11-E) are **not** removed here; they belong to RRP-003. Generic
 acquisition transport, session, egress, arbiter, supervisor and codec modules, integrity
 journal/replay, governance and the domain layer are retained. Tests were audited
 individually: pure scalar, type-level, rights, hashing/signature and arbitrary-byte
