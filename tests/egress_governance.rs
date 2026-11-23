@@ -27,9 +27,9 @@ use fieldbook::{
     egress::http_client,
     egress_intent::EgressIntent,
     rights::{
-        DeliveryMethod, Licensee, Operation, Purpose, Recipient, Retention, ScopeSet, TimeWindow,
-        UsageMode, UsageRight, authorize_operations, has_active_authorization,
-        require_provider_egress,
+        Actor, DataObject, DeliveryMethod, Licensee, ObjectKind, Operation, Purpose,
+        RecipientClass, RecipientIdentity, Retention, ScopeSet, TimeWindow, UsageMode, UsageRight,
+        authorize_operations, has_active_authorization, require_provider_egress,
     },
     taxonomy::CountryCode,
     ws::{self, ConnectOptions},
@@ -40,12 +40,15 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
         "schema_version = 1\n\
          licensee = \"licensee-a\"\n\
          territory = \"US\"\n\
-         recipient = \"internal\"\n\
+         recipient_class = \"internal\"\n\
+         recipient_identity = \"recipient-a\"\n\
          \n\
          [[rights]]\n\
          decision = \"{decision}\"\n\
          \n\
          [rights.identity]\n\
+         actor = \"fieldbook_producer\"\n\
+         data_object = {{ kind = \"raw_source_record\", id = \"object-a\", version = \"v1\" }}\n\
          licensee = \"licensee-a\"\n\
          venue = \"{venue}\"\n\
          provider_id = \"securities\"\n\
@@ -57,7 +60,8 @@ fn rights_toml(venue: &str, decision: &str, valid_until: i64) -> String {
          operation = \"real_time_capture\"\n\
          usage_right = \"real_time_access\"\n\
          usage_mode = \"non_display\"\n\
-         recipient = \"internal\"\n\
+         recipient_class = \"internal\"\n\
+         recipient_identity = \"recipient-a\"\n\
          purpose = \"internal_analysis\"\n\
          delivery_method = \"stream\"\n\
          instruments = {{ universe = \"governance-universe-1\" }}\n\
@@ -91,12 +95,18 @@ fn egress_intent(venue: &str, operation: Operation) -> EgressIntent {
         .venue_id(venue)
         .segment_id("venue-equity-cash")
         .dataset_id("market-data")
+        .actor(Actor::FieldbookProducer)
         .operation(operation)
+        .data_object(
+            DataObject::new(ObjectKind::RawSourceRecord, "object-a", "v1")
+                .expect("abstract object identity"),
+        )
         .purpose(Purpose::InternalAnalysis)
         .usage_mode(UsageMode::NonDisplay)
         .usage_right(UsageRight::RealTimeAccess)
         .licensee(Licensee::new("licensee-a").expect("licensee"))
-        .recipient(Recipient::Internal)
+        .recipient_class(RecipientClass::Internal)
+        .recipient_identity(RecipientIdentity::new("recipient-a").expect("recipient identity"))
         .territory(CountryCode::new("US").expect("country"))
         .instruments(universe.clone())
         .fields(universe.clone())
