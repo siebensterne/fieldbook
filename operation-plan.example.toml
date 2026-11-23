@@ -1,0 +1,94 @@
+# Caller-declared operation plan (W2.1 STEP 5).
+#
+# This file declares the REQUESTS a command may perform. It grants nothing.
+# Every step is compared with a separate record in the rights file, committed
+# to the audit directory, and reauthorized at its own side-effect boundary.
+# One valid step never implies another: a command plan must contain a step for
+# every operation the command requires, or startup is denied.
+#
+# Set [governance].operation_plan_file or --operation-plan-file to this file's
+# path. All identifiers here are abstract placeholders.
+
+schema_version = 1
+
+[plan]
+plan_id = "collect-plan-abstract"
+
+# Provider-egress step: contacts the declared endpoint only after the gate
+# authorizes the full request and the audit event is durable.
+[[plan.steps]]
+step_id = "source-contact"
+grant_reference = "REPLACE_WITH_CONTRACT_REFERENCE"
+approved_resource_class = "market-data/reference"
+approved_http_method = "GET"
+side_effect_boundary = "provider_contact"
+
+[plan.steps.request]
+request_kind = "egress"
+provider_id = "provider-a"
+source_id = "provider-source"
+source_product_id = "market-data-feed"
+venue_id = "venue-a"
+segment_id = "venue-equity-cash"
+dataset_id = "market-data"
+actor = "fieldbook_producer"
+operation = "source_contact"
+purpose = "proprietary_own_account_trading_research"
+usage_right = "real_time_access"
+usage_mode = "non_display"
+licensee = "REPLACE_WITH_LEGAL_LICENSEE"
+recipient_class = "internal"
+recipient_identity = "REPLACE_WITH_NAMED_RECIPIENT"
+territory = "US"
+delivery_method = "query"
+instruments = "not_applicable"
+fields = "not_applicable"
+modalities = "not_applicable"
+data_time_window = {}
+retention_request = { limit = "none", purge_required = false }
+
+[plan.steps.request.data_object]
+kind = "source_reference_record"
+id = "REPLACE_WITH_OBJECT_ID"
+version = "REPLACE_WITH_OBJECT_VERSION"
+
+[plan.steps.request.endpoint_identity]
+scheme = "wss"
+host = "venue-a.example"
+port = 443
+
+# Local-data step: no provider contact. The local-data gate is separate, and
+# no endpoint is consulted. Raw storage does not authorize replay.
+[[plan.steps]]
+step_id = "raw-storage"
+grant_reference = "REPLACE_WITH_CONTRACT_REFERENCE"
+side_effect_boundary = "durable_storage"
+
+[plan.steps.request]
+request_kind = "local"
+actor = "fieldbook_producer"
+licensee = "REPLACE_WITH_LEGAL_LICENSEE"
+venue = "venue-a"
+provider_id = "provider-a"
+source_id = "provider-source"
+dataset_id = "market-data"
+product_id = "market-data-feed"
+segment = "venue-equity-cash"
+territory = "US"
+operation = "raw_storage"
+usage_right = "historical_storage"
+usage_mode = "non_display"
+recipient_class = "internal"
+recipient_identity = "REPLACE_WITH_NAMED_RECIPIENT"
+purpose = "proprietary_own_account_trading_research"
+delivery_method = "stream"
+retention = { limit = { bounded = 86400 }, purge_required = true }
+instruments = { named = ["inst-a"] }
+fields = { named = ["bid", "ask"] }
+modalities = { named = ["l2"] }
+data_time_window = { from_us = 1_700_000_000_000_000, to_us = 1_700_086_400_000_000 }
+
+[plan.steps.request.data_object]
+kind = "raw_source_record"
+id = "REPLACE_WITH_OBJECT_ID"
+version = "REPLACE_WITH_OBJECT_VERSION"

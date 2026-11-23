@@ -379,10 +379,18 @@ pub struct GovernanceSettings {
     /// intent. This is the request, not the grant: loading it never produces a
     /// permission by itself and no value is inferred from a command name.
     pub egress_intent_file: Option<PathBuf>,
+    /// Path to a versioned TOML file declaring the whole operation plan.
+    /// Command startup authorizes every step from this file; a single declared
+    /// intent never implies the rest of a command's pipeline.
+    pub operation_plan_file: Option<PathBuf>,
     /// Declared intent loaded from `egress_intent_file` at settings load time.
     /// Kept out of the serialized config so it cannot be self-attested there.
     #[serde(skip)]
     pub declared_intent: Option<crate::egress_intent::EgressIntent>,
+    /// Declared plan loaded from `operation_plan_file`. Kept out of the
+    /// serialized config so it cannot be self-attested there.
+    #[serde(skip)]
+    pub declared_plan: Option<crate::governance::operation_plan::OperationPlan>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -444,7 +452,9 @@ impl Settings {
             journal: file.journal,
         };
         settings.apply_environment()?;
-        settings.load_declared_intent(path.and_then(Path::parent))?;
+        let base = path.and_then(Path::parent);
+        settings.load_declared_intent(base)?;
+        settings.load_declared_plan(base)?;
         settings.network.declared_intent = settings.governance.declared_intent.clone();
         settings.validate()?;
         Ok(settings)
@@ -464,6 +474,27 @@ impl Settings {
             base.map_or(path.clone(), |directory| directory.join(&path))
         };
         self.governance.declared_intent = Some(crate::egress_intent::EgressIntent::load(&path)?);
+        Ok(())
+    }
+
+    /// Load the caller-declared operation plan from its separate file. A
+    /// missing or invalid plan is an error: no command starts without a
+    /// complete, declared plan. No step is inferred from a command name.
+    ///
+    /// # Errors
+    /// Returns an error for a missing, malformed or incomplete plan file.
+    pub fn load_declared_plan(&mut self, base: Option<&Path>) -> anyhow::Result<()> {
+        let Some(path) = self.governance.operation_plan_file.clone() else {
+            return Ok(());
+        };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            base.map_or(path.clone(), |directory| directory.join(&path))
+        };
+        self.governance.declared_plan = Some(
+            crate::governance::operation_plan::OperationPlan::load(&path)?,
+        );
         Ok(())
     }
 

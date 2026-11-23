@@ -1,7 +1,10 @@
 //! Command-line surface. The binary is thin: every command
 //! delegates to a library module with explicit inputs and outputs.
 
-use std::{net::SocketAddr, path::PathBuf};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -41,6 +44,12 @@ pub struct Cli {
     /// is the request evaluated against the rights file, not a grant.
     #[arg(long = "egress-intent-file", global = true, value_name = "FILE")]
     pub egress_intent_file: Option<PathBuf>,
+
+    /// Versioned TOML file declaring every operation step the command may
+    /// perform. The full plan is authorized before startup; one declared step
+    /// never implies another. Overrides `[governance].operation_plan_file`.
+    #[arg(long = "operation-plan-file", global = true, value_name = "FILE")]
+    pub operation_plan_file: Option<PathBuf>,
 
     /// Disable `TCP_NODELAY` on websocket sockets.
     #[arg(long = "no-tcp-nodelay", global = true)]
@@ -292,11 +301,8 @@ pub enum JournalCommand {
     },
 }
 
-/// Commands that would contact a provider or publish derived provider data.
-/// Every one of them is gated before its library implementation is called.
-///
-/// A command declares the lifecycle operations it may require. Each operation
-/// is authorized independently; none is inferred from the command name.
+/// Operations a command may require. Every entry is authorized as an
+/// independent plan step; none is inferred from the command name.
 #[must_use]
 pub fn gated_operations(command: &Command) -> &'static [crate::rights::Operation] {
     use crate::rights::Operation;
@@ -324,6 +330,48 @@ pub fn gated_operations(command: &Command) -> &'static [crate::rights::Operation
     }
 }
 
+/// Operations that may open a socket toward a provider. These steps are
+/// authorized and reauthorized at the provider-egress boundary, before DNS,
+/// TCP, TLS or a protocol upgrade.
+#[must_use]
+pub fn provider_egress_operations(command: &Command) -> &'static [crate::rights::Operation] {
+    use crate::rights::Operation;
+    match command {
+        Command::Collect => &[
+            Operation::SourceContact,
+            Operation::ReferenceDataRetrieval,
+            Operation::RealTimeCapture,
+        ],
+        Command::Discover { .. } => &[Operation::SourceContact, Operation::ReferenceDataRetrieval],
+        Command::Latency { .. } => &[Operation::SourceContact, Operation::RealTimeCapture],
+        Command::NetworkProbe { .. } => &[Operation::SourceContact],
+        _ => &[],
+    }
+}
+
+/// Operations that only use or publish already-held local data. These steps
+/// go through the separate local-data gate and never authorize provider egress.
+/// Reading a release manifest for signature verification is `Display`; it does
+/// not authorize `Replay` of an event payload.
+#[must_use]
+pub fn local_data_operations(command: &Command) -> &'static [crate::rights::Operation] {
+    use crate::rights::Operation;
+    match command {
+        Command::Collect => &[Operation::RawStorage, Operation::Normalization],
+        Command::AnalyticsExport { .. } => {
+            &[Operation::InternalAnalytics, Operation::DerivedDataCreation]
+        }
+        Command::Replay { .. } => &[Operation::Replay],
+        Command::Inspect { .. }
+        | Command::Verify { .. }
+        | Command::Completeness { .. }
+        | Command::Coverage { .. }
+        | Command::AnalyticsVerify { .. } => &[Operation::Display],
+        Command::Journal { .. } => &[Operation::Backup],
+        _ => &[],
+    }
+}
+
 impl Cli {
     pub fn apply_settings(&self, settings: &mut Settings) -> anyhow::Result<()> {
         if let Some(path) = &self.rights_file {
@@ -337,6 +385,10 @@ impl Cli {
             let intent = crate::egress_intent::EgressIntent::load(path)?;
             settings.governance.declared_intent = Some(intent.clone());
             settings.network.declared_intent = Some(intent);
+        }
+        if let Some(path) = &self.operation_plan_file {
+            settings.governance.operation_plan_file = Some(path.clone());
+            settings.load_declared_plan(self.config.as_deref().and_then(Path::parent))?;
         }
         if self.no_tcp_nodelay {
             settings.network.tcp_nodelay = false;
