@@ -8,14 +8,22 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use fieldbook::{
-    completeness, config::Settings, coordinator, coverage, inspect, journal, latency, probe,
-    replay, report::write_json_atomic, rights, verify,
+    completeness,
+    config::Settings,
+    coordinator, coverage, inspect, journal, latency,
+    operation_plan::{self, PlanRequest},
+    probe, replay,
+    report::write_json_atomic,
+    verify,
 };
 
 use fieldbook::distribution::cli::Cli;
 use fieldbook::distribution::cli::Command;
 use fieldbook::distribution::cli::JournalCommand;
-use fieldbook::distribution::cli::gated_operations;
+use fieldbook::distribution::cli::{
+    gated_operations, local_data_operations, provider_egress_operations,
+};
+use fieldbook::rights::Operation;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,31 +35,45 @@ async fn main() -> anyhow::Result<()> {
         Cli::command().print_help().context("printing CLI help")?;
         anyhow::bail!("an explicit subcommand is required; no provider activity was started");
     };
-    // Gate before dispatch: a denied decision must stop the command before a
-    // client is built, a socket is opened, or a file is published. The request
-    // is the caller's declared EgressIntent; no command-derived request exists.
-    let required_operations = gated_operations(&command);
+    // Gate before dispatch: construct the full declared plan, require a step
+    // for every operation this command may perform, and authorize all steps
+    // atomically. A single valid step never implies the rest of the pipeline.
+    let required_operations: Vec<Operation> = provider_egress_operations(&command)
+        .iter()
+        .chain(local_data_operations(&command))
+        .chain(gated_operations(&command))
+        .copied()
+        .collect();
     if !required_operations.is_empty() {
-        let intent = settings.governance.declared_intent.as_ref().ok_or_else(|| {
+        let mut plan = settings.governance.declared_plan.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "{} requires an explicit EgressIntent: set --egress-intent-file or [governance].egress_intent_file",
-                required_operations
-                    .first()
-                    .map_or("command", |operation| operation.as_str())
+                "this command requires an explicit operation plan: set --operation-plan-file or [governance].operation_plan_file"
             )
         })?;
-        anyhow::ensure!(
-            required_operations.contains(&intent.operation),
-            "declared egress operation `{}` is not valid for this command",
-            intent.operation.as_str()
-        );
-        let authority = rights::authorize_egress_intent(&settings, intent)?;
-        // The gate retains its own reference; revocation can be driven through
-        // this handle by the owner during a long-running session.
-        let _ = authority;
+        plan.require_complete(&required_operations)?;
+        operation_plan::authorize_plan(&settings, &mut plan)?;
+        // Bind the transport to the authorized step, never to a separate
+        // declaration that happens to name the same venue.
+        for operation in [
+            Operation::RealTimeCapture,
+            Operation::SourceContact,
+            Operation::ReferenceDataRetrieval,
+        ] {
+            if let Some(PlanRequest::Egress(intent)) =
+                plan.step_for_operation(operation).map(|step| &step.request)
+            {
+                settings.network.declared_intent = Some(intent.clone());
+                settings.governance.declared_intent = Some(intent.clone());
+            }
+        }
+        settings.governance.declared_plan = Some(plan);
     }
     match command {
         Command::Collect => {
+            // Capture alone never grants durable storage. Both steps must be
+            // live at the boundary before any archive can be created.
+            gate_step(&settings, Operation::RealTimeCapture)?;
+            gate_step(&settings, Operation::RawStorage)?;
             let report = coordinator::run(settings).await?;
             eprintln!(
                 "collector stopped: {} SBE messages, {} bytes, {} symbols, reason={}",
@@ -73,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Replay { input } => {
+            gate_step(&settings, Operation::Replay)?;
             let report = replay::run(settings, &input)?;
             eprintln!(
                 "replay complete: {} SBE messages, {} bytes, {} symbols",
@@ -85,6 +108,7 @@ async fn main() -> anyhow::Result<()> {
             read_chunk_size,
             limit,
         } => {
+            gate_step(&settings, Operation::Display)?;
             let summary = inspect::run(&input, &read_chunk_size, limit)?;
             emit_json(&summary)?;
             Ok(())
@@ -93,6 +117,7 @@ async fn main() -> anyhow::Result<()> {
             input,
             read_chunk_size,
         } => {
+            gate_step(&settings, Operation::Display)?;
             let summary = verify::run(&input, &read_chunk_size)?;
             emit_json(&summary)?;
             anyhow::ensure!(
@@ -111,6 +136,7 @@ async fn main() -> anyhow::Result<()> {
             include_symbols,
             out,
         } => {
+            gate_step(&settings, Operation::Display)?;
             let summary = completeness::run(&input, &read_chunk_size, include_symbols)?;
             if let Some(path) = out.as_deref() {
                 write_json_atomic(path, &summary).context("writing completeness report")?;
@@ -131,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             read_chunk_size,
             out,
         } => {
+            gate_step(&settings, Operation::Display)?;
             let summary = coverage::run(&input, &metadata, &report, &read_chunk_size)?;
             if let Some(path) = out.as_deref() {
                 write_json_atomic(path, &summary).context("writing coverage certificate")?;
@@ -156,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Latency { out } => {
+            gate_step(&settings, Operation::SourceContact)?;
+            gate_step(&settings, Operation::RealTimeCapture)?;
             let max_markets = if settings.collector.max_markets == 0 {
                 10
             } else {
@@ -171,6 +200,8 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Discover { out } => {
+            gate_step(&settings, Operation::SourceContact)?;
+            gate_step(&settings, Operation::ReferenceDataRetrieval)?;
             let exchange = coordinator::build_exchange(&settings, false)?;
             let markets = exchange
                 .discover_markets(settings.collector.max_markets)
@@ -190,6 +221,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::NetworkProbe { target, out } => {
+            gate_step(&settings, Operation::SourceContact)?;
             let report = probe::run(&settings, target.as_deref()).await?;
             if let Some(path) = out.as_deref() {
                 write_json_atomic(path, &report).context("writing probe report")?;
@@ -206,6 +238,8 @@ async fn main() -> anyhow::Result<()> {
             capture_dir,
             staging_dir,
         } => {
+            gate_step(&settings, Operation::InternalAnalytics)?;
+            gate_step(&settings, Operation::DerivedDataCreation)?;
             let summary = fieldbook::analytics::export::export_capture(&capture_dir, &staging_dir)?;
             emit_json(&summary)?;
             anyhow::ensure!(
@@ -216,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::AnalyticsVerify { capture_dir, out } => {
+            gate_step(&settings, Operation::Display)?;
             let verification = fieldbook::analytics::verify_capture(&capture_dir)?;
             emit_json(&verification)?;
             if let Some(path) = out {
@@ -233,6 +268,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Journal { command } => match command {
             JournalCommand::Verify { run } => {
+                gate_step(&settings, Operation::Backup)?;
                 let verification = journal::verify_run(&run)?;
                 emit_json(&verification)?;
                 anyhow::ensure!(
@@ -243,12 +279,24 @@ async fn main() -> anyhow::Result<()> {
                 Ok(())
             }
             JournalCommand::Recover { run } => {
+                gate_step(&settings, Operation::Backup)?;
                 let verification = journal::recover_incomplete_run(&run)?;
                 emit_json(&verification)?;
                 Ok(())
             }
         },
     }
+}
+
+/// Reauthorize one declared step immediately before its side effect. A denial
+/// stops the command before a socket, file read, archive or publication.
+fn gate_step(settings: &Settings, operation: Operation) -> anyhow::Result<()> {
+    let plan = settings
+        .governance
+        .declared_plan
+        .as_ref()
+        .context("no authorized operation plan for this command")?;
+    operation_plan::require_declared_step(plan, operation)
 }
 
 /// Emit a JSON command result without panicking on a broken pipe.

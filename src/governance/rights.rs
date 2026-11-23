@@ -28,7 +28,7 @@
 //! proxy URLs, headers or raw payloads are ever included.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex,
@@ -2275,8 +2275,16 @@ impl LicensingRegistry {
             winning.audit.licence_document_hash,
             winning.audit.authority
         );
+        // The proof is bound to the request's full identity and to the
+        // winning grant's approved endpoint set. A request's own set is empty
+        // by construction; without this binding an authorized intent could
+        // not reach the endpoint named in the winning rights record.
+        let proof_scope = AuthorizationScope {
+            approved_endpoints: winning.identity.scope.approved_endpoints.clone(),
+            ..request.clone()
+        };
         Ok(AuthorizationProof {
-            scope: request.clone(),
+            scope: proof_scope,
             at_us,
             valid_from: winning.identity.valid_from,
             valid_until: winning.identity.valid_until,
@@ -2385,6 +2393,15 @@ pub struct DecisionAuditEvent {
     /// Endpoint authority checked by this event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Declared operation plan whose step produced this event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Declared step within that plan. A step is never inferred from a command.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    /// Side-effect boundary this decision permits, not a command name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side_effect_boundary: Option<String>,
     pub policy_version: u32,
     pub software_version: String,
 }
@@ -2398,6 +2415,9 @@ pub struct AuditContext {
     pub grant_snapshot_id: Option<String>,
     pub lease_expires_at_us: Option<i64>,
     pub endpoint: Option<String>,
+    pub plan_id: Option<String>,
+    pub step_id: Option<String>,
+    pub side_effect_boundary: Option<String>,
 }
 
 static AUDIT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -2537,6 +2557,9 @@ impl AuditSink {
             grant_snapshot_id: context.grant_snapshot_id,
             lease_expires_at_us: context.lease_expires_at_us,
             endpoint: context.endpoint,
+            plan_id: context.plan_id,
+            step_id: context.step_id,
+            side_effect_boundary: context.side_effect_boundary,
             policy_version: self.policy_version,
             software_version: env!("CARGO_PKG_VERSION").to_owned(),
         }
@@ -2725,6 +2748,21 @@ impl RightsContext {
         request: &AuthorizationRequest,
         at_us: i64,
     ) -> anyhow::Result<AuthorizationProof> {
+        self.authorize_with_context(request, at_us, AuditContext::default())
+            .map(|(proof, _event)| proof)
+    }
+
+    /// Authorize one request and return both the proof and its committed
+    /// audit event. Plan callers use the event id as the step's audit reference.
+    ///
+    /// # Errors
+    /// Same fail-closed contract as [`Self::authorize`].
+    pub fn authorize_with_context(
+        &self,
+        request: &AuthorizationRequest,
+        at_us: i64,
+        plan_context: AuditContext,
+    ) -> anyhow::Result<(AuthorizationProof, DecisionAuditEvent)> {
         let validation = request.validate();
         let outcome = match &validation {
             Err(error) => Err(error.clone()),
@@ -2742,7 +2780,7 @@ impl RightsContext {
             Ok(_) => ("grant".to_owned(), None),
             Err(error) => (error.to_string(), Some(error.to_string())),
         };
-        let lifecycle =
+        let mut lifecycle =
             outcome
                 .as_ref()
                 .ok()
@@ -2755,6 +2793,9 @@ impl RightsContext {
                     )),
                     ..AuditContext::default()
                 });
+        lifecycle.plan_id = plan_context.plan_id;
+        lifecycle.step_id = plan_context.step_id;
+        lifecycle.side_effect_boundary = plan_context.side_effect_boundary;
         let audit_result = self.sink.record_with_context(
             request,
             &decision,
@@ -2764,7 +2805,7 @@ impl RightsContext {
             lifecycle,
         );
         match (outcome, audit_result) {
-            (Ok(proof), Ok(_)) => Ok(proof),
+            (Ok(proof), Ok(event)) => Ok((proof, event)),
             // A permitted decision without a committed event is not usable.
             (Ok(_), Err(error)) => Err(error),
             // A denial remains a denial even when its event could not be written.
@@ -2791,6 +2832,18 @@ struct GateState {
     fallback_sink: Option<AuditSink>,
     next_session: u64,
     membership: UniverseMembershipRegistry,
+}
+
+/// One proof queued for installation, with the plan metadata audited for
+/// its step. A proof is never inferred from a command or from another step.
+#[derive(Debug, Clone)]
+pub struct ProofInstallation {
+    pub proof: AuthorizationProof,
+    pub sink: AuditSink,
+    pub authority: Option<Arc<dyn AuthorityRefresh>>,
+    pub plan_id: Option<String>,
+    pub step_id: Option<String>,
+    pub side_effect_boundary: Option<String>,
 }
 
 /// Instance-scoped authorization state.
@@ -2860,6 +2913,7 @@ impl AuthorizationGate {
             grant_snapshot_id: Some(item.proof.grant_snapshot_id.clone()),
             lease_expires_at_us: Some(item.session.expires_at_us),
             endpoint: Some(intent.endpoint_identity.authority()),
+            ..AuditContext::default()
         };
         let evidence = DecisionAudit {
             licence_reference: item.proof.licence_reference.clone(),
@@ -2869,6 +2923,33 @@ impl AuthorizationGate {
             authority: item.proof.recording_authority.clone(),
         };
         (item.sink.clone(), context, evidence)
+    }
+
+    /// Audit parts for a local-data scope. No endpoint is fabricated: a local
+    /// check never contacts or names a provider authority.
+    fn audit_parts_for_scope(
+        item: &ActiveAuthorization,
+    ) -> (AuditSink, AuditContext, DecisionAudit) {
+        let context = AuditContext {
+            recording_authority: Some(item.proof.recording_authority.clone()),
+            session_id: Some(item.session.session_id.clone()),
+            registry_revision: Some(item.proof.registry_revision),
+            grant_snapshot_id: Some(item.proof.grant_snapshot_id.clone()),
+            lease_expires_at_us: Some(item.session.expires_at_us),
+            ..AuditContext::default()
+        };
+        let evidence = DecisionAudit {
+            licence_reference: item.proof.licence_reference.clone(),
+            licence_document_hash: item.proof.licence_document_hash.clone(),
+            contract_revision: item.proof.contract_revision,
+            recorded_at_us: item.proof.at_us,
+            authority: item.proof.recording_authority.clone(),
+        };
+        (item.sink.clone(), context, evidence)
+    }
+
+    fn scope_key(scope: &AuthorizationScope) -> anyhow::Result<String> {
+        serde_json::to_string(scope).context("serializing authorization scope for batch identity")
     }
 
     /// Install one proof and start its active session.
@@ -2895,57 +2976,151 @@ impl AuthorizationGate {
         sink: AuditSink,
         authority: Option<Arc<dyn AuthorityRefresh>>,
     ) -> anyhow::Result<String> {
-        proof.scope.validate()?;
-        let at_us = proof.at_us;
-        let snapshot = GrantSnapshot::new(
-            proof.registry_revision,
-            proof.grant_snapshot_id.clone(),
-            proof.lease_duration_us,
-            at_us,
-        )?;
-        let mut state = self.lock();
-        if state
-            .active
-            .iter()
-            .any(|item| item.proof.scope == proof.scope)
-        {
-            anyhow::bail!("an identical authorization is already installed in this gate");
-        }
-        let session_id = format!("session-{}", state.next_session);
-        state.next_session = state.next_session.saturating_add(1);
-        let session = AuthorizationSession {
-            session_id: session_id.clone(),
-            expires_at_us: snapshot.expires_at_us(),
-            snapshot: snapshot.clone(),
-            renewals: 0,
-        };
-        if state.fallback_sink.is_none() {
-            state.fallback_sink = Some(sink.clone());
-        }
-        let context = AuditContext {
-            recording_authority: Some(proof.recording_authority.clone()),
-            session_id: Some(session_id.clone()),
-            registry_revision: Some(snapshot.registry_revision),
-            grant_snapshot_id: Some(snapshot.snapshot_id.clone()),
-            lease_expires_at_us: Some(session.expires_at_us),
-            ..AuditContext::default()
-        };
-        let evidence = DecisionAudit {
-            licence_reference: proof.licence_reference.clone(),
-            licence_document_hash: proof.licence_document_hash.clone(),
-            contract_revision: proof.contract_revision,
-            recorded_at_us: proof.at_us,
-            authority: proof.recording_authority.clone(),
-        };
-        sink.record_with_context(&proof.scope, "grant", None, Some(&evidence), at_us, context)
-            .context("committing grant audit event")?;
-        state.active.push(ActiveAuthorization {
+        let installation = ProofInstallation {
             proof,
             sink,
-            session,
             authority,
-        });
-        Ok(session_id)
+            plan_id: None,
+            step_id: None,
+            side_effect_boundary: None,
+        };
+        self.install_batch(vec![installation])?
+            .into_iter()
+            .next()
+            .context("batch installation returned no session id")
+    }
+
+    /// Install a whole plan atomically: either every proof becomes active or
+    /// none does. All fallible work (validation, duplicate detection and audit
+    /// commits) completes before any state is mutated, so a failure on a later
+    /// step cannot leave an earlier step authorized. A rollback audit record
+    /// is committed when a failure is detected after earlier grant records.
+    ///
+    /// Returns the session ids in installation order.
+    ///
+    /// # Errors
+    /// Returns the first fail-closed denial without installing any proof.
+    pub fn install_batch(
+        &self,
+        installations: Vec<ProofInstallation>,
+    ) -> anyhow::Result<Vec<String>> {
+        let mut snapshots = Vec::with_capacity(installations.len());
+        for installation in &installations {
+            installation.proof.scope.validate()?;
+            snapshots.push(GrantSnapshot::new(
+                installation.proof.registry_revision,
+                installation.proof.grant_snapshot_id.clone(),
+                installation.proof.lease_duration_us,
+                installation.proof.at_us,
+            )?);
+        }
+        let mut state = self.lock();
+        let mut keys: BTreeSet<String> = state
+            .active
+            .iter()
+            .map(|item| Self::scope_key(&item.proof.scope))
+            .collect::<anyhow::Result<_>>()?;
+        for (index, installation) in installations.iter().enumerate() {
+            let key = Self::scope_key(&installation.proof.scope)?;
+            anyhow::ensure!(
+                keys.insert(key),
+                "an identical authorization is already installed in this gate (step {index})"
+            );
+        }
+        let first_session = state.next_session;
+        let session_ids: Vec<String> = (0..installations.len())
+            .map(|offset| format!("session-{}", first_session.saturating_add(offset as u64)))
+            .collect();
+        let audit_outcome = (|| -> anyhow::Result<Vec<DecisionAuditEvent>> {
+            let mut events = Vec::with_capacity(installations.len());
+            for ((installation, snapshot), session_id) in
+                installations.iter().zip(&snapshots).zip(&session_ids)
+            {
+                let context = AuditContext {
+                    recording_authority: Some(installation.proof.recording_authority.clone()),
+                    session_id: Some(session_id.clone()),
+                    registry_revision: Some(snapshot.registry_revision),
+                    grant_snapshot_id: Some(snapshot.snapshot_id.clone()),
+                    lease_expires_at_us: Some(snapshot.expires_at_us()),
+                    endpoint: None,
+                    plan_id: installation.plan_id.clone(),
+                    step_id: installation.step_id.clone(),
+                    side_effect_boundary: installation.side_effect_boundary.clone(),
+                };
+                let evidence = DecisionAudit {
+                    licence_reference: installation.proof.licence_reference.clone(),
+                    licence_document_hash: installation.proof.licence_document_hash.clone(),
+                    contract_revision: installation.proof.contract_revision,
+                    recorded_at_us: installation.proof.at_us,
+                    authority: installation.proof.recording_authority.clone(),
+                };
+                events.push(
+                    installation
+                        .sink
+                        .record_with_context(
+                            &installation.proof.scope,
+                            "grant",
+                            None,
+                            Some(&evidence),
+                            installation.proof.at_us,
+                            context,
+                        )
+                        .context("committing grant audit event for plan step")?,
+                );
+            }
+            Ok(events)
+        })();
+        if let Err(error) = audit_outcome {
+            if let Some(first) = installations.first() {
+                let rollback = AuthorizationScope::denial_scope(
+                    &first.proof.scope.venue,
+                    first.proof.scope.operation,
+                );
+                let context = AuditContext {
+                    plan_id: first.plan_id.clone(),
+                    step_id: first.step_id.clone(),
+                    side_effect_boundary: first.side_effect_boundary.clone(),
+                    ..AuditContext::default()
+                };
+                let _ = first.sink.record_with_context(
+                    &rollback,
+                    "plan_rollback",
+                    Some(format!("{error}; no plan step was installed")),
+                    None,
+                    first.proof.at_us,
+                    context,
+                );
+            }
+            return Err(error);
+        }
+        // No state was mutated above. Commit the whole batch in one locked step.
+        for ((installation, snapshot), session_id) in
+            installations.iter().zip(&snapshots).zip(&session_ids)
+        {
+            state.active.push(ActiveAuthorization {
+                proof: installation.proof.clone(),
+                sink: installation.sink.clone(),
+                session: AuthorizationSession {
+                    session_id: session_id.clone(),
+                    expires_at_us: snapshot.expires_at_us(),
+                    snapshot: snapshot.clone(),
+                    renewals: 0,
+                },
+                authority: installation.authority.clone(),
+            });
+        }
+        state.next_session = first_session.saturating_add(installations.len() as u64);
+        if !installations.is_empty() && state.fallback_sink.is_none() {
+            state.fallback_sink = Some(installations[0].sink.clone());
+        }
+        Ok(session_ids)
+    }
+
+    /// Number of live proofs in this gate. Used by batch atomicity tests and
+    /// by operators auditing a process; it is not a permission.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        self.lock().active.len()
     }
 
     /// Evaluate the caller's intent against the gate.
@@ -2959,6 +3134,7 @@ impl AuthorizationGate {
         at_us: i64,
         audit_egress: bool,
         at: Option<MembershipTime>,
+        metadata: AuditContext,
     ) -> anyhow::Result<AuthorizationProof> {
         intent.validate()?;
         let scope = intent.to_scope();
@@ -3002,7 +3178,10 @@ impl AuthorizationGate {
 
         let (sink, context, evidence, session_id, expires_at, authority, proof) = {
             let item = &state.active[index];
-            let (sink, context, evidence) = Self::audit_parts(item, intent);
+            let (sink, mut context, evidence) = Self::audit_parts(item, intent);
+            context.plan_id = metadata.plan_id;
+            context.step_id = metadata.step_id;
+            context.side_effect_boundary = metadata.side_effect_boundary;
             (
                 sink,
                 context,
@@ -3097,7 +3276,7 @@ impl AuthorizationGate {
         intent: &EgressIntent,
         at_us: i64,
     ) -> anyhow::Result<AuthorizationProof> {
-        self.evaluate(intent, at_us, false, None)
+        self.evaluate(intent, at_us, false, None, AuditContext::default())
     }
 
     /// Preflight check with explicit universe membership evidence.
@@ -3110,7 +3289,141 @@ impl AuthorizationGate {
         at_us: i64,
         at: MembershipTime,
     ) -> anyhow::Result<AuthorizationProof> {
-        self.evaluate(intent, at_us, false, Some(at))
+        self.evaluate(intent, at_us, false, Some(at), AuditContext::default())
+    }
+
+    /// Check a local-data-use scope against the live gate without any endpoint
+    /// or provider contact. This is the separate gate used by replay, inspect,
+    /// verify, journal and export steps. A grant for a different operation or
+    /// object never covers the request, and a denied check never reads data.
+    ///
+    /// # Errors
+    /// Returns a fail-closed denial when no live proof covers the full scope,
+    /// and fails closed when a permitted event cannot be committed.
+    pub fn check_scope_active(&self, scope: &AuthorizationScope, at_us: i64) -> anyhow::Result<()> {
+        self.check_scope_active_with_context(scope, at_us, AuditContext::default())
+    }
+
+    /// Local-data check that audits the declaring plan, step and boundary.
+    ///
+    /// # Errors
+    /// Returns the same fail-closed denial as [`Self::check_scope_active`].
+    pub fn check_scope_active_with_context(
+        &self,
+        scope: &AuthorizationScope,
+        at_us: i64,
+        metadata: AuditContext,
+    ) -> anyhow::Result<()> {
+        scope.validate()?;
+        let mut state = self.lock();
+        let Some(index) = state
+            .active
+            .iter()
+            .position(|item| item.proof.scope.matches_request(scope))
+        else {
+            let error: anyhow::Error = RightsError::ScopeMismatch {
+                operation: scope.operation.as_str().to_owned(),
+                venue: scope.venue.clone(),
+                reason: "no live proof covers this local-data operation",
+            }
+            .into();
+            if let Some(sink) = state.fallback_sink.clone() {
+                let denial_context = AuditContext {
+                    plan_id: metadata.plan_id.clone(),
+                    step_id: metadata.step_id.clone(),
+                    side_effect_boundary: metadata.side_effect_boundary.clone(),
+                    ..AuditContext::default()
+                };
+                let _ = sink.record_with_context(
+                    scope,
+                    "local_denied",
+                    Some(error.to_string()),
+                    None,
+                    at_us,
+                    denial_context,
+                );
+            }
+            return Err(error);
+        };
+        let item = &state.active[index];
+        let (sink, context, evidence, authority, expires, proof) = {
+            let (sink, mut context, evidence) = Self::audit_parts_for_scope(item);
+            context.plan_id = metadata.plan_id;
+            context.step_id = metadata.step_id;
+            context.side_effect_boundary = metadata.side_effect_boundary;
+            (
+                sink,
+                context,
+                evidence,
+                item.authority.clone(),
+                item.session.expires_at_us,
+                item.proof.clone(),
+            )
+        };
+        if proof.valid_from > at_us || proof.valid_until.is_some_and(|end| at_us > end) {
+            state.active.remove(index);
+            let _ = sink.record_with_context(
+                scope,
+                "grant_expired",
+                Some(RightsError::AuthorizationExpired.to_string()),
+                Some(&evidence),
+                at_us,
+                context,
+            );
+            return Err(RightsError::AuthorizationExpired.into());
+        }
+        if at_us > expires {
+            state.active.remove(index);
+            let _ = sink.record_with_context(
+                scope,
+                "lease_expired",
+                Some(RightsError::LeaseExpired.to_string()),
+                Some(&evidence),
+                at_us,
+                context,
+            );
+            return Err(RightsError::LeaseExpired.into());
+        }
+        if let Some(authority) = authority {
+            match authority.refresh() {
+                Ok(current)
+                    if current.revision == proof.registry_revision
+                        && current.valid_snapshots.contains(&proof.grant_snapshot_id) => {}
+                Ok(_) => {
+                    state.active.remove(index);
+                    let _ = sink.record_with_context(
+                        scope,
+                        "grant_revoked",
+                        Some(RightsError::GrantInvalidated.to_string()),
+                        Some(&evidence),
+                        at_us,
+                        context,
+                    );
+                    return Err(RightsError::GrantInvalidated.into());
+                }
+                Err(error) => {
+                    let _ = sink.record_with_context(
+                        scope,
+                        "local_denied",
+                        Some(format!("{}: {error}", RightsError::AuthorityRefreshFailed)),
+                        Some(&evidence),
+                        at_us,
+                        context,
+                    );
+                    return Err(RightsError::AuthorityRefreshFailed.into());
+                }
+            }
+        }
+        sink.record_with_context(
+            scope,
+            "local_permitted",
+            None,
+            Some(&evidence),
+            at_us,
+            context,
+        )
+        .context("committing local-data authorization event")?;
+        Ok(())
     }
 
     /// Reauthorize one egress attempt and commit its event before returning.
@@ -3120,7 +3433,23 @@ impl AuthorizationGate {
     /// Returns an error on denial and when a permitted egress event cannot be
     /// committed. Denial events are written when a sink is available.
     pub fn require_egress(&self, intent: &EgressIntent, at_us: i64) -> anyhow::Result<()> {
-        self.evaluate(intent, at_us, true, None).map(|_| ())
+        self.evaluate(intent, at_us, true, None, AuditContext::default())
+            .map(|_| ())
+    }
+
+    /// Reauthorize one egress for a declared plan step, auditing its plan id,
+    /// step id and side-effect boundary.
+    ///
+    /// # Errors
+    /// Returns the fail-closed denial before the caller may egress.
+    pub fn require_egress_with_plan_context(
+        &self,
+        intent: &EgressIntent,
+        at_us: i64,
+        metadata: AuditContext,
+    ) -> anyhow::Result<()> {
+        self.evaluate(intent, at_us, true, None, metadata)
+            .map(|_| ())
     }
 
     /// Reauthorize an egress with explicit universe membership evidence.
@@ -3134,7 +3463,8 @@ impl AuthorizationGate {
         at_us: i64,
         at: MembershipTime,
     ) -> anyhow::Result<()> {
-        self.evaluate(intent, at_us, true, Some(at)).map(|_| ())
+        self.evaluate(intent, at_us, true, Some(at), AuditContext::default())
+            .map(|_| ())
     }
 
     /// Renew the lease of an active session after a successful authority refresh.
@@ -3388,21 +3718,25 @@ pub fn authorize_requests(
         )
     })?;
     let context = RightsContext::load(path, audit_dir)?;
-    let mut proofs = Vec::with_capacity(requests.len());
+    let mut installations = Vec::with_capacity(requests.len());
     for request in requests {
-        proofs.push(context.authorize(request, now_us()?)?);
-    }
-    for proof in proofs {
+        let proof = context.authorize(request, now_us()?)?;
         let authority: Arc<dyn AuthorityRefresh> = Arc::new(InMemoryAuthority::new(
             proof.registry_revision,
             proof.grant_snapshot_id.clone(),
         ));
-        default_gate().install_with_authority(
+        installations.push(ProofInstallation {
             proof,
-            context.sink().clone(),
-            Some(authority.clone()),
-        )?;
+            sink: context.sink().clone(),
+            authority: Some(authority),
+            plan_id: None,
+            step_id: None,
+            side_effect_boundary: None,
+        });
     }
+    // One atomic commit: a later duplicate or invalid proof denies the whole
+    // batch and leaves no earlier proof active.
+    default_gate().install_batch(installations)?;
     Ok(())
 }
 
@@ -5668,6 +6002,69 @@ mod tests {
         assert!(
             contact_event.universe_digest.is_none(),
             "a scope without a universe has no universe digest"
+        );
+    }
+
+    #[test]
+    fn batch_installation_is_atomic_on_later_failure() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let sink = sink(directory.path());
+        let first = scope();
+        let second = scope_with(|scope| {
+            scope.operation = Operation::RawStorage;
+            scope.data_object = DataObject::from_declared(
+                ObjectKind::RawSourceRecord,
+                "object-b".to_owned(),
+                "v1".to_owned(),
+            );
+        });
+        let make_proof = |scope: &AuthorizationScope| AuthorizationProof {
+            scope: scope.clone(),
+            at_us: 0,
+            valid_from: 0,
+            valid_until: None,
+            licence_reference: "contract-1".to_owned(),
+            licence_document_hash: "a".repeat(64),
+            contract_revision: 1,
+            registry_revision: 7,
+            grant_snapshot_id: format!("snapshot-{}", scope.operation.as_str()),
+            lease_duration_us: MAX_LEASE_DURATION.as_micros() as u64,
+            recording_authority: "contract-registry".to_owned(),
+        };
+        let gate = AuthorizationGate::new();
+        gate.install(make_proof(&second), sink.clone())
+            .expect("existing grant for the second step");
+        let before = gate.active_count();
+        let installations = vec![
+            ProofInstallation {
+                proof: make_proof(&first),
+                sink: sink.clone(),
+                authority: None,
+                plan_id: Some("plan-abstract".to_owned()),
+                step_id: Some("capture".to_owned()),
+                side_effect_boundary: Some("provider_contact".to_owned()),
+            },
+            ProofInstallation {
+                proof: make_proof(&second),
+                sink: sink.clone(),
+                authority: None,
+                plan_id: Some("plan-abstract".to_owned()),
+                step_id: Some("storage".to_owned()),
+                side_effect_boundary: Some("durable_storage".to_owned()),
+            },
+        ];
+        assert!(
+            gate.install_batch(installations).is_err(),
+            "a duplicate later step denies the whole batch"
+        );
+        assert_eq!(
+            gate.active_count(),
+            before,
+            "no earlier step was left installed"
+        );
+        assert!(
+            gate.check_active(&intent_for(&first), 1).is_err(),
+            "the first step was not partially authorized"
         );
     }
 }

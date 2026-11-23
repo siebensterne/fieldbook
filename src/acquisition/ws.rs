@@ -24,7 +24,8 @@ use url::Url;
 use crate::{
     egress::{self, EgressRoute, ProxyEndpoint, ProxyScheme},
     egress_intent::{EgressIntent, EndpointIdentity},
-    rights::{AuthorizationGate, Operation},
+    governance::operation_plan::{self, OperationPlan},
+    rights::{AuthorizationGate, Modality, Operation, ScopeSet},
     time::now_us,
 };
 
@@ -340,6 +341,48 @@ pub fn recheck_subscription(
     at_us: i64,
 ) -> anyhow::Result<()> {
     gate.require_egress(&intent.with_modalities(modalities), at_us)
+}
+
+/// Authorize a subscription change and only then transmit it. `send` is the
+/// single transmission seam: a denial returns before it is called, so a wider
+/// subscription can never leave the process on a denied gate.
+///
+/// # Errors
+/// Returns the fail-closed denial before transmission, or the send error.
+pub fn send_subscription_authorized<F>(
+    intent: &EgressIntent,
+    modalities: ScopeSet<Modality>,
+    gate: &AuthorizationGate,
+    at_us: i64,
+    send: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    recheck_subscription(intent, modalities, gate, at_us)?;
+    send()
+}
+
+/// Plan-aware subscription send. The step for `operation` must be permitted
+/// before the widened scope is even compared, and both checks happen before
+/// transmission.
+///
+/// # Errors
+/// Returns the fail-closed denial before transmission, or the send error.
+pub fn send_plan_subscription<F>(
+    plan: &OperationPlan,
+    operation: Operation,
+    intent: &EgressIntent,
+    modalities: ScopeSet<Modality>,
+    gate: &AuthorizationGate,
+    at_us: i64,
+    send: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce() -> anyhow::Result<()>,
+{
+    operation_plan::require_plan_step(plan, operation, gate, at_us)?;
+    send_subscription_authorized(intent, modalities, gate, at_us, send)
 }
 
 /// Perform one mid-session authorization checkpoint against a gate.

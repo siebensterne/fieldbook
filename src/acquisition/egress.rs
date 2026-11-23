@@ -37,10 +37,128 @@ use url::Url;
 
 use crate::{
     config::NetworkSettings,
-    egress_intent::{EgressIntent, MAX_REDIRECTS},
+    egress_intent::{EgressIntent, EndpointIdentity, MAX_REDIRECTS},
+    governance::operation_plan::{
+        OperationClass, OperationPlan, PlanRequest, class_for, require_plan_step,
+    },
     rights::{AuthorizationGate, require_provider_egress},
     util::sha256_hex,
 };
+
+/// The actual HTTP request being authorized, supplied by the caller at dispatch.
+///
+/// The intent carries the provider, source product, operation and full scope.
+/// The URL, method and resource class are the *actual* request, never values
+/// reconstructed from a plan step, a client or an installed proof.
+#[derive(Debug, Clone)]
+pub struct HttpEgressRequest<'a> {
+    pub intent: &'a EgressIntent,
+    pub url: &'a str,
+    pub method: &'a str,
+    pub resource_class: &'a str,
+    pub approved_resource_class: &'a str,
+    pub approved_method: &'a str,
+    pub gate: &'a AuthorizationGate,
+    pub at_us: i64,
+}
+
+/// Authorize one actual HTTP request before any client, DNS, TCP or TLS work.
+///
+/// Checks that the operation is a provider-egress step, that the URL's
+/// authority and scheme are exactly the ones in the caller's intent, that the
+/// method and endpoint resource class are the approved ones, and finally that
+/// the full intent is covered by a live authorization. A denial is always a
+/// denial: no network layer is reached.
+///
+/// # Errors
+/// Returns the fail-closed denial before dispatch is allowed to run.
+pub fn authorize_http_request(binding: &HttpEgressRequest<'_>) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        class_for(binding.intent.operation) == OperationClass::ProviderEgress,
+        "HTTP egress operation `{}` is not a provider-egress operation",
+        binding.intent.operation.as_str()
+    );
+    anyhow::ensure!(
+        !binding.resource_class.trim().is_empty()
+            && binding.resource_class == binding.approved_resource_class,
+        "HTTP endpoint resource class `{}` is not the approved class `{}`",
+        binding.resource_class,
+        binding.approved_resource_class
+    );
+    anyhow::ensure!(
+        !binding.method.trim().is_empty() && binding.method == binding.approved_method,
+        "HTTP method `{}` is not the approved method `{}`",
+        binding.method,
+        binding.approved_method
+    );
+    let actual = EndpointIdentity::from_url(binding.url)
+        .map_err(|error| anyhow::anyhow!("HTTP target has no usable endpoint: {error}"))?;
+    anyhow::ensure!(
+        actual == binding.intent.endpoint_identity,
+        "HTTP target `{}` is not the authorized endpoint `{}`",
+        actual.authority(),
+        binding.intent.endpoint_identity.authority()
+    );
+    binding.intent.validate()?;
+    binding.gate.require_egress(binding.intent, binding.at_us)
+}
+
+/// Authorize, then run one HTTP dispatch. The `send` closure is the only place
+/// a socket can be opened; injected transports make denial tests fail if it
+/// is reached. On denial it is never called.
+///
+/// # Errors
+/// Returns the authorization denial without calling `send`, or the dispatch
+/// error when authorization succeeded.
+pub fn dispatch_http_request<T>(
+    binding: &HttpEgressRequest<'_>,
+    send: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    authorize_http_request(binding)?;
+    send()
+}
+
+/// Derive an HTTP binding from an authorized plan step. The approved resource
+/// class and method come from the declaration, not from the dispatch caller,
+/// and the step is reauthorized before the binding is returned.
+///
+/// # Errors
+/// Returns the fail-closed denial when the step is missing, unauthorized or
+/// not an egress step.
+pub fn http_request_for_plan_step<'a>(
+    plan: &'a OperationPlan,
+    operation: crate::rights::Operation,
+    url: &'a str,
+    method: &'a str,
+    resource_class: &'a str,
+    gate: &'a AuthorizationGate,
+    at_us: i64,
+) -> anyhow::Result<HttpEgressRequest<'a>> {
+    require_plan_step(plan, operation, gate, at_us)?;
+    let step = plan
+        .step_for_operation(operation)
+        .ok_or_else(|| anyhow::anyhow!("no plan step for operation {operation:?}"))?;
+    let PlanRequest::Egress(intent) = &step.request else {
+        anyhow::bail!("plan step `{operation:?}` is not a provider-egress step");
+    };
+    let approved = step.approved_resource_class.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("plan step `{operation:?}` has no approved resource class")
+    })?;
+    let approved_method = step
+        .approved_http_method
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("plan step `{operation:?}` has no approved HTTP method"))?;
+    Ok(HttpEgressRequest {
+        intent,
+        url,
+        method,
+        resource_class,
+        approved_resource_class: approved,
+        approved_method,
+        gate,
+        at_us,
+    })
+}
 
 /// Proxy protocol the venue must be reached through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -385,6 +503,9 @@ pub fn http_client(
 /// inherited from the shell are blocked (`no_proxy`), and no route is added.
 /// Explicit proxy mode blocks the shell variables too, then attaches exactly
 /// one configured proxy. Failure never falls back to direct networking.
+/// Automatic redirects are disabled: a redirect target is a new authority and
+/// is never followed unless the caller installs a reauthorizing policy with
+/// [`http_client_with_authorized_redirects`].
 ///
 /// # Errors
 ///
@@ -394,6 +515,77 @@ pub fn http_client_with(
     timeout: std::time::Duration,
     network: &NetworkSettings,
     intent: Option<&EgressIntent>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<reqwest::Client> {
+    build_http_client(
+        user_agent,
+        timeout,
+        network,
+        intent,
+        reqwest::redirect::Policy::none(),
+        lookup,
+    )
+}
+
+/// Build a client that follows redirects only after each target has been
+/// reauthorized against the supplied gate. A different authority, an
+/// unparseable URL, an expired proof or a failed gate stops the redirect.
+///
+/// # Errors
+/// Same contract as [`http_client_with`].
+pub fn http_client_with_authorized_redirects(
+    user_agent: &str,
+    timeout: std::time::Duration,
+    network: &NetworkSettings,
+    intent: &EgressIntent,
+    gate: &AuthorizationGate,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<reqwest::Client> {
+    let redirect_intent = intent.clone();
+    let redirect_gate = gate.clone();
+    let policy = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.stop();
+        }
+        let Ok(at_us) = crate::time::now_us() else {
+            return attempt.stop();
+        };
+        if !authorize_redirect_on(
+            &redirect_intent,
+            attempt.url().as_str(),
+            &redirect_gate,
+            at_us,
+        ) {
+            return attempt.stop();
+        }
+        attempt.follow()
+    });
+    build_http_client(user_agent, timeout, network, Some(intent), policy, lookup)
+}
+
+/// Build a client only after the actual HTTP request has been authorized.
+/// The binding supplies provider, source product, operation and full scope
+/// through its intent, plus the actual URL, method and approved resource class.
+///
+/// # Errors
+/// Returns the fail-closed denial before any client or socket exists.
+pub fn http_client_with_request(
+    user_agent: &str,
+    timeout: std::time::Duration,
+    network: &NetworkSettings,
+    binding: &HttpEgressRequest<'_>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<reqwest::Client> {
+    authorize_http_request(binding)?;
+    http_client_with(user_agent, timeout, network, Some(binding.intent), lookup)
+}
+
+fn build_http_client(
+    user_agent: &str,
+    timeout: std::time::Duration,
+    network: &NetworkSettings,
+    intent: Option<&EgressIntent>,
+    redirect_policy: reqwest::redirect::Policy,
     lookup: impl Fn(&str) -> Option<String>,
 ) -> anyhow::Result<reqwest::Client> {
     // Fail closed before a client exists: no provider HTTP client is built
@@ -415,18 +607,6 @@ pub fn http_client_with(
     );
     require_provider_egress(&declared)?;
     let route = EgressRoute::from_network_with(network, lookup)?;
-    let redirect_intent = declared;
-    let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-        if attempt.previous().len() >= MAX_REDIRECTS {
-            return attempt.stop();
-        }
-        // Every redirect destination is reauthorized before it is followed.
-        // A permitted host cannot carry a request into a different unchecked authority.
-        if !authorize_redirect(&redirect_intent, attempt.url().as_str()) {
-            return attempt.stop();
-        }
-        attempt.follow()
-    });
     let mut builder = reqwest::Client::builder()
         .user_agent(user_agent.to_owned())
         .timeout(timeout)
@@ -462,15 +642,6 @@ pub fn authorize_redirect_on(
         return false;
     }
     gate.require_egress(&next, at_us).is_ok()
-}
-
-/// Reauthorize a redirect destination against the process-wide gate.
-#[must_use]
-fn authorize_redirect(intent: &EgressIntent, url: &str) -> bool {
-    let Ok(at_us) = crate::time::now_us() else {
-        return false;
-    };
-    authorize_redirect_on(intent, url, crate::rights::default_gate(), at_us)
 }
 
 /// Render the proxy URL handed to the HTTP client crate. The value carries

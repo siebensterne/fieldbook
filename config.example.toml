@@ -11,6 +11,9 @@
 # Without a rights file these commands deny before any provider contact.
 # rights_file = "rights.toml"
 # audit_dir = "captures/authorization-audit"
+# The full operation plan is authorized before startup. One declared step
+# never grants another; a missing step denies the command.
+# operation_plan_file = "operation-plan.example.toml"
 
 [collector]
 # 0 derives the shard count from the initial symbol count and the soft socket

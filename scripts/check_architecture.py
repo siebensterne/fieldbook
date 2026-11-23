@@ -134,6 +134,7 @@ SOURCE_RESPONSIBILITIES = {
     "src/domain/reference_data.rs": "effective-dated entity, venue, listing and specification graph with fail-closed identity resolution",
     "src/governance/rights.rs": "fail-closed licensing registry, typed authorization identity (actor, action, data object kind/id/version, recipient class and identity), action-object applicability matrix, exact versioned universe containment with recorded membership evidence, usage rights, decisions and entitlement authorization",
     "src/governance/egress_intent.rs": "explicit caller-supplied egress intent with typed actor, data object and recipient identity, applicability-conformant source-contact shape, endpoint authority and active authorization lease lifecycle",
+    "src/governance/operation_plan.rs": "typed operation plans with independent actor/action/object/scope steps, provider-egress and local-data-use separation, side-effect boundaries, atomic full-plan authorization and step reauthorization",
     "src/domain/taxonomy.rs": "universal asset, instrument, information, depth, frequency and temporal classification with validated country and currency codes",
     "src/lib.rs": "library module exports and public entry points",
     "src/main.rs": "process entry point and collect/discover/replay/inspect/verify/completeness/coverage/latency dispatch",
