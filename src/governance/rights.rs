@@ -40,7 +40,10 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::{config::Settings, report::write_json_atomic, taxonomy::CountryCode, time::now_us};
+use crate::config::Settings;
+use crate::report::write_json_atomic;
+use crate::taxonomy::CountryCode;
+use crate::time::now_us;
 
 /// Right being exercised over a dataset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -2799,21 +2802,38 @@ mod tests {
             })
             .build()
             .expect("explicit request");
-        assert_eq!(request.product_id, "exact-source-product");
-        assert_ne!(request.product_id, request.operation.as_str());
         assert_eq!(
-            request.purpose.as_str(),
-            "proprietary_own_account_trading_research"
+            request.product_id, "exact-source-product",
+            "product identity is explicit"
         );
-        assert_ne!(request.territory, CountryCode::default());
+        assert_ne!(
+            request.product_id,
+            request.operation.as_str(),
+            "product is not operation"
+        );
+        let purpose = request.purpose.as_str();
+        let expected_purpose = "proprietary_own_account_trading_research";
+        assert_eq!(purpose, expected_purpose, "purpose is verbatim");
+        assert_ne!(
+            request.territory,
+            CountryCode::default(),
+            "territory is explicit"
+        );
 
         // Every required value is mandatory; nothing is inferred.
         let missing = AuthorizationScope::request().build();
-        assert!(matches!(missing, Err(RightsError::MissingField { .. })));
+        assert!(
+            matches!(missing, Err(RightsError::MissingField { .. })),
+            "missing field denied"
+        );
 
         // Legacy operational labels are not market segments.
         let legacy_segment = scope_with(|item| item.segment = "live-capture".to_owned());
-        assert_eq!(legacy_segment.validate(), Err(RightsError::InvalidSegment));
+        assert_eq!(
+            legacy_segment.validate(),
+            Err(RightsError::InvalidSegment),
+            "legacy segment denied"
+        );
     }
 
     #[test]
@@ -2890,7 +2910,11 @@ mod tests {
             from_us: Some(20),
             to_us: Some(10),
         };
-        assert_eq!(reversed.validate(), Err(RightsError::InvalidTimeWindow));
+        assert_eq!(
+            reversed.validate(),
+            Err(RightsError::InvalidTimeWindow),
+            "reversed window denied"
+        );
         let mut request = scope();
         request.data_time_window = reversed;
         assert!(
