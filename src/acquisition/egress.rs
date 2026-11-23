@@ -22,7 +22,7 @@
 //!   read from environment variables named by `[network]` in configuration,
 //!   never from the TOML document itself. They are never serialized, hashed
 //!   into fingerprints, written to logs, or embedded in error messages.
-//! - **Venue authentication is end-to-end.** Kalshi signatures and venue TLS
+//! - **Venue authentication is end-to-end.** Adapter signatures and venue TLS
 //!   credentials are only ever sent through the venue's TLS connection. A
 //!   proxy observes destination metadata; it is not a trust anchor.
 //!

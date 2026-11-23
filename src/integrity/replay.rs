@@ -135,11 +135,8 @@ pub fn run(settings: Settings, input: &Path) -> anyhow::Result<RunReport> {
     let mut replay_settings = settings.clone();
     replay_settings.collector.shards = 1;
     replay_settings.collector.replicas = replay_settings.collector.replicas.max(2);
-    let core_config = CoreConfig::from_settings(
-        &replay_settings,
-        1,
-        crate::exchange::capabilities_for(replay_settings.exchange),
-    )?;
+    let core_config =
+        CoreConfig::from_settings(&replay_settings, 1, crate::exchange::capabilities_for())?;
     let mut core = CollectorCore::new(core_config)?;
     let mut writer = DirectWriter::create(crate::writer::WriterOptions::from_settings(&settings))?;
 
@@ -373,7 +370,7 @@ pub fn run(settings: Settings, input: &Path) -> anyhow::Result<RunReport> {
     let core_stats = core.stats();
     let mut report = RunReport::new(
         "replay",
-        &settings.exchange.to_string(),
+        &settings.network.venue,
         "fixture",
         first_timestamp.unwrap_or(ended_at_us),
         ended_at_us,
@@ -396,7 +393,7 @@ pub fn run(settings: Settings, input: &Path) -> anyhow::Result<RunReport> {
         );
     }
     if let Some(path) = sidecar_path(&settings.output.metadata_path) {
-        MarketMetadata::new(&settings.exchange.to_string(), core.market_infos())
+        MarketMetadata::new(&settings.network.venue, core.market_infos())
             .write(path)
             .context("writing replay metadata sidecar")?;
     }

@@ -1,5 +1,7 @@
 # Replay fixture format
 
+> **RRP-003 notice (2026-11-23).** Venue-specific examples and adapter references below describe families retired under RRP-003. They are retained as historical design rationale, not active capability claims. See `product-scope-retirement-2026-11-23.md`.
+
 `replay` consumes one JSON object per line (JSONL). Blank lines and lines whose
 first non-whitespace character is `#` are ignored. Every record carries a local
 `received_at_us` timestamp; timestamps must be non-decreasing across the file.

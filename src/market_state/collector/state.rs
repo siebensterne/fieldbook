@@ -129,7 +129,7 @@ impl CoreConfig {
                 .context("duration overflows microseconds")
         };
         Ok(Self {
-            exchange: settings.exchange.to_string(),
+            exchange: settings.network.venue.clone(),
             shard_count,
             replica_count: settings.collector.replicas,
             snapshot_interval_us: seconds_to_us(settings.collector.snapshot_interval_secs)?,
@@ -213,7 +213,7 @@ struct DiscontinuityIncident {
     resolved_at_us: Option<i64>,
     /// Reason continuity was lost
     reason: crate::model::DiscontinuityReason,
-    /// Whether the gap interval is quantifiable (Kalshi has seq/clock; Polymarket does not)
+    /// Whether the gap interval is quantifiable (an adapter declares seq/clock or not)
     quantifiable: bool,
 }
 
@@ -224,7 +224,7 @@ struct MarketState {
     active: Option<SourceId>,
     books: BTreeMap<SourceId, SourceBook>,
     /// Outstanding explicit recovery requests. A lower clock on one of these
-    /// snapshots is evidence of a Kalshi maintenance reset, not a stale shadow
+    /// snapshots can evidence a venue maintenance reset, not a stale shadow
     /// frame. For clockless venues the request also carries the receive fence
     /// that a replacement snapshot must beat.
     recovery_requests: BTreeMap<SourceId, RecoveryRequest>,
@@ -805,7 +805,7 @@ impl CollectorCore {
                 meta,
             } => {
                 // Canonical identity over the meaningful normalized payload.
-                // Kalshi's `seq` is per-connection and cannot name the same
+                // A venue `seq` may be per-connection and cannot name the same
                 // notification across replicas, so the dedup key is (market,
                 // kind, exchange timestamp, payload fingerprint). Two
                 // different updates for the same market with the same kind and
@@ -952,7 +952,7 @@ impl CollectorCore {
             return Vec::new();
         }
 
-        // Kalshi's clock is not comparable across exchange maintenance. A lower
+        // A venue clock may not be comparable across maintenance. A lower
         // clock is trusted only from the active connection, or from a requested
         // snapshot on a source whose old book was already invalidated (for
         // example after reconnecting). A lower clock on a still-valid shadow

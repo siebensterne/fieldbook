@@ -9,20 +9,19 @@ claim that the target capabilities exist. Gate results are in
 
 ## Scope
 
-The current system is a read-only prediction-market data collector. It discovers
-markets, maintains one normalized order book per outcome symbol, writes the
-supplied SBE schema, and optionally records exact public websocket frames. It
-does not submit orders, hold positions, or run strategy or pre-trade risk.
+The current system is a venue-neutral securities market-data platform core. It
+provides discovery, normalized order-book state, the supplied SBE capture format
+and an optional raw-frame journal. It does not submit orders, hold positions, or
+run strategy or pre-trade risk. The seven crypto and prediction-market adapter
+families were retired under RRP-003; no securities venue adapter is registered
+yet, and live commands deny at the composition root until one is qualified.
 
-Kalshi and Polymarket are the first venue adapters, not the limits of the
-domain model. The general numeric model (PR #33) removed the universal
-`[0, 1]` price range and six-decimal scale: `Price` and `Quantity` are exact
-`i64` coefficients interpreted by each instrument's `NumericSpec` (scale,
-units, tick bands, quantity step, lot size, contract multiplier), and the
-prediction-market `[0, 1]` check now lives in the Kalshi/Polymarket adapters.
-Remaining deliberate gaps — venue enumeration and binary outcome fields — are
-listed in the [platform charter](platform-charter.md). Removing them is
-scheduled work, not an implicit capability of this implementation.
+`Price` and `Quantity` are exact `i64` coefficients interpreted by each
+instrument's `NumericSpec` (scale, units, tick bands, quantity step, lot size,
+contract multiplier). There is no universal price range or fixed scale and no
+binary-outcome or prediction-market assumption in the active product. The target
+domain and adapter boundaries are in [platform-charter.md](platform-charter.md);
+this document does not claim that target capabilities exist.
 
 ## Runtime composition
 
@@ -37,8 +36,9 @@ client, socket or published file exists. Offline commands (replay,
 inspect, verify, journal, analytics-verify) need no rights. Live collection
 enters `src/distribution/coordinator.rs`, which constructs the exchange adapter, performs
 discovery, plans capacity, loads a catalog, starts session workers (plus the
-dedicated Kalshi lifecycle control plane), the writer, the journal, and the
-metrics endpoint, and then runs one serialized event loop.
+dedicated lifecycle control plane when declared by an adapter), the writer, the journal, and the
+metrics endpoint, and then runs one serialized event loop. With no adapter
+registered, composition fails closed before any of those components starts.
 
 Discovery is venue-specific behind `Exchange`. `src/storage/capacity.rs` converts the
 discovered records and outcome symbols into shard, connection, subscription,
@@ -94,14 +94,14 @@ flowchart LR
 
 ## Dedicated lifecycle control plane
 
-Kalshi exposes `market_lifecycle_v2` as a separate channel. Subscribing to it
-from every order-book shard duplicated the stream per replica and let an
-unrelated control-plane failure take down a data-plane connection. Book
-shards therefore carry only `orderbook_delta` subscriptions.
+A qualified venue may expose a separate market-lifecycle channel. Subscribing
+to it from every order-book shard duplicates the stream per replica and lets an
+unrelated control-plane failure take down a data-plane connection. Book shards
+therefore carry only book subscriptions.
 
 The coordinator starts `collector.lifecycle_replicas` supervised lifecycle
-sockets (Kalshi only, default 1, maximum 4) alongside the book workers. Each
-socket receives the same `market_lifecycle_v2` stream; the core deduplicates
+sockets (default 1, maximum 4) when an adapter declares the plane. Each socket
+receives the same lifecycle stream; the core deduplicates
 notifications by `(market, kind, exchange timestamp, normalized-payload
 fingerprint)` with a bounded window, so each distinct notification is applied
 once however many lifecycle replicas are configured. A lifecycle event for an
@@ -126,36 +126,21 @@ REST discovery round before the event stream is trusted again, because the
 venue may have emitted notifications while the socket was down. Set
 `lifecycle_replicas = 0` to disable the plane; new markets then enter only
 via REST discovery and terminal removals are deferred to the reconciliation
-cadence. Polymarket has no separate lifecycle channel; its `lifecycle_*`
-notifications ride the market channel and are unaffected.
+cadence. An adapter without a separate lifecycle channel ignores the knob and
+does not charge it to its connection budget.
 
 ## Abstraction boundaries
 
 `Exchange` reports venue capabilities and creates discovery and session
 objects. `ExchangeCapabilities` currently carries `has_sequence_clock`; the core
 consumes that value instead of identifying a venue by name. `SessionFactory`
-creates a `MarketDataSession` for one source, and `src/acquisition/session.rs` supervises
-reconnects, heartbeats, status, and control handling around it. Kalshi and
-Polymarket implement these boundaries in `src/acquisition/exchange/{kalshi,polymarket}/`.
-Hyperliquid implements them in `src/acquisition/exchange/hyperliquid/`: H0 reference data,
-H1 telemetry, H2 selected perpetuals and H3 synthetic capacity evidence behind
-the same seams, with no branch in the state machine. H2 reconciles an exact
-finite book set, emits only full snapshots from `l2Book`, maps `trades` to
-telemetry, and uses the existing `Control::{RequestSnapshot,Recover}` fences for
-recovery; `has_sequence_clock` stays `false`. H3 adds a test-only loopback wire
-mock that reuses the shared stress ledger, coverage hashes and manifest schema;
-it produces no production behavior and no live or capacity claim. Kraken
-implements H0 reference data in `src/acquisition/exchange/kraken/`: namespaced `AssetPairs`
-decoding with exact scales and an active-only filter, offline-fixture and
-read-only REST discovery, and a no-network session seam. H1-H3 remain planned;
-no Kraken socket, book, telemetry or live evidence exists.
-Binance implements H0 reference data in `src/acquisition/exchange/binance/`: deterministic
-discovery of spot and perpetual instruments from an offline `exchangeInfo`-style
-fixture, with explicit `binance:spot:<BASE>/<QUOTE>` /
-`binance:perp:<SYMBOL>` identities, canonical-quote scoping and exact numeric
-steps. Its session is a no-network stub with a disabled heartbeat and no
-lifecycle plane; `has_sequence_clock` is `false`. H1-H3 are planned gates, not
-implemented behavior, and no websocket, live, latency or capacity claim is made.
+creates a `MarketDataSession` for one source, and `src/acquisition/session.rs`
+supervises reconnects, heartbeats, status, and control handling around it. No
+concrete adapter is registered after RRP-003: a securities venue adapter is
+added behind these seams only after source qualification, rights and an accepted
+NDC projection (workspace W4). Offline paths use the conservative clockless
+capability declaration in `src/acquisition/exchange/mod.rs` rather than assuming
+an ordering guarantee they cannot verify.
 
 Ownership and dependency direction are deliberate:
 
@@ -228,21 +213,16 @@ flowchart LR
 
 | Area | Files | Responsibility |
 |---|---|---|
-| Composition | `main.rs`, `coordinator.rs`, `cli.rs`, `config.rs` | CLI, settings precedence, adapter construction, lifecycle |
+| Composition | `main.rs`, `coordinator.rs`, `cli.rs`, `config.rs` | CLI, settings precedence, fail-closed adapter composition, lifecycle |
 | Universal data foundation | `taxonomy.rs`, `reference_data.rs`, `event_model.rs`, `adapter.rs`, `quality.rs`, `rights.rs`, `coverage_certification.rs`, `docs/specifications/` | Declarative V2 contracts for domains, identity, typed events, source capabilities, quality, rights and coverage certification; additive to the live collector |
-| Discovery | `exchange/*/discovery.rs`, `capacity.rs`, `catalog.rs` | Venue discovery, eligibility, capacity admission, checkpoint |
+| Discovery | `exchange/mod.rs`, `capacity.rs`, `catalog.rs` | Venue-neutral discovery contract, eligibility, capacity admission, checkpoint |
 | State | `collector/state.rs`, `orderbook.rs`, `model.rs`, `fixed.rs` | Serialized books, failover, fixed-point values, output model |
 | Data-product contracts | `products.rs`, `exchange/mod.rs` (`source_capabilities_for`) | Platform M3 Phase 1 typed products, stable subscription keys from legacy native symbols, typed source capabilities, and an explicit subscription state machine with connection epochs; declarations only, no session-API, SBE, journal, replay or catalog change. H0-only venues declare reference data and no live products. |
 | Canonical event model | `canonical.rs`, `docs/canonical-event-model.md` | Platform M4 Phase 1 typed canonical envelope and taxonomy with deterministic opaque event ids, explicit provenance, schema-versioned serialization and a fail-closed reader; exact `ExchangeEvent` mappings only (no fabricated trades, BBO, assets or gaps). `NormalizedStore` is a contract with a test-only in-memory implementation; the raw journal is independent, the SBE writer is one projection, and no durable store, connector, performance or live claim is made. |
 | Non-market-data reference app | `application.rs`, `application/postgres.rs`, `docs/jsonl-postgres-reference.md` | Platform P5 second application proving source/target independence: JSONL source -> typed `CanonicalBusinessEvent` -> idempotent target contract with receipts, obligations and checkpointed resume; parameterized PostgreSQL SQL, a deterministic in-memory simulator and an opt-in real `PgTarget` with explicit migrations and database-enforced idempotency. No market-data module, SBE/journal/replay/catalog change, replication or performance claim; the live test needs an operator-supplied server. |
 | Durable reference pipeline | `application/file_source.rs`, `application/network_source.rs`, `application/durable.rs`, `application/postgres.rs`, `docs/durability-contract.md`, `tests/durable_pipeline.rs`, `tests/network_source.rs`, `tests/postgres_live.rs` | Platform P6 adds a fixed-buffer `BufRead` line source with exact bytes, physical offsets, a registered identity and a one-shot SHA-256 content fingerprint (64 KiB hash buffer; exact duplicate detection uses a fixed-size bucket table with a disk-backed index, not an O(unique) in-memory map); a verified resume anchor bound to (source id, fingerprint, target id); and a real local append-only, checksummed, fsync-capable commit store whose single record carries ids, dispositions/quarantines and the new checkpoint. Reopen verifies checksums and sequence gaps. Delivery receipts are six categories with `ExecutionMode`; simulated modes never write externally or move the durable checkpoint; rejection quarantines durably before progression. PostgreSQL has a synchronous driver, explicit migrations, source-scoped checkpoints and idempotency, and an opt-in live `PgTarget`; the network source is loopback-only. No replication, production network certification or performance claim. |
 | Acquisition plane (V2) | `acquisition/{mod,transport,codec,arbiter,packet,supervisor}.rs` | Additive TCP/UDP/multicast transport, codec registry, dual-channel sequence arbitration, raw packet evidence and bounded connection supervision; no new dependency and no change to the live collector path |
-| Transport | `exchange/*/session.rs`, `session.rs`, `ws.rs`, `egress.rs`, `protocol.rs` | Protocol handling, supervised workers, connection options, shared typed frame/signal vocabulary; egress policy: direct or explicit fail-closed proxy, route provenance. Hyperliquid's session subscribes to H1 telemetry (`allMids`/`fastAssetCtxs`) plus H2 `l2Book`/`trades` for the exact selected perpetuals; `request_snapshot` resubscribes/wait-for-next-push and `Recover` fences by the existing receive epoch/sequence. |
-| Adapter telemetry | `exchange/hyperliquid/telemetry.rs` | H1 exact-decimal decoding of venue-wide `allMids`/`fastAssetCtxs` statistics into typed `ProtocolControl` observations; `fastAssetCtxs` base64 + raw DEFLATE JSON map decoded from the real venue wire shape, finer-than-SBE values retained verbatim without rounding, malformed values rejected; no depth, `Snapshot`, `LevelChange` or heartbeat acknowledgement |
-| Adapter books | `exchange/hyperliquid/books.rs` | H2 exact-decimal decoding of full two-sided `l2Book` pushes into `ExchangeEvent::Snapshot` with exact receive time and advisory feed timestamp; `trades` stay `ProtocolControl` telemetry; identity is `hyperliquid:perp:<dex>:<coin>`; no spot books, no `LevelChange`, no full universe |
-| Adapter reference (Kraken) | `exchange/kraken/{mod,codec,discovery,session}.rs` | H0 namespaced `kraken:spot:BASE/QUOTE` identity from `wsname` or normalized legacy base/quote; exact `tick_size`/`lot_decimals` scales with precision rejection; `status == "online"` active filter; offline-fixture and read-only REST `AssetPairs` discovery; H0 no-network session with disabled heartbeat. H1-H3 planned, no live claim. |
-| Adapter reference (Binance H0) | `exchange/binance/{mod,codec,discovery,session}.rs` | Offline `exchangeInfo` decoding into validated `MarketInfo` with explicit `binance:spot:<BASE>/<QUOTE>` / `binance:perp:<SYMBOL>` identity, canonical-quote filter and exact steps from `PRICE_FILTER`/`LOT_SIZE`; precision beyond scale 6 rejected, never rounded; no-network session stub, disabled heartbeat, no lifecycle plane; H1-H3 planned only |
-| Control plane | `exchange/kalshi/session.rs` (`SessionMode::Lifecycle`), `coordinator.rs`, `collector/state.rs` | Dedicated Kalshi `market_lifecycle_v2` subscription, cross-connection dedup, reconciliation triggers |
+| Transport | `session.rs`, `ws.rs`, `egress.rs`, `protocol.rs` | Venue-neutral protocol handling, supervised workers, connection options, shared typed frame/signal vocabulary; egress policy: direct or explicit fail-closed proxy, route provenance. No venue session is registered. |
 | Diagnostics | `probe.rs` | `network-probe`: stage-timed transport diagnostic, JSON report |
 | Output | `writer.rs`, `util/aligned_sbe_*.rs`, `util/dtos.rs` | Ordered SBE writes, chunk framing, supplied-schema DTOs |
 | Durability | `journal.rs`, `persistence.rs`, `report.rs` | Raw-frame journal, checkpoints, run sidecars |
@@ -264,4 +244,5 @@ database, and it makes no performance or live claim.
 See [`operating-envelope.md`](operating-envelope.md) for measured
 limits and [`design-decisions.md`](design-decisions.md) for the rationale.
 Implementation contracts are in [`replay-format.md`](replay-format.md),
-[`raw-frame-journal.md`](raw-frame-journal.md), and [`latency.md`](latency.md).
+[`raw-frame-journal.md`](raw-frame-journal.md), and
+[`performance-methodology.md`](performance-methodology.md).

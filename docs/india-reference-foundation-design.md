@@ -1,5 +1,7 @@
 # Fieldbook India reference-data foundation — design
 
+> **RRP-003 notice (2026-11-23).** Venue-specific examples and adapter references below describe families retired under RRP-003. They are retained as historical design rationale, not active capability claims. See `product-scope-retirement-2026-11-23.md`.
+
 - **Status:** Proposed design. This document settles semantics before
   implementation. It is not an accepted contract, a data licence, rights
   evidence, a release, a schema or authorisation to collect.

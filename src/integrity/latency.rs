@@ -5,7 +5,7 @@
 //! includes any exchange/local clock offset. When more than one replica is
 //! configured, identical events are matched across connections and their
 //! arrival skew is reported separately. The methodology is documented in
-//! `docs/latency.md`.
+//! The methodology is recorded in `docs/performance-methodology.md`.
 
 use std::{
     collections::{HashMap, VecDeque},

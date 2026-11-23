@@ -539,9 +539,8 @@ fn validate_quantity_unit(unit: &QuantityUnit) -> anyhow::Result<()> {
 
 /// One exchange-defined band of valid prices.
 ///
-/// Kalshi exposes `price_ranges` as fixed-point dollar strings. Keeping every
-/// band (rather than collapsing to one tick size) preserves tapered grids such
-/// as `$0.00-$0.10` at `$0.001` and `$0.10-$0.90` at `$0.01`.
+/// A venue may expose `price_ranges` as fixed-point strings. Keeping every
+/// band (rather than collapsing to one tick size) preserves tapered grids.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceRange {
     pub start_us: i64,
@@ -559,8 +558,8 @@ impl PriceRange {
         Ok(())
     }
 
-    /// Validate the challenge's probability range in prediction-market
-    /// adapters. This is not a universal price restriction.
+    /// Validate a probability range where an adapter declares one. This is
+    /// not a universal price restriction.
     pub fn validate_probability(&self) -> anyhow::Result<()> {
         self.validate()?;
         anyhow::ensure!(
@@ -583,7 +582,7 @@ impl PriceRange {
 /// Exchange-level metadata for one subscribable symbol.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MarketInfo {
-    /// Exchange name (`kalshi` or `polymarket`).
+    /// Venue name, supplied by the qualified adapter.
     pub exchange: String,
     /// Identifier used on the exchange wire (ticker or asset id).
     pub native_symbol: String,

@@ -1,11 +1,11 @@
 # Stage performance methodology
 
 This document defines the *measured* stage boundaries, the histogram rules, the
-provenance published with each sample, and the limits of the claims. It applies
-to the deterministic synthetic loopback stress laboratory
-([`stress-lab-design.md`](stress-lab-design.md)) and to the live run report's
-optional `stage_timing` field. It is not a benchmark or a production
-certification.
+provenance published with each sample, and the limits of the claims. It
+applies to deterministic, arbitrary-byte loopback evidence and to the run
+report's optional `stage_timing` field. The synthetic stress laboratory and its
+design document were retired under RRP-003; no result from them is active. This
+is not a benchmark or a production certification.
 
 ## Measured boundaries
 

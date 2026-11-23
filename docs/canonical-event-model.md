@@ -1,5 +1,7 @@
 # Canonical event model
 
+> **RRP-003 notice (2026-11-23).** Venue-specific examples and adapter references below describe families retired under RRP-003. They are retained as historical design rationale, not active capability claims. See `product-scope-retirement-2026-11-23.md`.
+
 This document describes the **implemented** canonical event envelope and
 normalized event taxonomy in `src/canonical.rs`. It is additive to the existing
 challenge collector: the market-specific `ExchangeEvent` in `src/model.rs`

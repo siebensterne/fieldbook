@@ -11,7 +11,8 @@ binding when this summary and a policy differ.
 - `ORIGIN.md` — license, provenance and authorship rules.
 - `docs/style-standards.md` — language and formatting standards.
 - `docs/git-workflow.md` and `git-policy.json` — branch and merge policy.
-- `docs/live-evidence-runbook.md` — live evidence and egress rules.
+- `docs/operating-envelope.md` — current scope and operating bounds.
+- `docs/rights-enforcement-2026-11-23.md` — rights and egress enforcement.
 
 ## Behaviour rules
 

@@ -95,7 +95,7 @@ pub fn run(input: &Path, chunk_size: &str) -> anyhow::Result<VerifySummary> {
     // A snapshot mismatch is evidence of a lost or corrupted delta, so it can
     // only be judged for a symbol whose book has been changed by
     // deltas since its last authoritative snapshot. Snapshot-only venues
-    // (Hyperliquid `l2Book`) legitimately replace the whole book on every push
+    // (snapshot-only feeds) legitimately replace the whole book on every push
     // without emitting any delta; treating that as a mismatch would flag every
     // price movement as corruption.
     let mut deltas_since_snapshot: BTreeMap<String, u64> = BTreeMap::new();
@@ -361,7 +361,7 @@ mod tests {
 
     #[test]
     fn repeated_authoritative_snapshots_without_deltas_are_not_mismatches() {
-        // Hyperliquid `l2Book` pushes a complete replacement book on every
+        // A snapshot-only feed pushes a complete replacement book on every
         // block. With no delta stream there is nothing to lose, so a changed
         // snapshot is the authoritative state rather than a corruption signal.
         let (_directory, path) = write_capture(vec![

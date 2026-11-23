@@ -717,7 +717,7 @@ async fn rest_and_websocket_share_the_same_egress_route() {
 
     let client = rest_client(&format!("http://{}", proxy.addr));
     let _ = client
-        .get("https://gamma-api.polymarket.com/markets/keyset")
+        .get("https://venue.invalid/markets/keyset")
         .send()
         .await
         .expect_err("the upstream is a websocket acceptor, not a TLS venue; failure is expected");
@@ -727,7 +727,7 @@ async fn rest_and_websocket_share_the_same_egress_route() {
         assert!(
             requests
                 .iter()
-                .any(|head| head.starts_with("CONNECT gamma-api.polymarket.com:443")),
+                .any(|head| head.starts_with("CONNECT venue.invalid:443")),
             "the REST request must traverse the same proxy; captured: {requests:?}"
         );
         assert_eq!(

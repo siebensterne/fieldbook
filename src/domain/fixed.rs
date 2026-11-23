@@ -193,7 +193,7 @@ pub fn from_sbe_micros(value: i64, scale: u8) -> anyhow::Result<i64> {
     rescale_exact(value, u8::try_from(DECIMALS)?, scale)
 }
 
-/// Parse Kalshi's legacy integer-cent price.
+/// Parse a legacy integer-cent price.
 pub fn cents_to_micros(cents: i64) -> anyhow::Result<i64> {
     cents
         .checked_mul(10_000)
