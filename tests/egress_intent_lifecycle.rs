@@ -499,8 +499,14 @@ fn two_independent_authorizations_coexist_in_one_gate() {
         audit(&tmp.path().join("audit")),
     )
     .expect("second grant");
-    assert!(gate.require_egress(&intent_for(&first), 1).is_ok());
-    assert!(gate.require_egress(&intent_for(&second), 1).is_ok());
+    assert!(
+        gate.require_egress(&intent_for(&first), 1).is_ok(),
+        "first grant permits egress"
+    );
+    assert!(
+        gate.require_egress(&intent_for(&second), 1).is_ok(),
+        "second grant permits egress"
+    );
     let mut crossed = intent_for(&second);
     crossed.provider_id = "provider-a".to_owned();
     assert!(

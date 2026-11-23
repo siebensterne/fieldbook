@@ -134,6 +134,7 @@ SOURCE_RESPONSIBILITIES = {
     "src/integrity/quality.rs": "universal quality states, reason vocabulary, transition rules and two-sided reconciliation accounting",
     "src/domain/reference_data.rs": "effective-dated entity, venue, listing and specification graph with fail-closed identity resolution",
     "src/governance/rights.rs": "fail-closed licensing registry, usage rights, decisions and entitlement authorization",
+    "src/governance/egress_intent.rs": "explicit caller-supplied egress intent, endpoint authority and active authorization lease lifecycle",
     "src/domain/taxonomy.rs": "universal asset, instrument, information, depth, frequency and temporal classification with validated country and currency codes",
     "src/lib.rs": "library module exports and public entry points",
     "src/main.rs": "process entry point and collect/discover/replay/inspect/verify/completeness/coverage/latency dispatch",

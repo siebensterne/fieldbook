@@ -3049,20 +3049,13 @@ mod tests {
         );
         // An unwritable audit sink prevents installation of the grant itself,
         // so no egress can be permitted under it.
-        assert!(
-            !broken_gate.is_active(),
-            "a failed install leaves the gate empty"
-        );
-        assert!(
-            broken_gate
-                .require_egress(&intent_for(&request), 1)
-                .is_err(),
-            "audit write failure denies egress"
-        );
-        assert!(
-            gate.require_egress(&intent_for(&request), 1).is_ok(),
-            "a writable audit sink permits the matching egress"
-        );
+        assert!(!broken_gate.is_active(), "failed install leaves gate empty");
+        let denied = broken_gate
+            .require_egress(&intent_for(&request), 1)
+            .is_err();
+        assert!(denied, "audit write failure denies egress");
+        let permitted = gate.require_egress(&intent_for(&request), 1).is_ok();
+        assert!(permitted, "writable audit sink permits matching egress");
     }
 
     #[test]
