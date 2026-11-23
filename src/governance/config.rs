@@ -638,6 +638,10 @@ pub struct NetworkSettings {
     /// uses a loopback-only test identity; an empty venue denies.
     #[serde(skip)]
     pub venue: String,
+    /// Runtime-injected caller intent for provider egress. Never read from the
+    /// config file: a self-attested declaration cannot grant a right.
+    #[serde(skip)]
+    pub declared_intent: Option<crate::egress_intent::EgressIntent>,
 }
 
 impl Default for NetworkSettings {
@@ -657,6 +661,7 @@ impl Default for NetworkSettings {
             // A standalone transport default is a loopback test transport.
             // Settings derived from an exchange replace it with that venue.
             venue: "loopback".to_owned(),
+            declared_intent: None,
         }
     }
 }
@@ -683,6 +688,8 @@ impl NetworkSettings {
             // Settings-derived sessions capture a feed. Probes override this
             // to `source_contact` at their own call site.
             operation: crate::rights::Operation::RealTimeCapture,
+            intent: self.declared_intent.clone(),
+            denial_transport: None,
         })
     }
 }
@@ -745,6 +752,14 @@ pub struct GovernanceSettings {
     pub rights_file: Option<PathBuf>,
     /// Directory for one machine-readable JSON decision event per check.
     pub audit_dir: Option<PathBuf>,
+    /// Path to a versioned TOML file declaring the caller's actual egress
+    /// intent. This is the request, not the grant: loading it never produces a
+    /// permission by itself and no value is inferred from a command name.
+    pub egress_intent_file: Option<PathBuf>,
+    /// Declared intent loaded from `egress_intent_file` at settings load time.
+    /// Kept out of the serialized config so it cannot be self-attested there.
+    #[serde(skip)]
+    pub declared_intent: Option<crate::egress_intent::EgressIntent>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -842,8 +857,27 @@ impl Settings {
         };
         settings.apply_environment()?;
         settings.sync_venue();
+        settings.load_declared_intent(path.and_then(Path::parent))?;
+        settings.network.declared_intent = settings.governance.declared_intent.clone();
         settings.validate()?;
         Ok(settings)
+    }
+
+    /// Load the caller-declared egress intent from its separate file.
+    ///
+    /// A missing or malformed declaration is an error: the command stays
+    /// fail-closed. No intent value is synthesized from settings or commands.
+    fn load_declared_intent(&mut self, base: Option<&Path>) -> anyhow::Result<()> {
+        let Some(path) = self.governance.egress_intent_file.clone() else {
+            return Ok(());
+        };
+        let path = if path.is_absolute() {
+            path
+        } else {
+            base.map_or(path.clone(), |directory| directory.join(&path))
+        };
+        self.governance.declared_intent = Some(crate::egress_intent::EgressIntent::load(&path)?);
+        Ok(())
     }
 
     /// Keep the egress venue derived from the effective exchange selection.

@@ -1,0 +1,38 @@
+# Caller-declared egress intent (W1.2-C2).
+#
+# This file is the REQUEST, not the grant. The authorization gate compares it
+# with a full record in the rights file. Nothing here grants a right, and no
+# value may be inferred from a command name, an exchange, an environment
+# variable or an installed proof. Set [governance].egress_intent_file or
+# --egress-intent-file to this file's path. A missing or malformed declaration
+# denies every provider-facing command.
+
+schema_version = 1
+
+[intent]
+licensee = "REPLACE_WITH_LEGAL_LICENSEE"
+provider_id = "provider-a"
+source_id = "provider-source"
+source_product_id = "market-data-feed"
+venue_id = "venue-a"
+segment_id = "venue-equity-cash"
+dataset_id = "market-data"
+operation = "real_time_capture"
+purpose = "proprietary_own_account_trading_research"
+usage_right = "real_time_access"
+usage_mode = "non_display"
+recipient = "internal"
+territory = "US"
+delivery_method = "stream"
+instruments = { named = ["inst-a", "inst-b"] }
+fields = { named = ["bid", "ask"] }
+modalities = { named = ["l2"] }
+data_time_window = { from_us = 1_700_000_000_000_000, to_us = 1_700_086_400_000_000 }
+retention_request = { limit = { bounded = 86400 }, purge_required = true }
+
+# The authority the process will contact. A redirect to a different
+# authority is a new request and is reauthorized before it is followed.
+[intent.endpoint_identity]
+scheme = "wss"
+host = "venue-a.example"
+port = 443

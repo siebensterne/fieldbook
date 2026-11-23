@@ -28,10 +28,27 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("an explicit subcommand is required; no provider activity was started");
     };
     // Gate before dispatch: a denied decision must stop the command before a
-    // client is built, a socket is opened, or a file is published.
+    // client is built, a socket is opened, or a file is published. The request
+    // is the caller's declared EgressIntent; no command-derived request exists.
     let required_operations = gated_operations(&command);
     if !required_operations.is_empty() {
-        rights::authorize_operations(&settings, required_operations)?;
+        let intent = settings.governance.declared_intent.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} requires an explicit EgressIntent: set --egress-intent-file or [governance].egress_intent_file",
+                required_operations
+                    .first()
+                    .map_or("command", |operation| operation.as_str())
+            )
+        })?;
+        anyhow::ensure!(
+            required_operations.contains(&intent.operation),
+            "declared egress operation `{}` is not valid for this command",
+            intent.operation.as_str()
+        );
+        let authority = rights::authorize_egress_intent(&settings, intent)?;
+        // The gate retains its own reference; revocation can be driven through
+        // this handle by the owner during a long-running session.
+        let _ = authority;
     }
     match command {
         Command::Collect => {

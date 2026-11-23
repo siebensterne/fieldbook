@@ -110,6 +110,7 @@ impl KalshiExchange {
             concat!("fieldbook-collector/", env!("CARGO_PKG_VERSION")),
             Duration::from_secs(settings.request_timeout_secs),
             &network,
+            network.declared_intent.as_ref(),
         )
         .map_err(|error| anyhow::anyhow!("building Kalshi HTTP client: {error}"))?;
         Ok(Self {

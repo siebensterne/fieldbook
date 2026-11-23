@@ -39,6 +39,11 @@ pub struct Cli {
     #[arg(long = "rights-audit-dir", global = true, value_name = "DIR")]
     pub rights_audit_dir: Option<PathBuf>,
 
+    /// Versioned TOML file declaring the caller's actual egress intent. This
+    /// is the request evaluated against the rights file, not a grant.
+    #[arg(long = "egress-intent-file", global = true, value_name = "FILE")]
+    pub egress_intent_file: Option<PathBuf>,
+
     #[arg(long, global = true, value_enum)]
     pub exchange: Option<ExchangeKind>,
 
@@ -345,6 +350,12 @@ impl Cli {
         }
         if let Some(path) = &self.rights_audit_dir {
             settings.governance.audit_dir = Some(path.clone());
+        }
+        if let Some(path) = &self.egress_intent_file {
+            settings.governance.egress_intent_file = Some(path.clone());
+            let intent = crate::egress_intent::EgressIntent::load(path)?;
+            settings.governance.declared_intent = Some(intent.clone());
+            settings.network.declared_intent = Some(intent);
         }
         if let Some(environment) = self.kalshi_environment {
             settings.kalshi.environment = environment;

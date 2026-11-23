@@ -84,6 +84,7 @@ impl PolymarketExchange {
              EngineeringChallengeCollector/0.3",
             Duration::from_secs(settings.request_timeout_secs),
             &network,
+            network.declared_intent.as_ref(),
         )
         .map_err(|error| anyhow::anyhow!("building Polymarket HTTP client: {error}"))?;
         Ok(Self {

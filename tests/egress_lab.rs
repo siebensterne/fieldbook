@@ -410,9 +410,13 @@ fn proxy_options(proxy_url: &str) -> ConnectOptions {
 /// injected so no process environment is touched.
 fn rest_client(proxy_url: &str) -> reqwest::Client {
     let network = proxy_settings(dns_for(proxy_url));
-    http_client_with("egress-lab/0.1", Duration::from_secs(5), &network, |name| {
-        (name == "MARKETDATA_EGRESSLAB_LOOKUP").then(|| proxy_url.to_owned())
-    })
+    http_client_with(
+        "egress-lab/0.1",
+        Duration::from_secs(5),
+        &network,
+        None,
+        |name| (name == "MARKETDATA_EGRESSLAB_LOOKUP").then(|| proxy_url.to_owned()),
+    )
     .expect("proxy HTTP client must build")
 }
 
@@ -818,6 +822,7 @@ async fn http_client_builds_in_direct_and_proxy_modes() {
         "lab-agent",
         Duration::from_secs(1),
         &NetworkSettings::default(),
+        None,
         |_| None,
     )
     .expect("direct client must build");
@@ -826,6 +831,7 @@ async fn http_client_builds_in_direct_and_proxy_modes() {
         "lab-agent",
         Duration::from_secs(1),
         &proxy_settings(false),
+        None,
         |name| (name == "MARKETDATA_EGRESSLAB_LOOKUP").then(|| "http://127.0.0.1:9".to_owned()),
     )
     .expect("proxy client must build");
@@ -891,9 +897,13 @@ async fn rest_through_socks5_tunnels_to_the_gamma_stub() {
     )
     .await;
     let network = proxy_settings(true);
-    let client = http_client_with("egress-lab/0.1", Duration::from_secs(5), &network, |name| {
-        (name == "MARKETDATA_EGRESSLAB_LOOKUP").then(|| format!("socks5h://{}", proxy.addr))
-    })
+    let client = http_client_with(
+        "egress-lab/0.1",
+        Duration::from_secs(5),
+        &network,
+        None,
+        |name| (name == "MARKETDATA_EGRESSLAB_LOOKUP").then(|| format!("socks5h://{}", proxy.addr)),
+    )
     .expect("proxy HTTP client must build");
 
     let response = client

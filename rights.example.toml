@@ -14,8 +14,11 @@
 # contract has been reviewed: every exact identity and every scoped dimension
 # below must match the intended use, and the licence reference must name the
 # actual document. Display mode, purpose, recipient and licensee are separate
-# concepts: none is inferred from a command name. One command may need several
-# records, one per declared lifecycle operation: `collect` requires
+# concepts: none is inferred from a command name. The file-level licensee and
+# territory are checked against each record; a contradiction refuses to load.
+# `approved_endpoints` is the rights-file endpoint set: an empty set authorizes
+# no egress and a request endpoint outside it is denied. One command may need
+# several records, one per declared lifecycle operation: `collect` requires
 # source_contact, reference_data_retrieval, real_time_capture, raw_storage and
 # normalization; `network-probe` requires only source_contact.
 
@@ -45,6 +48,7 @@ delivery_method = "stream"
 instruments = { universe = "declared-universe-1" } # or { named = [...] } / "not_applicable"
 fields = { universe = "declared-universe-1" }
 modalities = { universe = "declared-universe-1" } # l1, l2, l3, order_by_order
+approved_endpoints = [{ scheme = "wss", host = "venue-a.example", port = 443 }]
 valid_from = 0
 valid_until = 4102444800000000        # effective interval, distinct from data window
 
