@@ -28,8 +28,9 @@ use url::Url;
 use crate::{
     config::Settings,
     rights::{
-        AuthorizationScope, DeliveryMethod, Licensee, Modality, Operation, Purpose, Recipient,
-        Retention, RightsError, ScopeSet, TimeWindow, UsageMode, UsageRight,
+        Actor, AuthorizationScope, DataObject, DeliveryMethod, Licensee, Modality, ObjectKind,
+        Operation, Purpose, RecipientClass, RecipientIdentity, Retention, RightsError, ScopeSet,
+        TimeWindow, UsageMode, UsageRight,
     },
     taxonomy::CountryCode,
     time::now_us,
@@ -122,12 +123,17 @@ pub struct EgressIntent {
     pub venue_id: String,
     pub segment_id: String,
     pub dataset_id: String,
+    /// Exact actor whose request is evaluated.
+    pub actor: Actor,
     pub operation: Operation,
+    /// Exact object kind, identity and version the action acts upon.
+    pub data_object: DataObject,
     pub purpose: Purpose,
     pub usage_mode: UsageMode,
     pub usage_right: UsageRight,
     pub licensee: Licensee,
-    pub recipient: Recipient,
+    pub recipient_class: RecipientClass,
+    pub recipient_identity: RecipientIdentity,
     pub territory: CountryCode,
     pub instruments: ScopeSet<String>,
     pub fields: ScopeSet<String>,
@@ -186,6 +192,7 @@ impl EgressIntent {
     #[must_use]
     pub fn to_scope(&self) -> AuthorizationScope {
         AuthorizationScope {
+            actor: self.actor,
             licensee: self.licensee.clone(),
             venue: self.venue_id.clone(),
             provider_id: self.provider_id.clone(),
@@ -195,9 +202,11 @@ impl EgressIntent {
             segment: self.segment_id.clone(),
             territory: self.territory.clone(),
             operation: self.operation,
+            data_object: self.data_object.clone(),
             usage_right: self.usage_right,
             usage_mode: self.usage_mode,
-            recipient: self.recipient,
+            recipient_class: self.recipient_class,
+            recipient_identity: self.recipient_identity.clone(),
             purpose: self.purpose,
             delivery_method: self.delivery_method,
             retention: self.retention_request,
@@ -224,12 +233,19 @@ impl EgressIntent {
             venue_id: "loopback".to_owned(),
             segment_id: "loopback-test".to_owned(),
             dataset_id: "loopback-test".to_owned(),
+            actor: Actor::FieldbookProducer,
             operation: Operation::SourceContact,
+            data_object: DataObject::from_declared(
+                ObjectKind::RawSourceRecord,
+                "loopback-object".to_owned(),
+                "loopback-v1".to_owned(),
+            ),
             purpose: Purpose::InternalAnalysis,
             usage_mode: UsageMode::NonDisplay,
             usage_right: UsageRight::RealTimeAccess,
             licensee: Licensee::system(),
-            recipient: Recipient::Internal,
+            recipient_class: RecipientClass::Internal,
+            recipient_identity: RecipientIdentity::from_declared("loopback-recipient".to_owned()),
             territory: CountryCode::new("ZZ").unwrap_or_default(),
             instruments: ScopeSet::NotApplicable,
             fields: ScopeSet::NotApplicable,
@@ -300,12 +316,15 @@ pub struct EgressIntentBuilder {
     venue_id: Option<String>,
     segment_id: Option<String>,
     dataset_id: Option<String>,
+    actor: Option<Actor>,
     operation: Option<Operation>,
+    data_object: Option<DataObject>,
     purpose: Option<Purpose>,
     usage_mode: Option<UsageMode>,
     usage_right: Option<UsageRight>,
     licensee: Option<Licensee>,
-    recipient: Option<Recipient>,
+    recipient_class: Option<RecipientClass>,
+    recipient_identity: Option<RecipientIdentity>,
     territory: Option<CountryCode>,
     instruments: Option<ScopeSet<String>>,
     fields: Option<ScopeSet<String>>,
@@ -359,10 +378,24 @@ impl EgressIntentBuilder {
         self
     }
 
-    /// Set the exact typed operation.
+    /// Set the exact declared actor.
+    #[must_use]
+    pub fn actor(mut self, value: Actor) -> Self {
+        self.actor = Some(value);
+        self
+    }
+
+    /// Set the exact typed operation. No second producer enum exists.
     #[must_use]
     pub fn operation(mut self, value: Operation) -> Self {
         self.operation = Some(value);
+        self
+    }
+
+    /// Set the exact typed object: kind, identity and version.
+    #[must_use]
+    pub fn data_object(mut self, value: DataObject) -> Self {
+        self.data_object = Some(value);
         self
     }
 
@@ -394,10 +427,17 @@ impl EgressIntentBuilder {
         self
     }
 
-    /// Set the exact recipient class.
+    /// Set the exact recipient class. `Internal` is a class, not an identity.
     #[must_use]
-    pub fn recipient(mut self, value: Recipient) -> Self {
-        self.recipient = Some(value);
+    pub fn recipient_class(mut self, value: RecipientClass) -> Self {
+        self.recipient_class = Some(value);
+        self
+    }
+
+    /// Set the exact named recipient identity.
+    #[must_use]
+    pub fn recipient_identity(mut self, value: RecipientIdentity) -> Self {
+        self.recipient_identity = Some(value);
         self
     }
 
@@ -483,12 +523,15 @@ impl EgressIntentBuilder {
             venue_id: required!("venue_id", self.venue_id),
             segment_id: required!("segment_id", self.segment_id),
             dataset_id: required!("dataset_id", self.dataset_id),
+            actor: required!("actor", self.actor),
             operation: required!("operation", self.operation),
+            data_object: required!("data_object", self.data_object),
             purpose: required!("purpose", self.purpose),
             usage_mode: required!("usage_mode", self.usage_mode),
             usage_right: required!("usage_right", self.usage_right),
             licensee: required!("licensee", self.licensee),
-            recipient: required!("recipient", self.recipient),
+            recipient_class: required!("recipient_class", self.recipient_class),
+            recipient_identity: required!("recipient_identity", self.recipient_identity),
             territory: required!("territory", self.territory),
             instruments: required!("instruments", self.instruments),
             fields: required!("fields", self.fields),

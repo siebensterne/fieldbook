@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Machine-readable data rights and entitlement decisions.
 //!
-//! Authorization is scoped to a licensee, a provider, a source product, a
+//! Authorization is scoped to a declared actor, a typed lifecycle operation,
+//! a typed data object (kind, identity and version), a named recipient
+//! identity and recipient class, a licensee, a provider, a source product, a
 //! venue, a segment, an instrument/field/modality/time window, a territory, a
-//! delivery method, a purpose, a recipient, a retention rule, a typed
-//! lifecycle operation and an effective interval. A dataset name alone never
-//! carries permission. Access to a feed does not grant storage, derived-data
-//! use or redistribution rights.
+//! delivery method, a purpose, a retention rule and an effective interval.
+//! A dataset name or an object kind alone never carries permission. Access to
+//! a feed does not grant storage, derived-data use or redistribution rights.
 //!
 //! Every decision is recorded with its licence reference, document digest,
 //! contract revision and recording time. Ambiguous, conflicting or revoked
@@ -103,10 +104,11 @@ impl UsageMode {
     }
 }
 
-/// Class of recipient exercising a right.
+/// Class of recipient exercising a right. `Internal` is a class, not a named
+/// recipient: a request still has to supply the named recipient identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Recipient {
+pub enum RecipientClass {
     Public,
     Internal,
     Participant,
@@ -114,7 +116,7 @@ pub enum Recipient {
     Affiliate,
 }
 
-impl Recipient {
+impl RecipientClass {
     /// Return the stable contract string for this recipient class.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -127,8 +129,39 @@ impl Recipient {
     }
 }
 
-/// Backwards-compatible name for [`Recipient`].
-pub type RecipientClass = Recipient;
+/// Backwards-compatible name for [`RecipientClass`].
+pub type Recipient = RecipientClass;
+
+/// Named recipient identity, independent of its recipient class.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RecipientIdentity(String);
+
+impl RecipientIdentity {
+    /// Build a recipient identity after validating that it is non-blank.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidRecipientIdentity`] for a blank identity.
+    pub fn new(value: &str) -> Result<Self, RightsError> {
+        if value.trim().is_empty() {
+            return Err(RightsError::InvalidRecipientIdentity);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Build a recipient identity from a declaration-owned string that was
+    /// already validated by its source. Gate validation still rejects a blank.
+    #[must_use]
+    pub fn from_declared(value: String) -> Self {
+        Self(value)
+    }
+
+    /// Return the validated recipient identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Purpose for which a right is exercised.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -205,6 +238,170 @@ impl Operation {
             Self::ExternalRedistribution => "external_redistribution",
             Self::Retention => "retention",
             Self::Deletion => "deletion",
+        }
+    }
+}
+
+/// Agent whose request or grant is evaluated. An actor is a declared fact:
+/// it is never inferred from a command name, a transport action or a proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Actor {
+    /// Fieldbook acts as the producer of a source observation or release.
+    FieldbookProducer,
+    /// Nirnay acts as the consumer of an admitted release.
+    NirnayConsumer,
+    /// The written-permission review authority acts on a grant.
+    RightsAuthority,
+    /// The publication key holder acts on canonical signed bytes.
+    SigningAuthority,
+}
+
+impl Actor {
+    /// Return the stable contract string for this actor.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FieldbookProducer => "fieldbook_producer",
+            Self::NirnayConsumer => "nirnay_consumer",
+            Self::RightsAuthority => "rights_authority",
+            Self::SigningAuthority => "signing_authority",
+        }
+    }
+}
+
+/// Class of object an action acts upon. A kind is one component of an object
+/// identity and never substitutes for the object's identity or version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectKind {
+    /// Reference record declared by a source.
+    SourceReferenceRecord,
+    /// Exact source bytes before normalization.
+    RawSourceRecord,
+    /// Normalized observation produced by Fieldbook.
+    CanonicalObservation,
+    /// Immutable archive of exact source bytes.
+    RawArchive,
+    /// Published, immutable NDC release.
+    NdcRelease,
+    /// Consumer-local copy admitted for research use.
+    ResearchCopy,
+    /// Derived research dataset referenced by an experiment.
+    ResearchDataset,
+    /// Artifact derived from an admitted research object.
+    DerivedArtifact,
+}
+
+impl ObjectKind {
+    /// Return the stable contract string for this object kind.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SourceReferenceRecord => "source_reference_record",
+            Self::RawSourceRecord => "raw_source_record",
+            Self::CanonicalObservation => "canonical_observation",
+            Self::RawArchive => "raw_archive",
+            Self::NdcRelease => "ndc_release",
+            Self::ResearchCopy => "research_copy",
+            Self::ResearchDataset => "research_dataset",
+            Self::DerivedArtifact => "derived_artifact",
+        }
+    }
+}
+
+/// Named identity of one object, independent of its kind and version.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ObjectIdentity(String);
+
+impl ObjectIdentity {
+    /// Build an object identity after validating that it is non-blank.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidObjectIdentity`] for a blank identity.
+    pub fn new(value: &str) -> Result<Self, RightsError> {
+        if value.trim().is_empty() {
+            return Err(RightsError::InvalidObjectIdentity);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Return the validated object identity.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Explicit version of one object, independent of its kind and identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ObjectVersion(String);
+
+impl ObjectVersion {
+    /// Build an object version after validating that it is non-blank.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidObjectVersion`] for a blank version.
+    pub fn new(value: &str) -> Result<Self, RightsError> {
+        if value.trim().is_empty() {
+            return Err(RightsError::InvalidObjectVersion);
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Return the validated object version.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Full identity of the object an action acts upon: kind, identity and version.
+///
+/// A kind alone is not an object. Two archives with different identities, or
+/// two versions of one identity, are different objects and need separate grants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataObject {
+    pub kind: ObjectKind,
+    pub id: ObjectIdentity,
+    pub version: ObjectVersion,
+}
+
+impl DataObject {
+    /// Build a typed object from its three explicit components.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidObjectIdentity`] or
+    /// [`RightsError::InvalidObjectVersion`] for a blank component.
+    pub fn new(kind: ObjectKind, id: &str, version: &str) -> Result<Self, RightsError> {
+        Ok(Self {
+            kind,
+            id: ObjectIdentity::new(id)?,
+            version: ObjectVersion::new(version)?,
+        })
+    }
+
+    /// Build a typed object from declaration-owned strings that were already
+    /// validated by their source. The authorization gate still validates
+    /// blank components before any comparison; no value is inferred here.
+    #[must_use]
+    pub fn from_declared(kind: ObjectKind, id: String, version: String) -> Self {
+        Self {
+            kind,
+            id: ObjectIdentity(id),
+            version: ObjectVersion(version),
+        }
+    }
+
+    /// Explicit diagnostic object used only by a denial event. It is never a
+    /// grant and never matches a request.
+    #[must_use]
+    fn diagnostic() -> Self {
+        Self {
+            kind: ObjectKind::SourceReferenceRecord,
+            id: ObjectIdentity("diagnostic-no-object".to_owned()),
+            version: ObjectVersion("diagnostic-no-version".to_owned()),
         }
     }
 }
@@ -471,6 +668,7 @@ fn end_covered(permitted: Option<i64>, requested: Option<i64>) -> bool {
 /// dimension of the request must lie inside the grant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizationScope {
+    pub actor: Actor,
     pub licensee: Licensee,
     pub venue: String,
     pub provider_id: String,
@@ -480,9 +678,11 @@ pub struct AuthorizationScope {
     pub segment: String,
     pub territory: CountryCode,
     pub operation: Operation,
+    pub data_object: DataObject,
     pub usage_right: UsageRight,
     pub usage_mode: UsageMode,
-    pub recipient: Recipient,
+    pub recipient_class: RecipientClass,
+    pub recipient_identity: RecipientIdentity,
     pub purpose: Purpose,
     pub delivery_method: DeliveryMethod,
     pub retention: Retention,
@@ -504,6 +704,15 @@ impl AuthorizationScope {
     /// # Errors
     /// Returns a [`RightsError`] describing the first invalid field.
     pub fn validate(&self) -> Result<(), RightsError> {
+        if self.data_object.id.as_str().trim().is_empty() {
+            return Err(RightsError::InvalidObjectIdentity);
+        }
+        if self.data_object.version.as_str().trim().is_empty() {
+            return Err(RightsError::InvalidObjectVersion);
+        }
+        if self.recipient_identity.as_str().trim().is_empty() {
+            return Err(RightsError::InvalidRecipientIdentity);
+        }
         if self.venue.trim().is_empty() {
             return Err(RightsError::VenueAbsent);
         }
@@ -524,7 +733,8 @@ impl AuthorizationScope {
     /// Retention is scoped, not exact: a narrower retention request is allowed.
     #[must_use]
     pub fn exact_match(&self, requested: &Self) -> bool {
-        self.licensee == requested.licensee
+        self.actor == requested.actor
+            && self.licensee == requested.licensee
             && self.venue == requested.venue
             && self.provider_id == requested.provider_id
             && self.source_id == requested.source_id
@@ -533,9 +743,11 @@ impl AuthorizationScope {
             && self.segment == requested.segment
             && self.territory == requested.territory
             && self.operation == requested.operation
+            && self.data_object == requested.data_object
             && self.usage_right == requested.usage_right
             && self.usage_mode == requested.usage_mode
-            && self.recipient == requested.recipient
+            && self.recipient_class == requested.recipient_class
+            && self.recipient_identity == requested.recipient_identity
             && self.purpose == requested.purpose
             && self.delivery_method == requested.delivery_method
     }
@@ -568,6 +780,7 @@ impl AuthorizationScope {
     #[must_use]
     pub fn denial_scope(venue: &str, operation: Operation) -> Self {
         Self {
+            actor: Actor::RightsAuthority,
             licensee: Licensee::system(),
             venue: venue.to_owned(),
             provider_id: "diagnostic-no-provider".to_owned(),
@@ -577,9 +790,11 @@ impl AuthorizationScope {
             segment: "diagnostic-no-segment".to_owned(),
             territory: CountryCode::new("US").unwrap_or_default(),
             operation,
+            data_object: DataObject::diagnostic(),
             usage_right: UsageRight::RealTimeAccess,
             usage_mode: UsageMode::NonDisplay,
-            recipient: Recipient::Internal,
+            recipient_class: RecipientClass::Internal,
+            recipient_identity: RecipientIdentity("diagnostic-no-recipient".to_owned()),
             purpose: Purpose::InternalAnalysis,
             delivery_method: DeliveryMethod::Query,
             retention: Retention::NONE,
@@ -653,6 +868,7 @@ pub type AuthorizationRequest = AuthorizationScope;
 /// [`AuthorizationRequestBuilder::build`] fails closed on the first omission.
 #[derive(Debug, Default)]
 pub struct AuthorizationRequestBuilder {
+    actor: Option<Actor>,
     licensee: Option<Licensee>,
     venue: Option<String>,
     provider_id: Option<String>,
@@ -662,9 +878,11 @@ pub struct AuthorizationRequestBuilder {
     segment: Option<String>,
     territory: Option<CountryCode>,
     operation: Option<Operation>,
+    data_object: Option<DataObject>,
     usage_right: Option<UsageRight>,
     usage_mode: Option<UsageMode>,
-    recipient: Option<Recipient>,
+    recipient_class: Option<RecipientClass>,
+    recipient_identity: Option<RecipientIdentity>,
     purpose: Option<Purpose>,
     delivery_method: Option<DeliveryMethod>,
     retention: Option<Retention>,
@@ -680,6 +898,13 @@ impl AuthorizationRequestBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the exact declared actor.
+    #[must_use]
+    pub fn actor(mut self, value: Actor) -> Self {
+        self.actor = Some(value);
+        self
     }
 
     /// Set the exact named licensee.
@@ -738,10 +963,17 @@ impl AuthorizationRequestBuilder {
         self
     }
 
-    /// Set the exact lifecycle operation.
+    /// Set the exact lifecycle operation. No second producer enum exists.
     #[must_use]
     pub fn operation(mut self, value: Operation) -> Self {
         self.operation = Some(value);
+        self
+    }
+
+    /// Set the exact typed data object: kind, identity and version.
+    #[must_use]
+    pub fn data_object(mut self, value: DataObject) -> Self {
+        self.data_object = Some(value);
         self
     }
 
@@ -759,10 +991,17 @@ impl AuthorizationRequestBuilder {
         self
     }
 
-    /// Set the exact recipient class.
+    /// Set the exact recipient class. `Internal` is a class, not an identity.
     #[must_use]
-    pub fn recipient(mut self, value: Recipient) -> Self {
-        self.recipient = Some(value);
+    pub fn recipient_class(mut self, value: RecipientClass) -> Self {
+        self.recipient_class = Some(value);
+        self
+    }
+
+    /// Set the exact named recipient identity.
+    #[must_use]
+    pub fn recipient_identity(mut self, value: RecipientIdentity) -> Self {
+        self.recipient_identity = Some(value);
         self
     }
 
@@ -847,6 +1086,7 @@ impl AuthorizationRequestBuilder {
             };
         }
         let scope = AuthorizationScope {
+            actor: required!("actor", self.actor),
             licensee: required!("licensee", self.licensee),
             venue: required!("venue", self.venue),
             provider_id: required!("provider_id", self.provider_id),
@@ -856,9 +1096,11 @@ impl AuthorizationRequestBuilder {
             segment: required!("segment", self.segment),
             territory: required!("territory", self.territory),
             operation: required!("operation", self.operation),
+            data_object: required!("data_object", self.data_object),
             usage_right: required!("usage_right", self.usage_right),
             usage_mode: required!("usage_mode", self.usage_mode),
-            recipient: required!("recipient", self.recipient),
+            recipient_class: required!("recipient_class", self.recipient_class),
+            recipient_identity: required!("recipient_identity", self.recipient_identity),
             purpose: required!("purpose", self.purpose),
             delivery_method: required!("delivery_method", self.delivery_method),
             retention: required!("retention", self.retention),
@@ -933,7 +1175,8 @@ impl AuthorizationIdentity {
     pub fn decision_key(&self) -> String {
         let scope = &self.scope;
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            scope.actor.as_str(),
             scope.licensee.as_str(),
             scope.venue,
             scope.provider_id,
@@ -943,9 +1186,13 @@ impl AuthorizationIdentity {
             scope.segment,
             scope.territory.as_str(),
             scope.operation.as_str(),
+            scope.data_object.kind.as_str(),
+            scope.data_object.id.as_str(),
+            scope.data_object.version.as_str(),
             scope.usage_right.as_str(),
             scope.usage_mode.as_str(),
-            scope.recipient.as_str(),
+            scope.recipient_class.as_str(),
+            scope.recipient_identity.as_str(),
             scope.purpose.as_str(),
             scope.delivery_method.as_str(),
             match scope.retention.limit {
@@ -1042,7 +1289,7 @@ impl AuthorizationRecord {
         {
             return false;
         }
-        if self.identity.scope.recipient == Recipient::Public
+        if self.identity.scope.recipient_class == RecipientClass::Public
             && self.identity.scope.usage_right.requires_explicit_grant()
         {
             return false;
@@ -1081,6 +1328,15 @@ pub enum RightsError {
     /// The query itself is incomplete.
     #[error("authorization query is incomplete")]
     InvalidQuery,
+    /// An object identity is blank; no kind or command supplies one.
+    #[error("authorization data object identity is missing")]
+    InvalidObjectIdentity,
+    /// An object version is blank; an unversioned object is not implied.
+    #[error("authorization data object version is missing")]
+    InvalidObjectVersion,
+    /// The named recipient identity is blank; a class is not an identity.
+    #[error("authorization recipient identity is missing")]
+    InvalidRecipientIdentity,
     /// An explicit request is missing a required value; nothing was inferred.
     #[error("authorization request is missing required field `{field}`")]
     MissingField { field: &'static str },
@@ -1312,7 +1568,9 @@ pub struct RightsFile {
     /// ISO 3166-1 alpha-2 territory for every decision in this file.
     pub territory: String,
     /// Recipient class for every decision in this file.
-    pub recipient: Recipient,
+    pub recipient_class: RecipientClass,
+    /// Named recipient identity for every decision in this file.
+    pub recipient_identity: RecipientIdentity,
     #[serde(default)]
     pub rights: Vec<AuthorizationRecord>,
 }
@@ -1334,17 +1592,24 @@ pub struct DecisionAuditEvent {
     pub monotonic_ns_since_start: Option<u64>,
     /// Actual typed operation requested, not a transport action name.
     pub operation: String,
+    /// Exact actor whose request was evaluated.
+    pub actor: String,
     pub venue: String,
     pub provider_id: String,
     pub source_id: String,
     pub dataset_id: String,
     pub product_id: String,
     pub segment: String,
+    /// Exact object kind, identity and version evaluated by the gate.
+    pub data_object: DataObject,
     pub licensee: String,
     pub territory: String,
     pub usage_right: String,
     pub usage_mode: String,
-    pub recipient: String,
+    /// Exact recipient class evaluated by the gate.
+    pub recipient_class: String,
+    /// Exact named recipient identity evaluated by the gate.
+    pub recipient_identity: String,
     pub purpose: String,
     pub delivery_method: String,
     pub retention: Retention,
@@ -1357,6 +1622,10 @@ pub struct DecisionAuditEvent {
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
+    /// Written-permission reference and contract revision of the evaluated
+    /// grant. It is distinct from the immutable grant snapshot identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant_evidence_reference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_digest: Option<String>,
     /// Recording authority from the rights file, when the event is tied to a grant.
@@ -1483,17 +1752,20 @@ impl AuditSink {
             recorded_at_us: at_us,
             monotonic_ns_since_start: monotonic_ns_since_start(),
             operation: scope.operation.as_str().to_owned(),
+            actor: scope.actor.as_str().to_owned(),
             venue: scope.venue.clone(),
             provider_id: scope.provider_id.clone(),
             source_id: scope.source_id.clone(),
             dataset_id: scope.dataset_id.clone(),
             product_id: scope.product_id.clone(),
             segment: scope.segment.clone(),
+            data_object: scope.data_object.clone(),
             licensee: scope.licensee.as_str().to_owned(),
             territory: scope.territory.as_str().to_owned(),
             usage_right: scope.usage_right.as_str().to_owned(),
             usage_mode: scope.usage_mode.as_str().to_owned(),
-            recipient: scope.recipient.as_str().to_owned(),
+            recipient_class: scope.recipient_class.as_str().to_owned(),
+            recipient_identity: scope.recipient_identity.as_str().to_owned(),
             purpose: scope.purpose.as_str().to_owned(),
             delivery_method: scope.delivery_method.as_str().to_owned(),
             retention: scope.retention,
@@ -1504,6 +1776,8 @@ impl AuditSink {
             decision: decision.to_owned(),
             reason,
             reference: evidence.map(|audit| audit.licence_reference.clone()),
+            grant_evidence_reference: evidence
+                .map(|audit| format!("{}#{}", audit.licence_reference, audit.contract_revision)),
             evidence_digest: evidence.map(|audit| audit.licence_document_hash.clone()),
             recording_authority: context.recording_authority,
             session_id: context.session_id,
@@ -1635,6 +1909,18 @@ impl RightsContext {
                 "record territory `{}` contradicts the rights-file territory `{}`",
                 record.identity.scope.territory.as_str(),
                 territory.as_str()
+            );
+            anyhow::ensure!(
+                record.identity.scope.recipient_class == file.recipient_class,
+                "record recipient class `{}` contradicts the rights-file recipient class `{}`",
+                record.identity.scope.recipient_class.as_str(),
+                file.recipient_class.as_str()
+            );
+            anyhow::ensure!(
+                record.identity.scope.recipient_identity == file.recipient_identity,
+                "record recipient identity `{}` contradicts the rights-file recipient identity `{}`",
+                record.identity.scope.recipient_identity.as_str(),
+                file.recipient_identity.as_str()
             );
             // An expired interval is never a grant. It is dropped here so it
             // cannot win a later decision even if the clock moves backwards.
@@ -2377,6 +2663,11 @@ mod tests {
     /// value is supplied explicitly; no command-derived default exists.
     fn scope() -> AuthorizationScope {
         AuthorizationScope::request()
+            .actor(Actor::FieldbookProducer)
+            .data_object(
+                DataObject::new(ObjectKind::RawSourceRecord, "object-a", "v1")
+                    .expect("abstract object identity"),
+            )
             .licensee(Licensee::new("licensee-a").expect("licensee"))
             .venue("venue-a")
             .provider_id("provider-a")
@@ -2388,7 +2679,8 @@ mod tests {
             .operation(Operation::RealTimeCapture)
             .usage_right(UsageRight::HistoricalStorage)
             .usage_mode(UsageMode::NonDisplay)
-            .recipient(Recipient::Internal)
+            .recipient_class(RecipientClass::Internal)
+            .recipient_identity(RecipientIdentity::new("recipient-a").expect("recipient identity"))
             .purpose(Purpose::HistoricalArchive)
             .delivery_method(DeliveryMethod::Stream)
             .retention(Retention::bounded(86_400))
@@ -2432,12 +2724,15 @@ mod tests {
             .venue_id(scope.venue.clone())
             .segment_id(scope.segment.clone())
             .dataset_id(scope.dataset_id.clone())
+            .actor(scope.actor)
             .operation(scope.operation)
+            .data_object(scope.data_object.clone())
             .purpose(scope.purpose)
             .usage_mode(scope.usage_mode)
             .usage_right(scope.usage_right)
             .licensee(scope.licensee.clone())
-            .recipient(scope.recipient)
+            .recipient_class(scope.recipient_class)
+            .recipient_identity(scope.recipient_identity.clone())
             .territory(scope.territory.clone())
             .instruments(scope.instruments.clone())
             .fields(scope.fields.clone())
@@ -2493,7 +2788,8 @@ mod tests {
             schema_version: 1,
             licensee: Licensee::new("licensee-a").expect("licensee"),
             territory: "US".to_owned(),
-            recipient: Recipient::Internal,
+            recipient_class: RecipientClass::Internal,
+            recipient_identity: RecipientIdentity::new("recipient-a").expect("recipient identity"),
             rights: records,
         }
     }
@@ -2651,12 +2947,12 @@ mod tests {
     fn public_access_never_grants_retention() {
         let mut registry = LicensingRegistry::new();
         let mut public = record(RightDecision::Permitted, "provider-a", "US", 0, None, 1);
-        public.identity.scope.recipient = Recipient::Public;
+        public.identity.scope.recipient_class = RecipientClass::Public;
         registry
             .register(public)
             .expect("public decision registered");
         let mut request = scope();
-        request.recipient = Recipient::Public;
+        request.recipient_class = RecipientClass::Public;
         assert!(
             registry.authorize(&request, 1).is_err(),
             "public access cannot imply historical storage"
@@ -3295,6 +3591,11 @@ mod tests {
     #[test]
     fn explicit_request_builder_never_infers_values() {
         let request = AuthorizationScope::request()
+            .actor(Actor::FieldbookProducer)
+            .data_object(
+                DataObject::new(ObjectKind::RawSourceRecord, "object-a", "v1")
+                    .expect("object identity"),
+            )
             .licensee(Licensee::new("licensee-a").expect("licensee"))
             .venue("venue-a")
             .provider_id("provider-a")
@@ -3306,7 +3607,8 @@ mod tests {
             .operation(Operation::RealTimeCapture)
             .usage_right(UsageRight::HistoricalStorage)
             .usage_mode(UsageMode::NonDisplay)
-            .recipient(Recipient::Internal)
+            .recipient_class(RecipientClass::Internal)
+            .recipient_identity(RecipientIdentity::new("recipient-a").expect("recipient identity"))
             .purpose(Purpose::ProprietaryOwnAccountTradingResearch)
             .delivery_method(DeliveryMethod::Stream)
             .retention(Retention::bounded(86_400))
@@ -3613,7 +3915,10 @@ mod tests {
 
     #[test]
     fn missing_licensee_is_denied() {
-        let missing = AuthorizationScope::request().venue("venue-a").build();
+        let missing = AuthorizationScope::request()
+            .actor(Actor::FieldbookProducer)
+            .venue("venue-a")
+            .build();
         assert!(
             matches!(
                 missing,
@@ -3664,7 +3969,7 @@ mod tests {
     #[test]
     fn wrong_recipient_is_denied() {
         let registry = registry_for(&scope());
-        let other = scope_with(|item| item.recipient = Recipient::Customer);
+        let other = scope_with(|item| item.recipient_class = RecipientClass::Customer);
         assert!(
             registry.authorize(&other, 1).is_err(),
             "a different recipient class is not covered by the grant"
@@ -3727,5 +4032,316 @@ mod tests {
                 "{name} mismatch must deny"
             );
         }
+    }
+
+    // The following cases use only abstract identifiers, versions and
+    // instants. No market observation, venue report or provider input exists.
+
+    fn object(kind: ObjectKind, id: &str, version: &str) -> DataObject {
+        DataObject::new(kind, id, version).expect("abstract object")
+    }
+
+    /// A complete builder; individual tests remove exactly one required value.
+    fn abstract_request() -> AuthorizationRequestBuilder {
+        AuthorizationScope::request()
+            .actor(Actor::FieldbookProducer)
+            .data_object(object(ObjectKind::RawSourceRecord, "object-a", "v1"))
+            .licensee(Licensee::new("licensee-a").expect("licensee"))
+            .venue("venue-a")
+            .provider_id("provider-a")
+            .source_id("source-a")
+            .dataset_id("dataset-a")
+            .product_id("product-a")
+            .segment("venue-a-segment-a")
+            .territory(CountryCode::new("US").expect("country code"))
+            .operation(Operation::RealTimeCapture)
+            .usage_right(UsageRight::HistoricalStorage)
+            .usage_mode(UsageMode::NonDisplay)
+            .recipient_class(RecipientClass::Internal)
+            .recipient_identity(RecipientIdentity::new("recipient-a").expect("recipient"))
+            .purpose(Purpose::ProprietaryOwnAccountTradingResearch)
+            .delivery_method(DeliveryMethod::Stream)
+            .retention(Retention::bounded(100))
+            .instruments(ScopeSet::Named(vec!["instrument-a".to_owned()]))
+            .fields(ScopeSet::Named(vec!["field-a".to_owned()]))
+            .modalities(ScopeSet::Named(vec![Modality::L2]))
+            .data_time_window(TimeWindow {
+                from_us: Some(1),
+                to_us: Some(9),
+            })
+    }
+
+    #[test]
+    fn same_action_different_actor_is_denied() {
+        let registry = registry_for(&scope());
+        let request = scope_with(|item| item.actor = Actor::NirnayConsumer);
+        assert_eq!(
+            request.operation,
+            scope().operation,
+            "the action is unchanged"
+        );
+        assert!(
+            registry.authorize(&request, 1).is_err(),
+            "a consumer cannot use a producer's grant for the same action"
+        );
+        assert!(
+            !scope().exact_match(&request),
+            "exact matching binds the actor"
+        );
+    }
+
+    #[test]
+    fn object_kind_alone_is_not_an_object_identity() {
+        let first = object(ObjectKind::RawArchive, "archive-a", "v1");
+        let second = object(ObjectKind::RawArchive, "archive-b", "v1");
+        assert_eq!(first.kind, second.kind, "both are raw archives");
+        assert_ne!(first, second, "a shared kind is not a shared object");
+        assert_eq!(ObjectKind::RawArchive.as_str(), "raw_archive");
+    }
+
+    #[test]
+    fn different_object_kind_is_denied() {
+        let registry = registry_for(&scope());
+        let request = scope_with(|item| {
+            item.data_object = object(ObjectKind::RawArchive, "object-a", "v1");
+        });
+        assert!(
+            registry.authorize(&request, 1).is_err(),
+            "the same id and version under another kind need another grant"
+        );
+    }
+
+    #[test]
+    fn same_object_kind_different_identity_is_denied() {
+        let registry = registry_for(&scope());
+        let request = scope_with(|item| {
+            item.data_object = object(ObjectKind::RawSourceRecord, "object-b", "v1");
+        });
+        assert!(
+            registry.authorize(&request, 1).is_err(),
+            "a different object identity needs another grant"
+        );
+    }
+
+    #[test]
+    fn different_object_version_is_denied() {
+        let registry = registry_for(&scope());
+        let request = scope_with(|item| {
+            item.data_object = object(ObjectKind::RawSourceRecord, "object-a", "v2");
+        });
+        assert!(
+            registry.authorize(&request, 1).is_err(),
+            "a new object version needs another grant"
+        );
+    }
+
+    #[test]
+    fn same_recipient_class_different_identity_is_denied() {
+        let registry = registry_for(&scope());
+        let request = scope_with(|item| {
+            item.recipient_identity =
+                RecipientIdentity::new("recipient-b").expect("other recipient identity");
+        });
+        assert_eq!(
+            request.recipient_class,
+            scope().recipient_class,
+            "both requests are internal"
+        );
+        assert!(
+            registry.authorize(&request, 1).is_err(),
+            "Internal is a class, not a named recipient"
+        );
+    }
+
+    #[test]
+    fn named_licensee_mismatch_denies() {
+        let registry = registry_for(&scope());
+        let request = scope_with(|item| {
+            item.licensee = Licensee::new("licensee-b").expect("other named licensee");
+        });
+        assert!(
+            registry.authorize(&request, 1).is_err(),
+            "another named licensee is not covered"
+        );
+    }
+
+    #[test]
+    fn wrong_purpose_denies_even_with_an_otherwise_exact_grant() {
+        let grant = scope_with(|item| {
+            item.purpose = Purpose::ProprietaryOwnAccountTradingResearch;
+        });
+        let registry = registry_for(&grant);
+        let request = scope();
+        assert_eq!(
+            request.purpose,
+            Purpose::HistoricalArchive,
+            "the request carries a different purpose"
+        );
+        assert!(
+            registry.authorize(&request, 1).is_err(),
+            "purpose is bound to the grant"
+        );
+    }
+
+    #[test]
+    fn missing_actor_object_or_recipient_identity_is_rejected() {
+        type Removal = (&'static str, fn(&mut AuthorizationRequestBuilder));
+        let removals: [Removal; 4] = [
+            ("actor", |builder| builder.actor = None),
+            ("data_object", |builder| builder.data_object = None),
+            ("recipient_class", |builder| builder.recipient_class = None),
+            ("recipient_identity", |builder| {
+                builder.recipient_identity = None
+            }),
+        ];
+        for (field, remove) in removals {
+            let mut builder = abstract_request();
+            remove(&mut builder);
+            assert!(
+                matches!(builder.build(), Err(RightsError::MissingField { field: missing }) if missing == field),
+                "a missing {field} cannot be defaulted"
+            );
+        }
+        assert!(
+            matches!(
+                DataObject::new(ObjectKind::RawArchive, " ", "v1"),
+                Err(RightsError::InvalidObjectIdentity)
+            ),
+            "a blank object identity is not an object"
+        );
+        assert!(
+            matches!(
+                DataObject::new(ObjectKind::RawArchive, "archive-a", ""),
+                Err(RightsError::InvalidObjectVersion)
+            ),
+            "a blank version is not an object version"
+        );
+        assert!(
+            matches!(
+                RecipientIdentity::new(" "),
+                Err(RightsError::InvalidRecipientIdentity)
+            ),
+            "a blank recipient identity is not an identity"
+        );
+    }
+
+    #[test]
+    fn unrelated_extra_grants_do_not_extend_a_request() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let mut registry = LicensingRegistry::new();
+        let granted = scope_with(|item| {
+            item.data_object = object(ObjectKind::RawArchive, "archive-a", "v1");
+        });
+        let extra = scope_with(|item| {
+            item.data_object = object(ObjectKind::RawArchive, "archive-b", "v1");
+        });
+        registry
+            .register(permitted_record(&granted))
+            .expect("first grant");
+        registry
+            .register(permitted_record(&extra))
+            .expect("unrelated grant");
+        let ungranted = scope_with(|item| {
+            item.data_object = object(ObjectKind::RawArchive, "archive-c", "v1");
+        });
+        assert!(
+            registry.authorize(&ungranted, 1).is_err(),
+            "a third object is not covered by either grant"
+        );
+
+        let gate = AuthorizationGate::new();
+        gate.install_scope(
+            granted.clone(),
+            0,
+            None,
+            &permitted_record(&granted).audit,
+            sink(directory.path()),
+        )
+        .expect("first proof installed");
+        assert!(
+            gate.check_active(&intent_for(&extra), 1).is_err(),
+            "an extra grant at the registry is not an installed proof"
+        );
+        assert!(
+            gate.check_active(&intent_for(&granted), 1).is_ok(),
+            "the exact grant still works"
+        );
+    }
+
+    #[test]
+    fn audit_event_carries_evaluated_identities_and_grant_evidence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audit = directory.path().join("audit");
+        let evaluated = scope_with(|item| {
+            item.actor = Actor::NirnayConsumer;
+            item.data_object = object(ObjectKind::ResearchDataset, "research-ds-a", "v3");
+            item.recipient_class = RecipientClass::Participant;
+            item.recipient_identity =
+                RecipientIdentity::new("participant-a").expect("recipient identity");
+        });
+        let gate = AuthorizationGate::new();
+        gate.install_scope(
+            evaluated.clone(),
+            0,
+            None,
+            &permitted_record(&evaluated).audit,
+            sink(&audit),
+        )
+        .expect("proof installed");
+        gate.require_egress(&intent_for(&evaluated), 1)
+            .expect("egress permitted");
+
+        let path = std::fs::read_dir(&audit)
+            .expect("audit directory")
+            .map(|entry| entry.expect("entry").path())
+            .find(|path| {
+                std::fs::read_to_string(path)
+                    .unwrap_or_default()
+                    .contains("egress_permitted")
+            })
+            .expect("permitted event");
+        let event: DecisionAuditEvent =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("event text"))
+                .expect("valid event");
+        assert_eq!(event.actor, "nirnay_consumer");
+        assert_eq!(event.data_object.kind, ObjectKind::ResearchDataset);
+        assert_eq!(event.data_object.id.as_str(), "research-ds-a");
+        assert_eq!(event.data_object.version.as_str(), "v3");
+        assert_eq!(event.recipient_class, "participant");
+        assert_eq!(event.recipient_identity, "participant-a");
+        assert_eq!(
+            event.grant_evidence_reference.as_deref(),
+            Some("contract-1#1")
+        );
+        assert_eq!(event.reference.as_deref(), Some("contract-1"));
+        assert!(event.grant_snapshot_id.is_some());
+        assert_ne!(
+            event.grant_evidence_reference, event.grant_snapshot_id,
+            "written evidence and immutable snapshot are separate references"
+        );
+    }
+
+    #[test]
+    fn producer_operation_enum_has_fourteen_distinct_values() {
+        let operations = [
+            Operation::SourceContact,
+            Operation::ReferenceDataRetrieval,
+            Operation::HistoricalDataRetrieval,
+            Operation::RealTimeCapture,
+            Operation::RawStorage,
+            Operation::Normalization,
+            Operation::Replay,
+            Operation::Backup,
+            Operation::InternalAnalytics,
+            Operation::DerivedDataCreation,
+            Operation::Display,
+            Operation::ExternalRedistribution,
+            Operation::Retention,
+            Operation::Deletion,
+        ];
+        let mut names: Vec<_> = operations.iter().map(|item| item.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 14, "no second producer operation enum exists");
     }
 }

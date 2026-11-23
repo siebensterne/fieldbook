@@ -10,6 +10,8 @@
 schema_version = 1
 
 [intent]
+actor = "fieldbook_producer"
+data_object = { kind = "raw_source_record", id = "REPLACE_WITH_OBJECT_ID", version = "REPLACE_WITH_OBJECT_VERSION" }
 licensee = "REPLACE_WITH_LEGAL_LICENSEE"
 provider_id = "provider-a"
 source_id = "provider-source"
@@ -21,7 +23,8 @@ operation = "real_time_capture"
 purpose = "proprietary_own_account_trading_research"
 usage_right = "real_time_access"
 usage_mode = "non_display"
-recipient = "internal"
+recipient_class = "internal"
+recipient_identity = "REPLACE_WITH_NAMED_RECIPIENT"
 territory = "US"
 delivery_method = "stream"
 instruments = { named = ["inst-a", "inst-b"] }

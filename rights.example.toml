@@ -25,12 +25,15 @@
 schema_version = 1
 licensee = "REPLACE_WITH_LEGAL_LICENSEE"
 territory = "US"
-recipient = "internal"                # separate from usage_right and purpose
+recipient_class = "internal"          # a class, never a named recipient
+recipient_identity = "REPLACE_WITH_NAMED_RECIPIENT"
 
 [[rights]]
 decision = "contract_required"
 
 [rights.identity]
+actor = "fieldbook_producer"           # declared agent, not a command name
+data_object = { kind = "raw_source_record", id = "REPLACE_WITH_OBJECT_ID", version = "REPLACE_WITH_OBJECT_VERSION" }
 venue = "venue-a"
 provider_id = "provider-a"
 source_id = "provider-source"
@@ -41,7 +44,8 @@ territory = "US"
 operation = "real_time_capture"       # lifecycle vocabulary, not a CLI command
 usage_right = "real_time_access"
 usage_mode = "non_display"            # separate display/non-display concept
-recipient = "internal"
+recipient_class = "internal"          # separate from the named recipient
+recipient_identity = "REPLACE_WITH_NAMED_RECIPIENT"
 purpose = "internal_analysis"         # replace with the exact reviewed wording,
                                       # e.g. "proprietary_own_account_trading_research"
 delivery_method = "stream"

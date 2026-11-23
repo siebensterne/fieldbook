@@ -497,8 +497,8 @@ impl CoverageRecord {
         right: UsageRight,
     ) -> Result<crate::rights::AuthorizationQuery, crate::rights::RightsError> {
         use crate::rights::{
-            DeliveryMethod, Licensee, Operation, Purpose, Recipient, Retention, ScopeSet,
-            TimeWindow, UsageMode,
+            Actor, DataObject, DeliveryMethod, Licensee, ObjectKind, Operation, Purpose,
+            RecipientClass, RecipientIdentity, Retention, ScopeSet, TimeWindow, UsageMode,
         };
         let operation = match right {
             UsageRight::RealTimeAccess => Operation::RealTimeCapture,
@@ -516,6 +516,12 @@ impl CoverageRecord {
             UsageRight::Redistribution => Purpose::Redistribution,
         };
         AuthorizationScope::request()
+            .actor(Actor::FieldbookProducer)
+            .data_object(DataObject::new(
+                ObjectKind::CanonicalObservation,
+                &self.dataset,
+                "coverage-v1",
+            )?)
             .licensee(Licensee::system())
             .venue(self.provider_id.clone())
             .provider_id(self.provider_id.clone())
@@ -532,7 +538,11 @@ impl CoverageRecord {
             .operation(operation)
             .usage_right(right)
             .usage_mode(UsageMode::NonDisplay)
-            .recipient(Recipient::Internal)
+            .recipient_class(RecipientClass::Internal)
+            .recipient_identity(RecipientIdentity::new(&format!(
+                "coverage-recipient-{}",
+                self.provider_id
+            ))?)
             .purpose(purpose)
             .delivery_method(DeliveryMethod::File)
             .retention(Retention::NONE)
@@ -880,15 +890,20 @@ mod tests {
     use crate::{
         quality::Reconciliation,
         rights::{
-            AuthorizationIdentity, AuthorizationRecord, DecisionAudit, DeliveryMethod, Licensee,
-            Operation, Purpose, Recipient, Retention, RightDecision, ScopeSet, TimeWindow,
-            UsageMode,
+            Actor, AuthorizationIdentity, AuthorizationRecord, DataObject, DecisionAudit,
+            DeliveryMethod, Licensee, ObjectKind, Operation, Purpose, RecipientClass,
+            RecipientIdentity, Retention, RightDecision, ScopeSet, TimeWindow, UsageMode,
         },
     };
     use std::collections::BTreeMap;
 
     fn rights_scope() -> AuthorizationScope {
         AuthorizationScope::request()
+            .actor(Actor::FieldbookProducer)
+            .data_object(
+                DataObject::new(ObjectKind::CanonicalObservation, "quotes", "coverage-v1")
+                    .expect("object identity"),
+            )
             .licensee(Licensee::system())
             .venue("source")
             .provider_id("source")
@@ -900,7 +915,10 @@ mod tests {
             .operation(Operation::InternalAnalytics)
             .usage_right(UsageRight::InternalProcessing)
             .usage_mode(UsageMode::NonDisplay)
-            .recipient(Recipient::Internal)
+            .recipient_class(RecipientClass::Internal)
+            .recipient_identity(
+                RecipientIdentity::new("coverage-recipient-source").expect("recipient identity"),
+            )
             .purpose(Purpose::InternalAnalysis)
             .delivery_method(DeliveryMethod::File)
             .retention(Retention::NONE)
@@ -1329,6 +1347,9 @@ mod tests {
                     scope: rights_scope().with(|scope| {
                         scope.venue = "other-provider".to_owned();
                         scope.provider_id = "other-provider".to_owned();
+                        scope.recipient_identity =
+                            RecipientIdentity::new("coverage-recipient-other-provider")
+                                .expect("recipient identity");
                     }),
                     valid_from: 0,
                     valid_until: Some(200),

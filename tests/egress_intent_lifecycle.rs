@@ -27,9 +27,10 @@ use fieldbook::{
     egress::authorize_redirect_on,
     egress_intent::{EgressIntent, InMemoryAuthority, MAX_LEASE_DURATION},
     rights::{
-        AuditSink, AuthorizationGate, AuthorizationProof, AuthorizationScope, DecisionAudit,
-        DeliveryMethod, Licensee, Modality, Operation, Purpose, Recipient, Retention,
-        RetentionLimit, RightsContext, RightsFile, ScopeSet, TimeWindow, UsageMode, UsageRight,
+        Actor, AuditSink, AuthorizationGate, AuthorizationProof, AuthorizationScope, DataObject,
+        DecisionAudit, DeliveryMethod, Licensee, Modality, ObjectKind, Operation, Purpose,
+        RecipientClass, RecipientIdentity, Retention, RetentionLimit, RightsContext, RightsFile,
+        ScopeSet, TimeWindow, UsageMode, UsageRight,
     },
     taxonomy::CountryCode,
     ws::{self, ConnectOptions, DenialTransport},
@@ -41,6 +42,11 @@ type Mutation = (&'static str, fn(&mut EgressIntent));
 
 fn scope() -> AuthorizationScope {
     AuthorizationScope::request()
+        .actor(Actor::FieldbookProducer)
+        .data_object(
+            DataObject::new(ObjectKind::RawSourceRecord, "object-a", "v1")
+                .expect("abstract object identity"),
+        )
         .licensee(Licensee::new("licensee-a").expect("licensee"))
         .venue("venue-a")
         .provider_id("provider-a")
@@ -52,7 +58,8 @@ fn scope() -> AuthorizationScope {
         .operation(Operation::RealTimeCapture)
         .usage_right(UsageRight::HistoricalStorage)
         .usage_mode(UsageMode::NonDisplay)
-        .recipient(Recipient::Internal)
+        .recipient_class(RecipientClass::Internal)
+        .recipient_identity(RecipientIdentity::new("recipient-a").expect("recipient identity"))
         .purpose(Purpose::ProprietaryOwnAccountTradingResearch)
         .delivery_method(DeliveryMethod::Stream)
         .retention(Retention::bounded(86_400))
@@ -77,12 +84,15 @@ fn intent_for(scope: &AuthorizationScope) -> EgressIntent {
         .venue_id(scope.venue.clone())
         .segment_id(scope.segment.clone())
         .dataset_id(scope.dataset_id.clone())
+        .actor(scope.actor)
         .operation(scope.operation)
+        .data_object(scope.data_object.clone())
         .purpose(scope.purpose)
         .usage_mode(scope.usage_mode)
         .usage_right(scope.usage_right)
         .licensee(scope.licensee.clone())
-        .recipient(scope.recipient)
+        .recipient_class(scope.recipient_class)
+        .recipient_identity(scope.recipient_identity.clone())
         .territory(scope.territory.clone())
         .instruments(scope.instruments.clone())
         .fields(scope.fields.clone())
@@ -164,7 +174,8 @@ fn rights_file(tmp: &Path, scope: &AuthorizationScope) -> PathBuf {
         schema_version: 1,
         licensee: scope.licensee.clone(),
         territory: "US".to_owned(),
-        recipient: Recipient::Internal,
+        recipient_class: RecipientClass::Internal,
+        recipient_identity: RecipientIdentity::new("recipient-a").expect("recipient identity"),
         rights: vec![fieldbook::rights::AuthorizationRecord {
             identity: fieldbook::rights::AuthorizationIdentity {
                 scope: scope.clone(),
@@ -241,7 +252,9 @@ fn every_declared_dimension_mismatch_denies() {
         ("purpose", |intent| {
             intent.purpose = Purpose::InternalAnalysis
         }),
-        ("recipient", |intent| intent.recipient = Recipient::Customer),
+        ("recipient class", |intent| {
+            intent.recipient_class = RecipientClass::Customer
+        }),
         ("territory", |intent| {
             intent.territory = CountryCode::new("GB").expect("GB")
         }),
@@ -596,7 +609,8 @@ fn rights_file_root_consistency_and_actual_recording_authority() {
         schema_version: 1,
         licensee: Licensee::new("different-licensee").expect("licensee"),
         territory: "US".to_owned(),
-        recipient: Recipient::Internal,
+        recipient_class: RecipientClass::Internal,
+        recipient_identity: RecipientIdentity::new("recipient-a").expect("recipient identity"),
         rights: Vec::new(),
     };
     file.rights.push(fieldbook::rights::AuthorizationRecord {

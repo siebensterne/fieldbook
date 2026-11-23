@@ -329,7 +329,8 @@ fn declared_rights_query(
     right: UsageRight,
 ) -> Result<AuthorizationScope, crate::rights::RightsError> {
     use crate::rights::{
-        DeliveryMethod, Licensee, Purpose, Recipient, Retention, TimeWindow, UsageMode,
+        Actor, DataObject, DeliveryMethod, Licensee, ObjectKind, Purpose, RecipientClass,
+        RecipientIdentity, Retention, TimeWindow, UsageMode,
     };
     let operation = match right {
         UsageRight::RealTimeAccess => Operation::RealTimeCapture,
@@ -345,6 +346,12 @@ fn declared_rights_query(
         UsageRight::Redistribution => Purpose::Redistribution,
     };
     AuthorizationScope::request()
+        .actor(Actor::FieldbookProducer)
+        .data_object(DataObject::new(
+            ObjectKind::CanonicalObservation,
+            &declaration.dataset,
+            "conformance-v1",
+        )?)
         .licensee(Licensee::system())
         .venue(declaration.provider_id.clone())
         .provider_id(declaration.provider_id.clone())
@@ -356,7 +363,11 @@ fn declared_rights_query(
         .operation(operation)
         .usage_right(right)
         .usage_mode(UsageMode::NonDisplay)
-        .recipient(Recipient::Internal)
+        .recipient_class(RecipientClass::Internal)
+        .recipient_identity(RecipientIdentity::new(&format!(
+            "conformance-recipient-{}",
+            declaration.provider_id
+        ))?)
         .purpose(purpose)
         .delivery_method(DeliveryMethod::File)
         .retention(Retention::NONE)
