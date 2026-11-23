@@ -501,6 +501,8 @@ fn two_independent_authorizations_coexist_in_one_gate() {
     second.provider_id = "provider-b".to_owned();
     second.product_id = "product-b".to_owned();
     second.operation = Operation::ReferenceDataRetrieval;
+    second.data_object = DataObject::new(ObjectKind::SourceReferenceRecord, "reference-a", "v1")
+        .expect("reference object identity");
     let gate = AuthorizationGate::new();
     gate.install(
         proof_for(&first, MAX_LEASE_DURATION.as_micros() as u64, 0),

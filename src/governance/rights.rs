@@ -544,15 +544,632 @@ impl Retention {
     }
 }
 
+/// Exact, versioned identity of a membership universe.
+///
+/// A universe is named by an explicit version, a content digest and the
+/// membership source that produced it. Data-as-of and knowledge-time windows
+/// bound the interval for which that exact version may be consulted. Member
+/// names are never resolved against present-day symbols: every containment
+/// decision needs a recorded membership fact for the exact reference and time.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseRef {
+    /// Stable identity of the universe, independent of any single version.
+    pub universe_id: String,
+    /// Exact version of that universe. A new version is a new set.
+    pub version: String,
+    /// Lowercase hex SHA-256 digest of the exact version's membership bytes.
+    pub digest: String,
+    /// Named source that produced the membership facts.
+    pub membership_source: String,
+    /// Data-time interval for which this version may be consulted.
+    pub valid_time: TimeWindow,
+    /// Knowledge-time interval in which this version was known.
+    pub knowledge_time: TimeWindow,
+    /// Monotonic revision of the universe declaration; never zero.
+    pub revision: u64,
+}
+
+impl UniverseRef {
+    /// Build a universe reference, validating every component.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidUniverse`] for a blank component, a
+    /// malformed digest, a zero revision or a reversed window.
+    pub fn new(
+        universe_id: &str,
+        version: &str,
+        digest: &str,
+        membership_source: &str,
+        valid_time: TimeWindow,
+        knowledge_time: TimeWindow,
+        revision: u64,
+    ) -> Result<Self, RightsError> {
+        let reference = Self {
+            universe_id: universe_id.to_owned(),
+            version: version.to_owned(),
+            digest: digest.to_owned(),
+            membership_source: membership_source.to_owned(),
+            valid_time,
+            knowledge_time,
+            revision,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Validate the shape of a declared universe reference.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidUniverse`] when any component is invalid.
+    pub fn validate(&self) -> Result<(), RightsError> {
+        if self.universe_id.trim().is_empty()
+            || self.version.trim().is_empty()
+            || self.membership_source.trim().is_empty()
+            || !is_lowercase_sha256(&self.digest)
+            || self.revision == 0
+        {
+            return Err(RightsError::InvalidUniverse);
+        }
+        self.valid_time.validate()?;
+        self.knowledge_time.validate()?;
+        Ok(())
+    }
+}
+
+fn is_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+/// Explicit instants at which a member's universe membership is required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MembershipTime {
+    /// Data-as-of instant of the requested observation.
+    pub data_as_of: i64,
+    /// Knowledge-time instant at which the membership was known.
+    pub knowledge_as_of: i64,
+}
+
+/// One recorded membership fact. It is evidence, not a live symbol lookup.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UniverseMembership {
+    /// Exact universe version whose membership is recorded.
+    pub universe: UniverseRef,
+    /// Named member whose membership is recorded.
+    pub member: String,
+    /// Data-as-of instant of the recorded fact.
+    pub data_as_of: i64,
+    /// Knowledge-time instant of the recorded fact.
+    pub knowledge_as_of: i64,
+}
+
+/// Recorded, versioned membership evidence for universe containment.
+///
+/// The registry contains only facts inserted by a caller that holds the
+/// membership evidence. It never consults a current instrument master, a
+/// command name or a symbol string that happens to exist today.
+#[derive(Debug, Clone, Default)]
+pub struct UniverseMembershipRegistry {
+    facts: std::collections::BTreeSet<UniverseMembership>,
+}
+
+impl UniverseMembershipRegistry {
+    /// Create an empty, fail-closed membership registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one membership fact after checking it against the exact universe.
+    ///
+    /// # Errors
+    /// Returns [`RightsError::InvalidUniverse`] or
+    /// [`RightsError::InvalidUniverseMembership`] for invalid evidence.
+    pub fn record(&mut self, membership: UniverseMembership) -> Result<(), RightsError> {
+        membership.universe.validate()?;
+        if membership.member.trim().is_empty() {
+            return Err(RightsError::InvalidUniverseMembership);
+        }
+        let data_point = TimeWindow {
+            from_us: Some(membership.data_as_of),
+            to_us: Some(membership.data_as_of),
+        };
+        let knowledge_point = TimeWindow {
+            from_us: Some(membership.knowledge_as_of),
+            to_us: Some(membership.knowledge_as_of),
+        };
+        if !membership.universe.valid_time.contains(&data_point)
+            || !membership
+                .universe
+                .knowledge_time
+                .contains(&knowledge_point)
+        {
+            return Err(RightsError::InvalidUniverseMembership);
+        }
+        self.facts.insert(membership);
+        Ok(())
+    }
+
+    /// Whether the exact universe contains the named member at both instants.
+    #[must_use]
+    pub fn contains(&self, universe: &UniverseRef, member: &str, at: MembershipTime) -> bool {
+        self.facts.contains(&UniverseMembership {
+            universe: universe.clone(),
+            member: member.to_owned(),
+            data_as_of: at.data_as_of,
+            knowledge_as_of: at.knowledge_as_of,
+        })
+    }
+
+    /// Number of recorded membership facts.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.facts.len()
+    }
+
+    /// Whether no membership facts have been recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.facts.is_empty()
+    }
+}
+
+/// Requirement level of one dimension in the applicability matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DimensionRequirement {
+    /// An explicit value must be supplied.
+    Required,
+    /// A value is permitted without a declared requirement; a missing value
+    /// is still never encoded as `NotApplicable`.
+    Optional,
+    /// The value must be supplied and is inherited from the upstream scope.
+    Inherited,
+    /// The dimension has no meaning for this operation and must be absent.
+    NotApplicable,
+    /// Supplying the dimension is forbidden for this operation.
+    Prohibited,
+}
+
+impl DimensionRequirement {
+    /// Return the stable contract string for this requirement.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Optional => "optional",
+            Self::Inherited => "inherited",
+            Self::NotApplicable => "not_applicable",
+            Self::Prohibited => "prohibited",
+        }
+    }
+
+    const fn needs_value(self) -> bool {
+        matches!(self, Self::Required | Self::Optional | Self::Inherited)
+    }
+
+    const fn needs_absent(self) -> bool {
+        matches!(self, Self::NotApplicable | Self::Prohibited)
+    }
+}
+
+/// Scope representations an operation may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeRepresentations {
+    /// Whether an explicit named set is allowed.
+    pub named: bool,
+    /// Whether an exact versioned universe is allowed.
+    pub universe: bool,
+    /// Whether an explicitly written unrestricted set is allowed.
+    pub all: bool,
+}
+
+const NO_SETS: ScopeRepresentations = ScopeRepresentations {
+    named: false,
+    universe: false,
+    all: false,
+};
+const BOUNDED_SETS: ScopeRepresentations = ScopeRepresentations {
+    named: true,
+    universe: true,
+    all: false,
+};
+const OPEN_SETS: ScopeRepresentations = ScopeRepresentations {
+    named: true,
+    universe: true,
+    all: true,
+};
+
+/// Applicability of every validated dimension to one action-object pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Applicability {
+    /// Operation whose dimensions are described.
+    pub operation: Operation,
+    /// Object kind permitted for this operation.
+    pub data_object_kind: ObjectKind,
+    /// Provider requirement.
+    pub provider: DimensionRequirement,
+    /// Venue requirement.
+    pub venue: DimensionRequirement,
+    /// Segment requirement.
+    pub segment: DimensionRequirement,
+    /// Instrument requirement.
+    pub instruments: DimensionRequirement,
+    /// Field requirement.
+    pub fields: DimensionRequirement,
+    /// Modality requirement.
+    pub modality: DimensionRequirement,
+    /// Data-time requirement.
+    pub data_time: DimensionRequirement,
+    /// Retention requirement.
+    pub retention: DimensionRequirement,
+    /// Permitted scope representations for named dimensions.
+    pub representations: ScopeRepresentations,
+}
+
+/// Outcome of applying the matrix to one scope before containment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicabilityDecision {
+    /// Every required dimension is present and every representation is allowed.
+    Applicable,
+    /// The operation has no data dimensions; its absent shape is correct.
+    NotApplicable,
+    /// The object kind is not permitted for the operation.
+    Prohibited,
+    /// A dimension is missing, present where absent is required, or malformed.
+    Invalid,
+}
+
+impl ApplicabilityDecision {
+    /// Return the stable contract string for this decision.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applicable => "applicable",
+            Self::NotApplicable => "not_applicable",
+            Self::Prohibited => "prohibited",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+const fn matrix_entry(
+    operation: Operation,
+    kind: ObjectKind,
+    provider: DimensionRequirement,
+    sets: DimensionRequirement,
+    data_time: DimensionRequirement,
+    retention: DimensionRequirement,
+    representations: ScopeRepresentations,
+) -> Applicability {
+    Applicability {
+        operation,
+        data_object_kind: kind,
+        provider,
+        venue: DimensionRequirement::Required,
+        segment: DimensionRequirement::Required,
+        instruments: sets,
+        fields: sets,
+        modality: sets,
+        data_time,
+        retention,
+        representations,
+    }
+}
+
+/// Applicability of one action-object pair, or `None` when the pair is
+/// prohibited. An unlisted object kind never inherits another kind's matrix.
+#[must_use]
+pub const fn applicability_for(operation: Operation, kind: ObjectKind) -> Option<Applicability> {
+    use DimensionRequirement as D;
+    match operation {
+        Operation::SourceContact => match kind {
+            ObjectKind::SourceReferenceRecord | ObjectKind::RawSourceRecord => Some(matrix_entry(
+                operation,
+                kind,
+                D::Required,
+                D::NotApplicable,
+                D::NotApplicable,
+                D::NotApplicable,
+                NO_SETS,
+            )),
+            _ => None,
+        },
+        Operation::ReferenceDataRetrieval => match kind {
+            ObjectKind::SourceReferenceRecord => Some(matrix_entry(
+                operation,
+                kind,
+                D::Required,
+                D::Required,
+                D::Required,
+                D::Inherited,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::HistoricalDataRetrieval => match kind {
+            ObjectKind::CanonicalObservation | ObjectKind::RawArchive => Some(matrix_entry(
+                operation,
+                kind,
+                D::Required,
+                D::Required,
+                D::Required,
+                D::Required,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::RealTimeCapture => match kind {
+            ObjectKind::RawSourceRecord => Some(matrix_entry(
+                operation,
+                kind,
+                D::Required,
+                D::Required,
+                D::Inherited,
+                D::Inherited,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::RawStorage => match kind {
+            ObjectKind::RawSourceRecord | ObjectKind::RawArchive => Some(matrix_entry(
+                operation,
+                kind,
+                D::Required,
+                D::Inherited,
+                D::Inherited,
+                D::Required,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::Normalization => match kind {
+            ObjectKind::RawSourceRecord | ObjectKind::CanonicalObservation => Some(matrix_entry(
+                operation,
+                kind,
+                D::Required,
+                D::Inherited,
+                D::Inherited,
+                D::Inherited,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::Replay => match kind {
+            ObjectKind::RawArchive | ObjectKind::ResearchCopy => Some(matrix_entry(
+                operation,
+                kind,
+                D::Inherited,
+                D::Inherited,
+                D::Required,
+                D::Inherited,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::Backup => match kind {
+            ObjectKind::RawArchive => Some(matrix_entry(
+                operation,
+                kind,
+                D::Required,
+                D::Inherited,
+                D::Inherited,
+                D::Required,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::InternalAnalytics => match kind {
+            ObjectKind::ResearchDataset => Some(matrix_entry(
+                operation,
+                kind,
+                D::Inherited,
+                D::Inherited,
+                D::Inherited,
+                D::Inherited,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::DerivedDataCreation => match kind {
+            ObjectKind::DerivedArtifact => Some(matrix_entry(
+                operation,
+                kind,
+                D::Inherited,
+                D::Inherited,
+                D::Inherited,
+                D::Inherited,
+                BOUNDED_SETS,
+            )),
+            _ => None,
+        },
+        Operation::Display => match kind {
+            ObjectKind::NdcRelease => Some(matrix_entry(
+                operation,
+                kind,
+                D::Inherited,
+                D::Inherited,
+                D::Optional,
+                D::Inherited,
+                OPEN_SETS,
+            )),
+            _ => None,
+        },
+        Operation::ExternalRedistribution => match kind {
+            ObjectKind::NdcRelease | ObjectKind::DerivedArtifact => Some(matrix_entry(
+                operation,
+                kind,
+                D::Inherited,
+                D::Inherited,
+                D::Inherited,
+                D::Required,
+                OPEN_SETS,
+            )),
+            _ => None,
+        },
+        Operation::Retention => match kind {
+            ObjectKind::RawArchive | ObjectKind::NdcRelease | ObjectKind::DerivedArtifact => {
+                Some(matrix_entry(
+                    operation,
+                    kind,
+                    D::Inherited,
+                    D::Inherited,
+                    D::Inherited,
+                    D::Required,
+                    BOUNDED_SETS,
+                ))
+            }
+            _ => None,
+        },
+        Operation::Deletion => match kind {
+            ObjectKind::RawArchive
+            | ObjectKind::NdcRelease
+            | ObjectKind::ResearchCopy
+            | ObjectKind::ResearchDataset
+            | ObjectKind::DerivedArtifact => Some(matrix_entry(
+                operation,
+                kind,
+                D::Optional,
+                D::NotApplicable,
+                D::NotApplicable,
+                D::Prohibited,
+                NO_SETS,
+            )),
+            _ => None,
+        },
+    }
+}
+
+fn check_dimension(
+    requirement: DimensionRequirement,
+    field: &'static str,
+    value: &str,
+) -> Result<(), RightsError> {
+    if requirement.needs_value() && value.trim().is_empty() {
+        return Err(RightsError::MissingField { field });
+    }
+    if requirement.needs_absent() && !value.trim().is_empty() {
+        return Err(RightsError::InvalidScopeSet);
+    }
+    Ok(())
+}
+
+fn check_scope_set<T>(
+    set: &ScopeSet<T>,
+    requirement: DimensionRequirement,
+    representations: ScopeRepresentations,
+) -> Result<(), RightsError> {
+    if requirement.needs_absent() {
+        if !matches!(set, ScopeSet::NotApplicable) {
+            return Err(RightsError::InvalidScopeSet);
+        }
+        return Ok(());
+    }
+    match set {
+        ScopeSet::NotApplicable => Err(RightsError::InvalidScopeSet),
+        ScopeSet::Named(members) if members.is_empty() || !representations.named => {
+            Err(RightsError::InvalidScopeSet)
+        }
+        ScopeSet::Named(_) => Ok(()),
+        ScopeSet::Universe(reference) if representations.universe => reference.validate(),
+        ScopeSet::Universe(_) => Err(RightsError::InvalidScopeSet),
+        ScopeSet::All if representations.all => Ok(()),
+        ScopeSet::All => Err(RightsError::InvalidScopeSet),
+    }
+}
+
+fn check_data_time(
+    window: &TimeWindow,
+    requirement: DimensionRequirement,
+) -> Result<(), RightsError> {
+    window.validate()?;
+    let unbounded = window.from_us.is_none() && window.to_us.is_none();
+    if requirement.needs_absent() && !unbounded {
+        return Err(RightsError::InvalidScopeSet);
+    }
+    if requirement == DimensionRequirement::Required && unbounded {
+        return Err(RightsError::InvalidScopeSet);
+    }
+    Ok(())
+}
+
+fn check_retention(
+    retention: &Retention,
+    requirement: DimensionRequirement,
+) -> Result<(), RightsError> {
+    let none = retention.limit == RetentionLimit::None;
+    if requirement.needs_absent() && !none {
+        return Err(RightsError::InvalidScopeSet);
+    }
+    if requirement == DimensionRequirement::Required && none {
+        return Err(RightsError::InvalidScopeSet);
+    }
+    Ok(())
+}
+
+/// Apply the applicability matrix to one grant or request before containment.
+///
+/// Both sides call this from [`AuthorizationScope::validate`], so a scope that
+/// cannot be evaluated is never compared with a grant.
+///
+/// # Errors
+/// Returns [`RightsError::ObjectKindNotApplicable`] for a prohibited pair,
+/// [`RightsError::MissingField`] for an absent required identity dimension and
+/// [`RightsError::InvalidScopeSet`] for a shape or representation violation.
+pub fn validate_applicability(
+    scope: &AuthorizationScope,
+) -> Result<ApplicabilityDecision, RightsError> {
+    let Some(applicability) = applicability_for(scope.operation, scope.data_object.kind) else {
+        return Err(RightsError::ObjectKindNotApplicable {
+            operation: scope.operation.as_str(),
+            kind: scope.data_object.kind.as_str(),
+        });
+    };
+    check_dimension(applicability.provider, "provider_id", &scope.provider_id)?;
+    check_dimension(applicability.venue, "venue", &scope.venue)?;
+    check_dimension(applicability.segment, "segment", &scope.segment)?;
+    check_scope_set(
+        &scope.instruments,
+        applicability.instruments,
+        applicability.representations,
+    )?;
+    check_scope_set(
+        &scope.fields,
+        applicability.fields,
+        applicability.representations,
+    )?;
+    check_scope_set(
+        &scope.modalities,
+        applicability.modality,
+        applicability.representations,
+    )?;
+    check_data_time(&scope.data_time_window, applicability.data_time)?;
+    check_retention(&scope.retention, applicability.retention)?;
+    if applicability.instruments == DimensionRequirement::NotApplicable {
+        Ok(ApplicabilityDecision::NotApplicable)
+    } else {
+        Ok(ApplicabilityDecision::Applicable)
+    }
+}
+
 /// A scope dimension with four explicit states.
 ///
 /// `NotApplicable` records that the dimension has no meaning for the
 /// operation (for example, instruments for a source contact). `Named` is an
 /// explicit enumerated set; an empty `Named` set contains no members and is
-/// never converted into `All`. `Universe` names an explicitly versioned
-/// universe and is the only unbounded-but-defined set a capture may use.
+/// never converted into `All`. `Universe` names an exact versioned universe:
+/// it covers only the same reference, and named members only when recorded
+/// membership evidence for that reference and both instants is supplied.
 /// `All` is unrestricted and may only be written explicitly in an operator
-/// rights record; it is never a runtime default or an inferred wildcard.
+/// rights record where the matrix allows it; it is never a runtime default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScopeSet<T> {
@@ -560,14 +1177,18 @@ pub enum ScopeSet<T> {
     NotApplicable,
     /// An explicit set of named members. Empty means "no members".
     Named(Vec<T>),
-    /// Every member of a named, versioned universe.
-    Universe(String),
+    /// Every member of an exact, versioned universe.
+    Universe(UniverseRef),
     /// Unrestricted; operator-written only, never inferred.
     All,
 }
 
 impl<T: PartialEq + Eq> ScopeSet<T> {
     /// Whether every requested member is covered by this permitted set.
+    ///
+    /// A universe covers only an equal universe reference. A named
+    /// request is never silently admitted by a universe here; that requires
+    /// the explicit membership-evidence path.
     #[must_use]
     pub fn contains_all(&self, requested: &Self) -> bool {
         match (self, requested) {
@@ -576,10 +1197,7 @@ impl<T: PartialEq + Eq> ScopeSet<T> {
             (Self::Named(permitted), Self::Named(asked)) => {
                 asked.iter().all(|item| permitted.contains(item))
             }
-            // A named request is a subset of the declared versioned universe.
-            (Self::Universe(_), Self::Named(_)) => true,
             (Self::Universe(permitted), Self::Universe(asked)) => permitted == asked,
-            // A bounded grant never covers an unbounded or inapplicable request.
             (Self::Named(_) | Self::Universe(_) | Self::NotApplicable, _) => false,
         }
     }
@@ -595,6 +1213,41 @@ impl<T: PartialEq + Eq> ScopeSet<T> {
     pub const fn is_applicable(&self) -> bool {
         !matches!(self, Self::NotApplicable)
     }
+
+    /// Return the exact universe reference when this set names one.
+    #[must_use]
+    pub fn universe_ref(&self) -> Option<&UniverseRef> {
+        match self {
+            Self::Universe(reference) => Some(reference),
+            _ => None,
+        }
+    }
+}
+
+impl ScopeSet<String> {
+    /// Verify named-member containment against recorded universe membership.
+    ///
+    /// Every requested name must be present for the exact universe reference at
+    /// the required data-as-of and knowledge-time instants. An unknown name, a
+    /// different reference or a different instant denies. No current symbol
+    /// resolution or present-day clock is consulted.
+    #[must_use]
+    pub fn contains_universe_member(
+        &self,
+        requested: &Self,
+        membership: &UniverseMembershipRegistry,
+        at: MembershipTime,
+    ) -> bool {
+        match (self, requested) {
+            (Self::Universe(reference), Self::Named(members)) => {
+                !members.is_empty()
+                    && members
+                        .iter()
+                        .all(|member| membership.contains(reference, member, at))
+            }
+            _ => self.contains_all(requested),
+        }
+    }
 }
 
 impl<T> Default for ScopeSet<T> {
@@ -605,7 +1258,7 @@ impl<T> Default for ScopeSet<T> {
 
 /// Inclusive time window over the data itself, distinct from the effective
 /// interval over which the decision is valid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub struct TimeWindow {
     /// Earliest covered data instant; absent means unbounded.
     pub from_us: Option<i64>,
@@ -725,7 +1378,7 @@ impl AuthorizationScope {
         }
         validate_segment(&self.segment)?;
         self.data_time_window.validate()?;
-        validate_scope_sets(self)?;
+        validate_applicability(self)?;
         Ok(())
     }
 
@@ -755,8 +1408,35 @@ impl AuthorizationScope {
     /// Whether every scoped dimension of `requested` lies inside this grant.
     #[must_use]
     pub fn scope_contains(&self, requested: &Self) -> bool {
-        self.instruments.contains_all(&requested.instruments)
-            && self.fields.contains_all(&requested.fields)
+        self.scope_contains_with(requested, None)
+    }
+
+    /// Scope containment with optional, explicit membership evidence.
+    ///
+    /// Universe-to-named containment is denied unless the caller supplies both
+    /// the membership registry and the required data-as-of/knowledge-time.
+    #[must_use]
+    pub fn scope_contains_with(
+        &self,
+        requested: &Self,
+        membership: Option<(&UniverseMembershipRegistry, MembershipTime)>,
+    ) -> bool {
+        let instruments_ok = match membership {
+            Some((registry, at)) => {
+                self.instruments
+                    .contains_universe_member(&requested.instruments, registry, at)
+            }
+            None => self.instruments.contains_all(&requested.instruments),
+        };
+        let fields_ok = match membership {
+            Some((registry, at)) => {
+                self.fields
+                    .contains_universe_member(&requested.fields, registry, at)
+            }
+            None => self.fields.contains_all(&requested.fields),
+        };
+        instruments_ok
+            && fields_ok
             && self.modalities.contains_all(&requested.modalities)
             && self.data_time_window.contains(&requested.data_time_window)
             && self.retention.contains(&requested.retention)
@@ -765,7 +1445,17 @@ impl AuthorizationScope {
     /// Full comparison used by authorization and by every egress recheck.
     #[must_use]
     pub fn matches_request(&self, requested: &Self) -> bool {
-        self.exact_match(requested) && self.scope_contains(requested)
+        self.matches_request_with(requested, None)
+    }
+
+    /// Full comparison with optional, explicit membership evidence.
+    #[must_use]
+    pub fn matches_request_with(
+        &self,
+        requested: &Self,
+        membership: Option<(&UniverseMembershipRegistry, MembershipTime)>,
+    ) -> bool {
+        self.exact_match(requested) && self.scope_contains_with(requested, membership)
     }
 
     /// Whether the requested endpoint is inside the rights-file-approved set.
@@ -828,29 +1518,6 @@ fn validate_segment(segment: &str) -> Result<(), RightsError> {
         || LEGACY_SEGMENTS.contains(&value.to_ascii_lowercase().as_str())
     {
         return Err(RightsError::InvalidSegment);
-    }
-    Ok(())
-}
-
-/// Operation-aware validation of scope sets. A source contact has no data
-/// scope; capture requires named members or an explicitly versioned universe
-/// and can never rely on an unrestricted `All`.
-fn validate_scope_sets(scope: &AuthorizationScope) -> Result<(), RightsError> {
-    if scope.operation == Operation::SourceContact {
-        if scope.instruments.is_applicable()
-            || scope.fields.is_applicable()
-            || scope.modalities.is_applicable()
-        {
-            return Err(RightsError::InvalidScopeSet);
-        }
-        return Ok(());
-    }
-    if scope.operation == Operation::RealTimeCapture
-        && (scope.instruments == ScopeSet::All
-            || scope.fields == ScopeSet::All
-            || scope.modalities == ScopeSet::All)
-    {
-        return Err(RightsError::InvalidScopeSet);
     }
     Ok(())
 }
@@ -1164,7 +1831,18 @@ impl AuthorizationIdentity {
     /// Whether this record applies to a request at `at_us`.
     #[must_use]
     pub fn matches(&self, request: &AuthorizationRequest, at_us: i64) -> bool {
-        self.scope.matches_request(request)
+        self.matches_with(request, at_us, None)
+    }
+
+    /// Whether this record applies, with optional universe membership evidence.
+    #[must_use]
+    pub fn matches_with(
+        &self,
+        request: &AuthorizationRequest,
+        at_us: i64,
+        membership: Option<(&UniverseMembershipRegistry, MembershipTime)>,
+    ) -> bool {
+        self.scope.matches_request_with(request, membership)
             && self.valid_from <= at_us
             && self.valid_until.is_none_or(|end| at_us <= end)
     }
@@ -1349,6 +2027,18 @@ pub enum RightsError {
     /// A scope set is not valid for the requested operation.
     #[error("authorization scope set is not valid for the operation")]
     InvalidScopeSet,
+    /// A universe reference is incomplete or malformed.
+    #[error("authorization universe reference is incomplete or malformed")]
+    InvalidUniverse,
+    /// A membership fact is blank or lies outside the exact universe windows.
+    #[error("authorization universe membership is invalid for the exact universe")]
+    InvalidUniverseMembership,
+    /// The object kind has no applicability entry for the operation.
+    #[error("authorization object kind `{kind}` is not permitted for operation `{operation}`")]
+    ObjectKindNotApplicable {
+        operation: &'static str,
+        kind: &'static str,
+    },
     /// A record or query has no venue, so no egress can be authorized.
     #[error("authorization identity has no venue")]
     VenueAbsent,
@@ -1429,6 +2119,9 @@ pub struct LicensingRegistry {
     /// Monotonically increasing rights-registry revision. Every registration
     /// advances it, so an installed proof can be invalidated by policy change.
     revision: u64,
+    /// Recorded membership evidence used only for explicit universe-to-named
+    /// containment. It is empty until evidence is supplied by a caller.
+    membership: UniverseMembershipRegistry,
 }
 
 impl LicensingRegistry {
@@ -1441,6 +2134,21 @@ impl LicensingRegistry {
     #[must_use]
     pub const fn revision(&self) -> u64 {
         self.revision
+    }
+
+    /// Attach recorded universe membership evidence to this registry.
+    #[must_use]
+    pub fn with_membership(mut self, membership: UniverseMembershipRegistry) -> Self {
+        self.membership = membership;
+        self
+    }
+
+    /// Record one universe membership fact for later containment checks.
+    ///
+    /// # Errors
+    /// Returns an error for invalid universe or membership evidence.
+    pub fn record_membership(&mut self, membership: UniverseMembership) -> Result<(), RightsError> {
+        self.membership.record(membership)
     }
 
     /// Register an authorization record.
@@ -1487,6 +2195,9 @@ impl LicensingRegistry {
 
     /// Authorize one fully identified request at an instant.
     ///
+    /// Without explicit membership evidence, a named request is never admitted
+    /// by a universe grant. Call [`Self::authorize_with_membership`] for that.
+    ///
     /// # Errors
     /// Returns the first fail-closed denial described by [`RightsError`].
     pub fn authorize(
@@ -1494,11 +2205,34 @@ impl LicensingRegistry {
         request: &AuthorizationRequest,
         at_us: i64,
     ) -> Result<AuthorizationProof, RightsError> {
+        self.authorize_with(request, at_us, None)
+    }
+
+    /// Authorize with explicit universe membership evidence and instants.
+    ///
+    /// # Errors
+    /// Returns the first fail-closed denial described by [`RightsError`].
+    pub fn authorize_with_membership(
+        &self,
+        request: &AuthorizationRequest,
+        at_us: i64,
+        at: MembershipTime,
+    ) -> Result<AuthorizationProof, RightsError> {
+        self.authorize_with(request, at_us, Some(at))
+    }
+
+    fn authorize_with(
+        &self,
+        request: &AuthorizationRequest,
+        at_us: i64,
+        at: Option<MembershipTime>,
+    ) -> Result<AuthorizationProof, RightsError> {
         request.validate()?;
+        let membership = at.map(|instant| (&self.membership, instant));
         let mut candidates: Vec<&AuthorizationRecord> = self
             .records
             .iter()
-            .filter(|record| record.identity.matches(request, at_us))
+            .filter(|record| record.identity.matches_with(request, at_us, membership))
             .collect();
         if candidates.is_empty() {
             return Err(RightsError::MissingRecord {
@@ -1617,6 +2351,11 @@ pub struct DecisionAuditEvent {
     pub fields: ScopeSet<String>,
     pub modalities: ScopeSet<Modality>,
     pub data_time_window: TimeWindow,
+    /// Result of the applicability matrix applied before containment.
+    pub applicability_decision: ApplicabilityDecision,
+    /// Digest of the exact universe referenced by this scope, when present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub universe_digest: Option<String>,
     pub decision: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -1743,6 +2482,17 @@ impl AuditSink {
         context: AuditContext,
     ) -> DecisionAuditEvent {
         let sequence = AUDIT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let applicability_decision = match validate_applicability(scope) {
+            Ok(decision) => decision,
+            Err(RightsError::ObjectKindNotApplicable { .. }) => ApplicabilityDecision::Prohibited,
+            Err(_) => ApplicabilityDecision::Invalid,
+        };
+        let universe_digest = scope
+            .instruments
+            .universe_ref()
+            .or_else(|| scope.fields.universe_ref())
+            .or_else(|| scope.modalities.universe_ref())
+            .map(|reference| reference.digest.clone());
         DecisionAuditEvent {
             schema_version: 1,
             event_id: format!("{}-{}-{sequence}", std::process::id(), at_us),
@@ -1773,6 +2523,8 @@ impl AuditSink {
             fields: scope.fields.clone(),
             modalities: scope.modalities.clone(),
             data_time_window: scope.data_time_window,
+            applicability_decision,
+            universe_digest,
             decision: decision.to_owned(),
             reason,
             reference: evidence.map(|audit| audit.licence_reference.clone()),
@@ -2038,6 +2790,7 @@ struct GateState {
     active: Vec<ActiveAuthorization>,
     fallback_sink: Option<AuditSink>,
     next_session: u64,
+    membership: UniverseMembershipRegistry,
 }
 
 /// Instance-scoped authorization state.
@@ -2065,10 +2818,31 @@ impl AuthorizationGate {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// Attach recorded universe membership evidence to this gate.
+    #[must_use]
+    pub fn with_membership(self, membership: UniverseMembershipRegistry) -> Self {
+        self.lock().membership = membership;
+        self
+    }
+
+    /// Record one universe membership fact for later containment checks.
+    ///
+    /// # Errors
+    /// Returns an error for invalid universe or membership evidence.
+    pub fn record_membership(&self, membership: UniverseMembership) -> Result<(), RightsError> {
+        self.lock().membership.record(membership)
+    }
+
     /// Whether the installed authorization covers the whole caller-supplied
     /// intent, including its endpoint. Time and lifecycle are checked separately.
-    fn matches(item: &ActiveAuthorization, intent: &EgressIntent) -> bool {
-        item.proof.scope.matches_request(&intent.to_scope())
+    fn matches(
+        item: &ActiveAuthorization,
+        intent: &EgressIntent,
+        membership: Option<(&UniverseMembershipRegistry, MembershipTime)>,
+    ) -> bool {
+        item.proof
+            .scope
+            .matches_request_with(&intent.to_scope(), membership)
             && item
                 .proof
                 .scope
@@ -2184,17 +2958,20 @@ impl AuthorizationGate {
         intent: &EgressIntent,
         at_us: i64,
         audit_egress: bool,
+        at: Option<MembershipTime>,
     ) -> anyhow::Result<AuthorizationProof> {
         intent.validate()?;
         let scope = intent.to_scope();
         let mut state = self.lock();
+        let membership = state.membership.clone();
+        let evidence = at.map(|instant| (&membership, instant));
         let Some(index) = state
             .active
             .iter()
-            .position(|item| Self::matches(item, intent))
+            .position(|item| Self::matches(item, intent, evidence))
         else {
             let error = if state.active.iter().any(|item| {
-                item.proof.scope.matches_request(&scope)
+                item.proof.scope.matches_request_with(&scope, evidence)
                     && !item
                         .proof
                         .scope
@@ -2320,7 +3097,20 @@ impl AuthorizationGate {
         intent: &EgressIntent,
         at_us: i64,
     ) -> anyhow::Result<AuthorizationProof> {
-        self.evaluate(intent, at_us, false)
+        self.evaluate(intent, at_us, false, None)
+    }
+
+    /// Preflight check with explicit universe membership evidence.
+    ///
+    /// # Errors
+    /// Returns a fail-closed denial when no live authorization covers the intent.
+    pub fn check_active_with_membership(
+        &self,
+        intent: &EgressIntent,
+        at_us: i64,
+        at: MembershipTime,
+    ) -> anyhow::Result<AuthorizationProof> {
+        self.evaluate(intent, at_us, false, Some(at))
     }
 
     /// Reauthorize one egress attempt and commit its event before returning.
@@ -2330,7 +3120,21 @@ impl AuthorizationGate {
     /// Returns an error on denial and when a permitted egress event cannot be
     /// committed. Denial events are written when a sink is available.
     pub fn require_egress(&self, intent: &EgressIntent, at_us: i64) -> anyhow::Result<()> {
-        self.evaluate(intent, at_us, true).map(|_| ())
+        self.evaluate(intent, at_us, true, None).map(|_| ())
+    }
+
+    /// Reauthorize an egress with explicit universe membership evidence.
+    ///
+    /// # Errors
+    /// Returns an error on denial and when a permitted egress event cannot be
+    /// committed.
+    pub fn require_egress_with_membership(
+        &self,
+        intent: &EgressIntent,
+        at_us: i64,
+        at: MembershipTime,
+    ) -> anyhow::Result<()> {
+        self.evaluate(intent, at_us, true, Some(at)).map(|_| ())
     }
 
     /// Renew the lease of an active session after a successful authority refresh.
@@ -2339,13 +3143,24 @@ impl AuthorizationGate {
     /// Returns an error when the intent is not covered or the authority cannot
     /// be refreshed.
     pub fn renew_lease(&self, intent: &EgressIntent, at_us: i64) -> anyhow::Result<()> {
+        self.renew_lease_with(intent, at_us, None)
+    }
+
+    fn renew_lease_with(
+        &self,
+        intent: &EgressIntent,
+        at_us: i64,
+        at: Option<MembershipTime>,
+    ) -> anyhow::Result<()> {
         intent.validate()?;
         let scope = intent.to_scope();
         let mut state = self.lock();
+        let membership = state.membership.clone();
+        let evidence = at.map(|instant| (&membership, instant));
         let Some(index) = state
             .active
             .iter()
-            .position(|item| Self::matches(item, intent))
+            .position(|item| Self::matches(item, intent, evidence))
         else {
             return Err(RightsError::ScopeMismatch {
                 operation: intent.operation.as_str().to_owned(),
@@ -2410,12 +3225,38 @@ impl AuthorizationGate {
     /// # Errors
     /// Returns an error when no active session covers the intent.
     pub fn cancel(&self, intent: &EgressIntent, reason: &str, at_us: i64) -> anyhow::Result<()> {
+        self.cancel_with(intent, reason, at_us, None)
+    }
+
+    /// Cancel a session matched with explicit universe membership evidence.
+    ///
+    /// # Errors
+    /// Returns an error when no active session covers the intent.
+    pub fn cancel_with_membership(
+        &self,
+        intent: &EgressIntent,
+        reason: &str,
+        at_us: i64,
+        at: MembershipTime,
+    ) -> anyhow::Result<()> {
+        self.cancel_with(intent, reason, at_us, Some(at))
+    }
+
+    fn cancel_with(
+        &self,
+        intent: &EgressIntent,
+        reason: &str,
+        at_us: i64,
+        at: Option<MembershipTime>,
+    ) -> anyhow::Result<()> {
         let scope = intent.to_scope();
         let mut state = self.lock();
+        let membership = state.membership.clone();
+        let evidence = at.map(|instant| (&membership, instant));
         let Some(index) = state
             .active
             .iter()
-            .position(|item| Self::matches(item, intent))
+            .position(|item| Self::matches(item, intent, evidence))
         else {
             return Err(RightsError::SessionCancelled {
                 reason: "no matching session".to_owned(),
@@ -2658,6 +3499,20 @@ impl AuthorizationGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Abstract exact universe reference. No market universe is named.
+    fn universe_ref(version: &str, digest: &str) -> UniverseRef {
+        UniverseRef::new(
+            "universe-a",
+            version,
+            digest,
+            "abstract-membership",
+            TimeWindow::default(),
+            TimeWindow::default(),
+            1,
+        )
+        .expect("abstract universe")
+    }
 
     /// Abstract exact request used as the base for mismatch probes. Every
     /// value is supplied explicitly; no command-derived default exists.
@@ -3159,6 +4014,8 @@ mod tests {
         probe.instruments = ScopeSet::NotApplicable;
         probe.fields = ScopeSet::NotApplicable;
         probe.modalities = ScopeSet::NotApplicable;
+        probe.data_time_window = TimeWindow::default();
+        probe.retention = Retention::NONE;
         assert!(
             matches!(
                 registry.authorize(&probe, 1),
@@ -3186,6 +4043,8 @@ mod tests {
             item.instruments = ScopeSet::NotApplicable;
             item.fields = ScopeSet::NotApplicable;
             item.modalities = ScopeSet::NotApplicable;
+            item.data_time_window = TimeWindow::default();
+            item.retention = Retention::NONE;
         }));
         assert!(
             gate.require_egress(&contact, 1).is_err(),
@@ -3546,6 +4405,7 @@ mod tests {
             item.product_id = "product-b".to_owned();
             item.segment = "venue-a-equity-derivatives".to_owned();
             item.operation = Operation::ReferenceDataRetrieval;
+            item.data_object = object(ObjectKind::SourceReferenceRecord, "reference-a", "v1");
         });
         gate.install_scope(
             first.clone(),
@@ -3805,15 +4665,15 @@ mod tests {
             !named_a.contains_all(&ScopeSet::All),
             "Named cannot cover All"
         );
-        let universe_v1 = ScopeSet::<String>::Universe("v1".to_owned());
-        let universe_v2 = ScopeSet::<String>::Universe("v2".to_owned());
+        let universe_v1 = ScopeSet::<String>::Universe(universe_ref("v1", &"a".repeat(64)));
+        let universe_v2 = ScopeSet::<String>::Universe(universe_ref("v2", &"a".repeat(64)));
         assert!(
             !universe_v1.contains_all(&universe_v2),
             "a versioned universe does not cover another version"
         );
         assert!(
-            universe_v1.contains_all(&named_a),
-            "a named subset is inside the declared universe"
+            !universe_v1.contains_all(&named_a),
+            "a named request needs explicit membership evidence"
         );
         let na = ScopeSet::<String>::NotApplicable;
         assert!(
@@ -3837,9 +4697,9 @@ mod tests {
             "capture cannot rely on an unrestricted All"
         );
         let universe = scope_with(|item| {
-            item.instruments = ScopeSet::Universe("v1".to_owned());
-            item.fields = ScopeSet::Universe("v1".to_owned());
-            item.modalities = ScopeSet::Universe("v1".to_owned());
+            item.instruments = ScopeSet::Universe(universe_ref("v1", &"a".repeat(64)));
+            item.fields = ScopeSet::Universe(universe_ref("v1", &"a".repeat(64)));
+            item.modalities = ScopeSet::Universe(universe_ref("v1", &"a".repeat(64)));
         });
         assert!(universe.validate().is_ok(), "a versioned universe is valid");
     }
@@ -3851,6 +4711,8 @@ mod tests {
             item.instruments = ScopeSet::NotApplicable;
             item.fields = ScopeSet::NotApplicable;
             item.modalities = ScopeSet::NotApplicable;
+            item.data_time_window = TimeWindow::default();
+            item.retention = Retention::NONE;
         });
         assert!(
             contact.validate().is_ok(),
@@ -4234,9 +5096,11 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let mut registry = LicensingRegistry::new();
         let granted = scope_with(|item| {
+            item.operation = Operation::RawStorage;
             item.data_object = object(ObjectKind::RawArchive, "archive-a", "v1");
         });
         let extra = scope_with(|item| {
+            item.operation = Operation::RawStorage;
             item.data_object = object(ObjectKind::RawArchive, "archive-b", "v1");
         });
         registry
@@ -4246,6 +5110,7 @@ mod tests {
             .register(permitted_record(&extra))
             .expect("unrelated grant");
         let ungranted = scope_with(|item| {
+            item.operation = Operation::RawStorage;
             item.data_object = object(ObjectKind::RawArchive, "archive-c", "v1");
         });
         assert!(
@@ -4278,6 +5143,7 @@ mod tests {
         let audit = directory.path().join("audit");
         let evaluated = scope_with(|item| {
             item.actor = Actor::NirnayConsumer;
+            item.operation = Operation::InternalAnalytics;
             item.data_object = object(ObjectKind::ResearchDataset, "research-ds-a", "v3");
             item.recipient_class = RecipientClass::Participant;
             item.recipient_identity =
@@ -4371,5 +5237,437 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), 14, "no second producer operation enum exists");
+    }
+
+    const ALL_OPERATIONS: [Operation; 14] = [
+        Operation::SourceContact,
+        Operation::ReferenceDataRetrieval,
+        Operation::HistoricalDataRetrieval,
+        Operation::RealTimeCapture,
+        Operation::RawStorage,
+        Operation::Normalization,
+        Operation::Replay,
+        Operation::Backup,
+        Operation::InternalAnalytics,
+        Operation::DerivedDataCreation,
+        Operation::Display,
+        Operation::ExternalRedistribution,
+        Operation::Retention,
+        Operation::Deletion,
+    ];
+
+    const ALL_KINDS: [ObjectKind; 8] = [
+        ObjectKind::SourceReferenceRecord,
+        ObjectKind::RawSourceRecord,
+        ObjectKind::CanonicalObservation,
+        ObjectKind::RawArchive,
+        ObjectKind::NdcRelease,
+        ObjectKind::ResearchCopy,
+        ObjectKind::ResearchDataset,
+        ObjectKind::DerivedArtifact,
+    ];
+
+    const MEMBERSHIP_TIME: MembershipTime = MembershipTime {
+        data_as_of: 1_000,
+        knowledge_as_of: 2_000,
+    };
+
+    fn abstract_set(requirement: DimensionRequirement) -> ScopeSet<String> {
+        match requirement {
+            DimensionRequirement::NotApplicable | DimensionRequirement::Prohibited => {
+                ScopeSet::NotApplicable
+            }
+            _ => ScopeSet::Named(vec!["member-a".to_owned()]),
+        }
+    }
+
+    fn abstract_modality_set(requirement: DimensionRequirement) -> ScopeSet<Modality> {
+        match requirement {
+            DimensionRequirement::NotApplicable | DimensionRequirement::Prohibited => {
+                ScopeSet::NotApplicable
+            }
+            _ => ScopeSet::Named(vec![Modality::L2]),
+        }
+    }
+
+    /// Build the valid shape declared by the matrix for one permitted pair.
+    fn applicable_scope(operation: Operation, kind: ObjectKind) -> AuthorizationScope {
+        let applicability =
+            applicability_for(operation, kind).expect("permitted action-object pair");
+        scope_with(|item| {
+            item.operation = operation;
+            item.data_object = object(kind, "object-a", "v1");
+            item.instruments = abstract_set(applicability.instruments);
+            item.fields = abstract_set(applicability.fields);
+            item.modalities = abstract_modality_set(applicability.modality);
+            item.data_time_window = match applicability.data_time {
+                DimensionRequirement::NotApplicable | DimensionRequirement::Prohibited => {
+                    TimeWindow::default()
+                }
+                _ => TimeWindow {
+                    from_us: Some(1),
+                    to_us: Some(9),
+                },
+            };
+            item.retention = match applicability.retention {
+                DimensionRequirement::NotApplicable | DimensionRequirement::Prohibited => {
+                    Retention::NONE
+                }
+                _ => Retention::bounded(100),
+            };
+        })
+    }
+
+    fn membership_at(universe: &UniverseRef, member: &str) -> UniverseMembership {
+        UniverseMembership {
+            universe: universe.clone(),
+            member: member.to_owned(),
+            data_as_of: MEMBERSHIP_TIME.data_as_of,
+            knowledge_as_of: MEMBERSHIP_TIME.knowledge_as_of,
+        }
+    }
+
+    fn memberships(facts: Vec<UniverseMembership>) -> UniverseMembershipRegistry {
+        let mut registry = UniverseMembershipRegistry::new();
+        for fact in facts {
+            registry.record(fact).expect("recorded abstract membership");
+        }
+        registry
+    }
+
+    #[test]
+    fn applicability_matrix_covers_every_action_object_pair() {
+        let mut permitted = 0;
+        for operation in ALL_OPERATIONS {
+            for kind in ALL_KINDS {
+                match applicability_for(operation, kind) {
+                    Some(applicability) => {
+                        permitted += 1;
+                        assert_eq!(
+                            applicability.operation, operation,
+                            "matrix entry keeps its operation"
+                        );
+                        assert_eq!(
+                            applicability.data_object_kind, kind,
+                            "matrix entry keeps its object kind"
+                        );
+                        let valid = applicable_scope(operation, kind);
+                        assert_eq!(
+                            valid.validate(),
+                            Ok(()),
+                            "valid shape for {operation:?}/{kind:?}"
+                        );
+                    }
+                    None => {
+                        let invalid = scope_with(|item| {
+                            item.operation = operation;
+                            item.data_object = object(kind, "object-a", "v1");
+                        });
+                        assert!(
+                            matches!(
+                                invalid.validate(),
+                                Err(RightsError::ObjectKindNotApplicable { .. })
+                            ),
+                            "unlisted pair {operation:?}/{kind:?} is prohibited"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(permitted, 26, "all permitted pairs have a valid shape");
+    }
+
+    #[test]
+    fn missing_required_dimension_is_denied() {
+        for field in ["provider_id", "venue", "segment"] {
+            let mut probe =
+                applicable_scope(Operation::RealTimeCapture, ObjectKind::RawSourceRecord);
+            match field {
+                "provider_id" => probe.provider_id.clear(),
+                "venue" => probe.venue.clear(),
+                "segment" => probe.segment.clear(),
+                _ => unreachable!("enumerated abstract field"),
+            }
+            assert!(
+                matches!(
+                    validate_applicability(&probe),
+                    Err(RightsError::MissingField { field: missing }) if missing == field
+                ),
+                "missing {field} is never NotApplicable"
+            );
+        }
+    }
+
+    #[test]
+    fn incorrect_not_applicable_shape_is_denied() {
+        let mut capture = applicable_scope(Operation::RealTimeCapture, ObjectKind::RawSourceRecord);
+        capture.instruments = ScopeSet::NotApplicable;
+        assert_eq!(
+            capture.validate(),
+            Err(RightsError::InvalidScopeSet),
+            "capture instruments cannot be NotApplicable"
+        );
+        let mut contact = applicable_scope(Operation::SourceContact, ObjectKind::RawSourceRecord);
+        assert_eq!(
+            contact.validate(),
+            Ok(()),
+            "source contact has no data scope"
+        );
+        contact.instruments = ScopeSet::Named(vec!["member-a".to_owned()]);
+        assert_eq!(
+            contact.validate(),
+            Err(RightsError::InvalidScopeSet),
+            "source contact cannot name a data scope"
+        );
+    }
+
+    #[test]
+    fn empty_named_set_is_denied() {
+        let mut empty = applicable_scope(Operation::RealTimeCapture, ObjectKind::RawSourceRecord);
+        empty.instruments = ScopeSet::Named(Vec::new());
+        assert_eq!(
+            empty.validate(),
+            Err(RightsError::InvalidScopeSet),
+            "an empty Named set is not All"
+        );
+        assert_eq!(
+            ScopeSet::<String>::default(),
+            ScopeSet::Named(Vec::new()),
+            "the default is empty Named, never All"
+        );
+    }
+
+    #[test]
+    fn explicit_all_is_limited_to_permitted_operations() {
+        let mut capture = applicable_scope(Operation::RealTimeCapture, ObjectKind::RawSourceRecord);
+        capture.instruments = ScopeSet::All;
+        assert_eq!(
+            capture.validate(),
+            Err(RightsError::InvalidScopeSet),
+            "capture cannot rely on an unrestricted All"
+        );
+        let mut display = applicable_scope(Operation::Display, ObjectKind::NdcRelease);
+        display.instruments = ScopeSet::All;
+        assert_eq!(
+            display.validate(),
+            Ok(()),
+            "an explicitly written All is valid only where the matrix allows it"
+        );
+    }
+
+    #[test]
+    fn exact_universe_containment_is_version_and_digest_strict() {
+        let v1 = universe_ref("v1", &"a".repeat(64));
+        let v2 = universe_ref("v2", &"a".repeat(64));
+        let other_digest = universe_ref("v1", &"b".repeat(64));
+        let permitted = ScopeSet::Universe(v1.clone());
+        assert!(
+            permitted.contains_all(&ScopeSet::Universe(v1)),
+            "the same universe reference covers itself"
+        );
+        assert!(
+            !permitted.contains_all(&ScopeSet::Universe(v2)),
+            "another universe version is not covered"
+        );
+        assert!(
+            !permitted.contains_all(&ScopeSet::Universe(other_digest)),
+            "another universe digest is not covered"
+        );
+        assert!(
+            !permitted.contains_all(&ScopeSet::Named(vec!["member-a".to_owned()])),
+            "named membership is never inferred by contains_all"
+        );
+    }
+
+    #[test]
+    fn named_member_inside_and_outside_universe() {
+        let universe = universe_ref("v1", &"a".repeat(64));
+        let mut registry = LicensingRegistry::new()
+            .with_membership(memberships(vec![membership_at(&universe, "member-a")]));
+        let grant = scope_with(|item| item.instruments = ScopeSet::Universe(universe));
+        registry
+            .register(permitted_record(&grant))
+            .expect("universe grant registered");
+        let inside = scope_with(|item| {
+            item.instruments = ScopeSet::Named(vec!["member-a".to_owned()]);
+        });
+        let outside = scope_with(|item| {
+            item.instruments = ScopeSet::Named(vec!["member-b".to_owned()]);
+        });
+        assert!(
+            registry
+                .authorize_with_membership(&inside, 1, MEMBERSHIP_TIME)
+                .is_ok(),
+            "a recorded member is covered at the required instants"
+        );
+        assert!(
+            registry
+                .authorize_with_membership(&outside, 1, MEMBERSHIP_TIME)
+                .is_err(),
+            "a member outside the universe is denied"
+        );
+        assert!(
+            registry.authorize(&inside, 1).is_err(),
+            "without evidence a named request is never admitted"
+        );
+    }
+
+    #[test]
+    fn unknown_membership_denies() {
+        let universe = universe_ref("v1", &"a".repeat(64));
+        let mut registry = LicensingRegistry::new();
+        let grant = scope_with(|item| item.instruments = ScopeSet::Universe(universe));
+        registry
+            .register(permitted_record(&grant))
+            .expect("universe grant registered");
+        let asked = scope_with(|item| {
+            item.instruments = ScopeSet::Named(vec!["member-a".to_owned()]);
+        });
+        assert!(
+            registry
+                .authorize_with_membership(&asked, 1, MEMBERSHIP_TIME)
+                .is_err(),
+            "an unrecorded member cannot be resolved to a universe"
+        );
+    }
+
+    #[test]
+    fn wrong_universe_version_or_digest_denies() {
+        let universe = universe_ref("v1", &"a".repeat(64));
+        let membership = memberships(vec![membership_at(&universe, "member-a")]);
+        let asked = scope_with(|item| {
+            item.instruments = ScopeSet::Named(vec!["member-a".to_owned()]);
+        });
+        for wrong in [
+            universe_ref("v2", &"a".repeat(64)),
+            universe_ref("v1", &"b".repeat(64)),
+        ] {
+            let mut registry = LicensingRegistry::new().with_membership(membership.clone());
+            let grant = scope_with(|item| item.instruments = ScopeSet::Universe(wrong));
+            registry
+                .register(permitted_record(&grant))
+                .expect("universe grant registered");
+            assert!(
+                registry
+                    .authorize_with_membership(&asked, 1, MEMBERSHIP_TIME)
+                    .is_err(),
+                "a different version or digest cannot use the recorded membership"
+            );
+        }
+    }
+
+    #[test]
+    fn historical_membership_mismatch_denies() {
+        let universe = universe_ref("v1", &"a".repeat(64));
+        let mut registry = LicensingRegistry::new()
+            .with_membership(memberships(vec![membership_at(&universe, "member-a")]));
+        let grant = scope_with(|item| item.instruments = ScopeSet::Universe(universe));
+        registry
+            .register(permitted_record(&grant))
+            .expect("universe grant registered");
+        let asked = scope_with(|item| {
+            item.instruments = ScopeSet::Named(vec!["member-a".to_owned()]);
+        });
+        let later_knowledge = MembershipTime {
+            data_as_of: MEMBERSHIP_TIME.data_as_of,
+            knowledge_as_of: MEMBERSHIP_TIME.knowledge_as_of + 1,
+        };
+        let later_data = MembershipTime {
+            data_as_of: MEMBERSHIP_TIME.data_as_of + 1,
+            knowledge_as_of: MEMBERSHIP_TIME.knowledge_as_of,
+        };
+        let present_day = MembershipTime {
+            data_as_of: i64::MAX / 4,
+            knowledge_as_of: i64::MAX / 4,
+        };
+        assert!(
+            registry
+                .authorize_with_membership(&asked, 1, MEMBERSHIP_TIME)
+                .is_ok(),
+            "the recorded historical instants permit"
+        );
+        assert!(
+            registry
+                .authorize_with_membership(&asked, 1, later_knowledge)
+                .is_err(),
+            "a later knowledge instant is not substituted"
+        );
+        assert!(
+            registry
+                .authorize_with_membership(&asked, 1, later_data)
+                .is_err(),
+            "a later data instant is not substituted"
+        );
+        assert!(
+            registry
+                .authorize_with_membership(&asked, 1, present_day)
+                .is_err(),
+            "no present-day symbol resolution is performed"
+        );
+    }
+
+    #[test]
+    fn gate_universe_member_containment_uses_recorded_evidence() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let universe = universe_ref("v1", &"a".repeat(64));
+        let grant_scope =
+            scope_with(|item| item.instruments = ScopeSet::Universe(universe.clone()));
+        let gate = AuthorizationGate::new()
+            .with_membership(memberships(vec![membership_at(&universe, "member-a")]));
+        gate.install_scope(
+            grant_scope.clone(),
+            0,
+            None,
+            &permitted_record(&grant_scope).audit,
+            sink(directory.path()),
+        )
+        .expect("universe proof installed");
+        let inside = intent_for(&scope_with(|item| {
+            item.instruments = ScopeSet::Named(vec!["member-a".to_owned()]);
+        }));
+        assert!(
+            gate.require_egress_with_membership(&inside, 1, MEMBERSHIP_TIME)
+                .is_ok(),
+            "recorded membership permits egress at the required instants"
+        );
+        assert!(
+            gate.require_egress(&inside, 1).is_err(),
+            "egress without membership evidence denies"
+        );
+    }
+
+    #[test]
+    fn audit_event_records_applicability_and_universe_digest() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let audit = directory.path().join("audit");
+        let sink = sink(&audit);
+        let universe = universe_ref("v1", &"a".repeat(64));
+        let scope = scope_with(|item| item.instruments = ScopeSet::Universe(universe));
+        let event = sink
+            .record(&scope, "probe", None, None, 1)
+            .expect("applicability event recorded");
+        assert_eq!(
+            event.applicability_decision,
+            ApplicabilityDecision::Applicable,
+            "the matrix decision is audited"
+        );
+        assert_eq!(
+            event.universe_digest.as_deref(),
+            Some("a".repeat(64).as_str()),
+            "the exact universe digest is audited"
+        );
+        let contact = applicable_scope(Operation::SourceContact, ObjectKind::RawSourceRecord);
+        let contact_event = sink
+            .record(&contact, "probe", None, None, 1)
+            .expect("not-applicable event recorded");
+        assert_eq!(
+            contact_event.applicability_decision,
+            ApplicabilityDecision::NotApplicable,
+            "an absent data scope is distinguished from an invalid one"
+        );
+        assert!(
+            contact_event.universe_digest.is_none(),
+            "a scope without a universe has no universe digest"
+        );
     }
 }

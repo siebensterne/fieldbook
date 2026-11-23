@@ -49,9 +49,12 @@ recipient_identity = "REPLACE_WITH_NAMED_RECIPIENT"
 purpose = "internal_analysis"         # replace with the exact reviewed wording,
                                       # e.g. "proprietary_own_account_trading_research"
 delivery_method = "stream"
-instruments = { universe = "declared-universe-1" } # or { named = [...] } / "not_applicable"
-fields = { universe = "declared-universe-1" }
-modalities = { universe = "declared-universe-1" } # l1, l2, l3, order_by_order
+# A universe is an exact version and digest, not a present-day symbol lookup.
+# Named membership needs recorded evidence at the required data-as-of and
+# knowledge-time instants; an unrecorded member denies.
+instruments = { universe = { universe_id = "declared-universe-1", version = "v1", digest = "0000000000000000000000000000000000000000000000000000000000000000", membership_source = "REPLACE_WITH_MEMBERSHIP_SOURCE", valid_time = {}, knowledge_time = {}, revision = 1 } }
+fields = { universe = { universe_id = "declared-universe-1", version = "v1", digest = "0000000000000000000000000000000000000000000000000000000000000000", membership_source = "REPLACE_WITH_MEMBERSHIP_SOURCE", valid_time = {}, knowledge_time = {}, revision = 1 } }
+modalities = { universe = { universe_id = "declared-universe-1", version = "v1", digest = "0000000000000000000000000000000000000000000000000000000000000000", membership_source = "REPLACE_WITH_MEMBERSHIP_SOURCE", valid_time = {}, knowledge_time = {}, revision = 1 } } # l1, l2, l3, order_by_order
 approved_endpoints = [{ scheme = "wss", host = "venue-a.example", port = 443 }]
 valid_from = 0
 valid_until = 4102444800000000        # effective interval, distinct from data window

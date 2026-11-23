@@ -284,6 +284,7 @@ impl EgressIntent {
         next.instruments = ScopeSet::NotApplicable;
         next.fields = ScopeSet::NotApplicable;
         next.modalities = ScopeSet::NotApplicable;
+        next.data_time_window = TimeWindow::default();
         next.retention_request = Retention::NONE;
         Ok(next)
     }
