@@ -216,8 +216,14 @@ mod tests {
 
     #[test]
     fn offline_capability_declarations_are_conservative() {
-        assert!(!capabilities_for().has_sequence_clock);
-        assert!(!source_capabilities_for().has_sequence_clock);
-        assert!(source_capabilities_for().products.is_empty());
+        assert!(!capabilities_for().has_sequence_clock, "no sequence clock");
+        assert!(
+            !source_capabilities_for().has_sequence_clock,
+            "no source sequence clock"
+        );
+        assert!(
+            source_capabilities_for().products.is_empty(),
+            "no products declared"
+        );
     }
 }

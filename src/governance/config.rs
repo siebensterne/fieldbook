@@ -1070,8 +1070,12 @@ mod tests {
     fn checked_in_examples_parse_and_validate() {
         let settings = Settings::load(Some(Path::new("config.example.toml")))
             .expect("config.example.toml must load");
-        assert_eq!(settings.collector.catalog_mode, CatalogMode::Off);
-        assert!(!settings.output.overwrite);
+        assert_eq!(
+            settings.collector.catalog_mode,
+            CatalogMode::Off,
+            "catalog off"
+        );
+        assert!(!settings.output.overwrite, "overwrite disabled");
         settings.validate().expect("example config must validate");
     }
 
