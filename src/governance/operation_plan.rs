@@ -8,7 +8,9 @@
 //! reauthorized at its own side-effect boundary. A plan is installed atomically:
 //! a later failing step leaves no earlier step authorized.
 
+use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context as _;
 use serde::Deserialize;
@@ -16,11 +18,14 @@ use serde::Serialize;
 
 use crate::{
     config::Settings,
-    egress_intent::{AuthorityRefresh, EgressIntent, InMemoryAuthority},
+    egress_intent::{
+        AUTHORITY_REFRESH_TIMEOUT, CHECKPOINT_INTERVAL, Clock, DecisionTime, EgressIntent,
+        GrantSnapshot, InMemoryAuthority, LEASE_RENEWAL_MARGIN, SystemClock,
+    },
     rights::{
-        Actor, AuditContext, AuthorizationGate, AuthorizationRequest, AuthorizationScope,
-        DataObject, DecisionAuditEvent, Operation, ProofInstallation, RightsContext, RightsError,
-        default_gate,
+        Actor, AuditContext, AuditSink, AuthorizationGate, AuthorizationRequest,
+        AuthorizationScope, DataObject, DecisionAudit, DecisionAuditEvent, Operation,
+        ProofInstallation, RightsContext, RightsError, default_gate,
     },
     time::now_us,
 };
@@ -445,26 +450,42 @@ impl OperationPlan {
     }
 }
 
-fn installation_authority(
-    proof: &crate::rights::AuthorizationProof,
-) -> std::sync::Arc<dyn AuthorityRefresh> {
-    std::sync::Arc::new(InMemoryAuthority::new(
-        proof.registry_revision,
-        proof.grant_snapshot_id.clone(),
-    ))
+/// Retained handle to one authorized plan.
+///
+/// Every step shares one refreshable authority. A runtime revision advance,
+/// revocation or refresh failure on that handle is therefore visible to every
+/// gate checkpoint; no snapshot is frozen at installation time.
+#[derive(Debug, Clone)]
+pub struct PlanAuthorization {
+    pub plan_id: String,
+    pub plan: OperationPlan,
+    pub gate: AuthorizationGate,
+    pub authority: Arc<dyn crate::egress_intent::AuthorityRefresh>,
+    pub live_authority: Arc<InMemoryAuthority>,
+    pub sink: AuditSink,
+    pub lease_id: String,
+    pub lease_duration_us: u64,
+    pub registry_revision: u64,
+    pub snapshots: Vec<String>,
+    pub evidence: DecisionAudit,
+    pub wall_issued_at_us: i64,
+    pub monotonic_issued_at_us: u64,
 }
 
 /// Authorize every step of a plan from the runtime rights file and install the
-/// proofs atomically into the process-wide gate.
+/// proofs atomically into the process-wide gate. The returned handle must be
+/// retained by the long-running session so it can refresh and revoke authority.
 ///
 /// # Errors
 /// Returns the first fail-closed denial. No step is permitted on failure.
-pub fn authorize_plan(settings: &Settings, plan: &mut OperationPlan) -> anyhow::Result<()> {
-    authorize_plan_on(settings, plan, default_gate())
+pub fn authorize_plan(
+    settings: &Settings,
+    plan: &mut OperationPlan,
+) -> anyhow::Result<PlanAuthorization> {
+    authorize_plan_with_clock(settings, plan, default_gate(), &SystemClock)
 }
 
-/// Authorize a plan against a specific gate. Library callers and offline tests
-/// use this instance-scoped form; the binary uses [`authorize_plan`].
+/// Authorize a plan against a specific gate and clock.
 ///
 /// Step decisions and audit references are updated only after the whole batch
 /// commits, so a failed step never marks another step permitted.
@@ -475,7 +496,22 @@ pub fn authorize_plan_on(
     settings: &Settings,
     plan: &mut OperationPlan,
     gate: &AuthorizationGate,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PlanAuthorization> {
+    authorize_plan_with_clock(settings, plan, gate, &SystemClock)
+}
+
+/// Authorize a plan with an injected clock. The wall reading decides contract
+/// validity; the monotonic reading anchors the lease deadline used by the
+/// receive loop.
+///
+/// # Errors
+/// Returns the first fail-closed denial. No step is permitted on failure.
+pub fn authorize_plan_with_clock(
+    settings: &Settings,
+    plan: &mut OperationPlan,
+    gate: &AuthorizationGate,
+    clock: &dyn Clock,
+) -> anyhow::Result<PlanAuthorization> {
     let path = settings.governance.rights_file.as_deref().ok_or_else(|| {
         anyhow::anyhow!(
             "operation plans require a runtime authorization file: set [governance].rights_file or --rights-file"
@@ -490,8 +526,8 @@ pub fn authorize_plan_on(
         step.validate()?;
     }
     let context = RightsContext::load(path, audit_dir)?;
-    let at_us = now_us()?;
-    let mut installations = Vec::with_capacity(plan.steps.len());
+    let time = DecisionTime::from_clock(clock)?;
+    let mut proofs = Vec::with_capacity(plan.steps.len());
     let mut committed = Vec::with_capacity(plan.steps.len());
     for step in &plan.steps {
         let audit_context = AuditContext {
@@ -500,17 +536,55 @@ pub fn authorize_plan_on(
             side_effect_boundary: Some(step.side_effect_boundary.as_str().to_owned()),
             ..AuditContext::default()
         };
-        let (proof, event): (crate::rights::AuthorizationProof, DecisionAuditEvent) =
-            context.authorize_with_context(&step.request.to_scope(), at_us, audit_context)?;
+        let (proof, event): (crate::rights::AuthorizationProof, DecisionAuditEvent) = context
+            .authorize_with_context(&step.request.to_scope(), time.wall_us, audit_context)?;
+        proofs.push(proof);
+        committed.push(event);
+    }
+    anyhow::ensure!(!proofs.is_empty(), "an operation plan has no steps");
+    let registry_revision = proofs[0].registry_revision;
+    let snapshots: Vec<String> = proofs
+        .iter()
+        .map(|proof| proof.grant_snapshot_id.clone())
+        .collect();
+    let lease_duration_us = proofs
+        .iter()
+        .map(|proof| proof.lease_duration_us)
+        .min()
+        .unwrap_or(0);
+    let authority = Arc::new(InMemoryAuthority::new_with_snapshots(
+        registry_revision,
+        snapshots.clone(),
+    ));
+    let authority_refresh: Arc<dyn crate::egress_intent::AuthorityRefresh> = authority.clone();
+    let deadline = time
+        .monotonic_us
+        .map(|now| now.saturating_add(lease_duration_us));
+    let lease_id = GrantSnapshot::new(
+        registry_revision,
+        snapshots[0].clone(),
+        lease_duration_us,
+        time.wall_us,
+    )?
+    .lease_id;
+    let evidence = DecisionAudit {
+        licence_reference: proofs[0].licence_reference.clone(),
+        licence_document_hash: proofs[0].licence_document_hash.clone(),
+        contract_revision: proofs[0].contract_revision,
+        recorded_at_us: proofs[0].at_us,
+        authority: proofs[0].recording_authority.clone(),
+    };
+    let mut installations = Vec::with_capacity(proofs.len());
+    for (index, proof) in proofs.iter().enumerate() {
         installations.push(ProofInstallation {
-            authority: Some(installation_authority(&proof)),
+            authority: Some(authority_refresh.clone()),
             proof: proof.clone(),
             sink: context.sink().clone(),
             plan_id: Some(plan.plan_id.clone()),
-            step_id: Some(step.step_id.clone()),
-            side_effect_boundary: Some(step.side_effect_boundary.as_str().to_owned()),
+            step_id: Some(plan.steps[index].step_id.clone()),
+            side_effect_boundary: Some(plan.steps[index].side_effect_boundary.as_str().to_owned()),
+            lease_deadline_monotonic_us: deadline,
         });
-        committed.push(event);
     }
     // Atomic gate commit. A later duplicate or invalid proof denies the whole
     // plan and leaves no earlier step installed.
@@ -519,7 +593,330 @@ pub fn authorize_plan_on(
         step.decision = PlanDecision::Permitted;
         step.audit_reference = Some(event.event_id);
     }
-    Ok(())
+    let authorized = plan.clone();
+    Ok(PlanAuthorization {
+        plan_id: authorized.plan_id.clone(),
+        plan: authorized,
+        gate: gate.clone(),
+        authority: authority_refresh,
+        live_authority: authority,
+        sink: context.sink().clone(),
+        lease_id,
+        lease_duration_us,
+        registry_revision,
+        snapshots,
+        evidence,
+        wall_issued_at_us: time.wall_us,
+        monotonic_issued_at_us: time.monotonic_us.unwrap_or(0),
+    })
+}
+
+/// Outcome of one authorization checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointOutcome {
+    pub renewed: bool,
+    pub lease_epoch: u64,
+    pub monotonic_deadline_us: Option<u64>,
+}
+
+/// Evidence returned when a session is halted. Counts are the frames and
+/// decoded events read on the connection that were not yet committed by the
+/// coordinator; they are reported, never silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaltOutcome {
+    pub reason: String,
+    pub lease_id: String,
+    pub lease_epoch: u64,
+    pub buffered_frames: u64,
+    pub uncommitted_events: u64,
+    pub cancel_committed: bool,
+}
+
+/// Authorization lifecycle carried by the long-running receive loop.
+#[derive(Debug, Clone)]
+pub struct SessionAuthorization {
+    pub auth: PlanAuthorization,
+    pub clock: Arc<dyn Clock>,
+    pub checkpoint_interval_us: u64,
+    pub refresh_timeout_us: u64,
+    pub renewal_margin_us: u64,
+    next_checkpoint_tick: u64,
+    halted: bool,
+}
+
+impl SessionAuthorization {
+    /// Bind an authorized plan to an injected clock. A fresh authorization is
+    /// mandatory: no session is resumed from persisted gate state.
+    ///
+    /// # Errors
+    /// Returns an error when the plan has no provider-egress step.
+    pub fn new(auth: PlanAuthorization, clock: Arc<dyn Clock>) -> anyhow::Result<Self> {
+        let interval = CHECKPOINT_INTERVAL.as_micros().min(u64::MAX as u128) as u64;
+        let next_checkpoint_tick = clock.monotonic_us().saturating_add(interval);
+        let session = Self {
+            auth,
+            clock,
+            checkpoint_interval_us: interval,
+            refresh_timeout_us: AUTHORITY_REFRESH_TIMEOUT.as_micros().min(u64::MAX as u128) as u64,
+            renewal_margin_us: LEASE_RENEWAL_MARGIN.as_micros().min(u64::MAX as u128) as u64,
+            next_checkpoint_tick,
+            halted: false,
+        };
+        session.primary_intent()?;
+        Ok(session)
+    }
+
+    /// Replace the clock used for abstract timing (test fault injection).
+    #[must_use]
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.next_checkpoint_tick = clock
+            .monotonic_us()
+            .saturating_add(self.checkpoint_interval_us);
+        self.clock = clock;
+        self
+    }
+
+    /// Whether a checkpoint is due on the monotonic timeline.
+    #[must_use]
+    pub fn checkpoint_due(&self) -> bool {
+        self.clock.monotonic_us() >= self.next_checkpoint_tick
+    }
+
+    /// Whether the session has been halted and must never receive again.
+    #[must_use]
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
+    /// The declared provider intent that carries this session's receive scope.
+    fn primary_intent(&self) -> anyhow::Result<EgressIntent> {
+        self.auth
+            .plan
+            .steps
+            .iter()
+            .find_map(|step| match &step.request {
+                PlanRequest::Egress(intent) => Some(intent.clone()),
+                PlanRequest::Local(_) => None,
+            })
+            .context("a receive session requires a declared provider-egress step")
+    }
+
+    fn step_context(&self, step: &PlanStep) -> AuditContext {
+        AuditContext {
+            plan_id: Some(self.auth.plan_id.clone()),
+            step_id: Some(step.step_id.clone()),
+            side_effect_boundary: Some(step.side_effect_boundary.as_str().to_owned()),
+            lease_id: Some(self.auth.lease_id.clone()),
+            grant_identity: Some(format!(
+                "{}#{}",
+                self.auth.snapshots[0], self.auth.registry_revision
+            )),
+            ..AuditContext::default()
+        }
+    }
+
+    /// Run one checkpoint: check the monotonic lease deadline, reauthorize every
+    /// step of the active plan, enforce the refresh timeout, renew if needed,
+    /// then commit the checkpoint audit. Any failure halts the session.
+    ///
+    /// # Errors
+    /// Returns the fail-closed denial that also stops the receive loop.
+    pub fn checkpoint(&mut self) -> anyhow::Result<CheckpointOutcome> {
+        if self.halted {
+            return Err(RightsError::SessionCancelled {
+                reason: "session already halted".to_owned(),
+            }
+            .into());
+        }
+        let time = DecisionTime::from_clock(self.clock.as_ref())?;
+        let intent = self.primary_intent()?;
+        let session = self.auth.gate.session_lease(&intent)?;
+        if time.lease_expired(session.expires_at_us, session.lease_deadline_monotonic_us) {
+            // Commit the authoritative expiry event through the gate before
+            // the final halt record. The gate removes the session in the same
+            // audited transaction.
+            let _ = self
+                .auth
+                .gate
+                .require_egress_with_time(&intent, time, AuditContext::default());
+            let _ = self.halt("authorization lease expired", 0, 0);
+            return Err(RightsError::LeaseExpired.into());
+        }
+
+        let before = self.clock.monotonic_us();
+        for step in &self.auth.plan.steps {
+            require_plan_step_with_time(
+                &self.auth.plan,
+                step.action(),
+                &self.auth.gate,
+                time,
+                self.step_context(step),
+            )?;
+        }
+        let consumed = self.clock.monotonic_us().saturating_sub(before);
+        if consumed > self.refresh_timeout_us {
+            let _ = self.halt("authority refresh timeout", 0, 0);
+            return Err(RightsError::AuthorityRefreshFailed.into());
+        }
+        let mut renewed = false;
+        let remaining = session
+            .lease_deadline_monotonic_us
+            .map(|deadline| deadline.saturating_sub(time.monotonic_us.unwrap_or(0)));
+        if remaining.is_some_and(|value| value <= self.renewal_margin_us) {
+            let step = self
+                .auth
+                .plan
+                .step_for_operation(Operation::RealTimeCapture)
+                .context("renewal requires a capture step")?;
+            let renewal =
+                self.auth
+                    .gate
+                    .renew_lease_with_time(&intent, time, self.step_context(step))?;
+            renewed = true;
+            self.next_checkpoint_tick = renewal
+                .monotonic_deadline_us
+                .unwrap_or_else(|| time.monotonic_us.unwrap_or(0))
+                .min(
+                    self.clock
+                        .monotonic_us()
+                        .saturating_add(self.checkpoint_interval_us),
+                );
+        } else {
+            self.next_checkpoint_tick = self
+                .clock
+                .monotonic_us()
+                .saturating_add(self.checkpoint_interval_us);
+        }
+
+        let scope = intent.to_scope();
+        let checkpoint_step = self
+            .auth
+            .plan
+            .step_for_operation(Operation::RealTimeCapture)
+            .context("checkpoint audit requires a capture step")?;
+        let mut context = self.step_context(checkpoint_step);
+        context.event_kind = Some("checkpoint".to_owned());
+        context.lease_epoch = Some(self.auth.gate.session_lease(&intent)?.lease_epoch);
+        context.lease_expires_at_us = Some(self.auth.gate.session_lease(&intent)?.expires_at_us);
+        context.monotonic_deadline_us = self
+            .auth
+            .gate
+            .session_lease(&intent)?
+            .lease_deadline_monotonic_us;
+        self.auth.sink.record_with_context(
+            &scope,
+            "authorization_checkpoint",
+            None,
+            Some(&self.auth.evidence),
+            time.wall_us,
+            context,
+        )?;
+        let final_session = self.auth.gate.session_lease(&intent)?;
+        Ok(CheckpointOutcome {
+            renewed,
+            lease_epoch: final_session.lease_epoch,
+            monotonic_deadline_us: final_session.lease_deadline_monotonic_us,
+        })
+    }
+
+    /// Stop receive, cancel the session transactionally and commit the final
+    /// audit state. Buffered and uncommitted counts are reported for
+    /// reconciliation; nothing is silently discarded.
+    ///
+    /// # Errors
+    /// Returns an error only when the clock or the primary intent is invalid.
+    pub fn halt(
+        &mut self,
+        reason: &str,
+        buffered_frames: u64,
+        uncommitted_events: u64,
+    ) -> anyhow::Result<HaltOutcome> {
+        let time = DecisionTime::from_clock(self.clock.as_ref())?;
+        let intent = self.primary_intent()?;
+        let session = self.auth.gate.session_lease(&intent).ok();
+        let lease_id = session.as_ref().map_or_else(
+            || self.auth.lease_id.clone(),
+            |value| value.lease_id.clone(),
+        );
+        let lease_epoch = session.as_ref().map_or(0, |value| value.lease_epoch);
+        let cancel_committed = self.auth.gate.cancel(&intent, reason, time.wall_us).is_ok();
+        let step = self
+            .auth
+            .plan
+            .step_for_operation(Operation::RealTimeCapture)
+            .context("halt audit requires a capture step")?;
+        let mut context = self.step_context(step);
+        context.event_kind = Some(
+            if reason.contains("revoke") || reason.contains("authority") {
+                "revocation"
+            } else if reason.contains("lease") {
+                "expiry"
+            } else {
+                "cancellation"
+            }
+            .to_owned(),
+        );
+        context.lease_epoch = Some(lease_epoch);
+        let _ = self.auth.sink.record_with_context(
+            &intent.to_scope(),
+            "session_halted",
+            Some(format!(
+                "{reason}; buffered_frames={buffered_frames}; uncommitted_events={uncommitted_events}"
+            )),
+            Some(&self.auth.evidence),
+            time.wall_us,
+            context,
+        );
+        self.halted = true;
+        Ok(HaltOutcome {
+            reason: reason.to_owned(),
+            lease_id,
+            lease_epoch,
+            buffered_frames,
+            uncommitted_events,
+            cancel_committed,
+        })
+    }
+
+    /// Recheck a widened subscription against the live gate before the worker
+    /// transmits it. Named symbols are an explicit request set; a set outside
+    /// the grant's declared instruments denies before any socket action.
+    ///
+    /// # Errors
+    /// Returns the fail-closed denial from the gate.
+    pub fn recheck_subscription(&self, desired: &BTreeSet<String>) -> anyhow::Result<()> {
+        if self.halted {
+            return Err(RightsError::SessionCancelled {
+                reason: "session already halted".to_owned(),
+            }
+            .into());
+        }
+        let time = DecisionTime::from_clock(self.clock.as_ref())?;
+        let mut intent = self.primary_intent()?;
+        intent.instruments = crate::rights::ScopeSet::Named(desired.iter().cloned().collect());
+        self.auth.gate.check_active_with_time(&intent, time)?;
+        Ok(())
+    }
+
+    /// Reauthorize before resuming after a process restart. A restarted process
+    /// never inherits a live gate: it must install a fresh plan authorization
+    /// and recheck every step against the live authority before activity.
+    ///
+    /// # Errors
+    /// Returns an error when the fresh authorization is stale or denied.
+    pub fn resume(fresh: PlanAuthorization, clock: Arc<dyn Clock>) -> anyhow::Result<Self> {
+        let time = DecisionTime::from_clock(clock.as_ref())?;
+        for step in &fresh.plan.steps {
+            require_plan_step_with_time(
+                &fresh.plan,
+                step.action(),
+                &fresh.gate,
+                time,
+                AuditContext::default(),
+            )?;
+        }
+        Self::new(fresh, clock)
+    }
 }
 
 /// Reauthorize one step immediately before its side effect. This is the
@@ -534,6 +931,36 @@ pub fn require_plan_step(
     operation: Operation,
     gate: &AuthorizationGate,
     at_us: i64,
+) -> anyhow::Result<()> {
+    let metadata = plan
+        .step_for_operation(operation)
+        .map(|step| AuditContext {
+            plan_id: Some(plan.plan_id.clone()),
+            step_id: Some(step.step_id.clone()),
+            side_effect_boundary: Some(step.side_effect_boundary.as_str().to_owned()),
+            ..AuditContext::default()
+        })
+        .unwrap_or_default();
+    require_plan_step_with_time(
+        plan,
+        operation,
+        gate,
+        DecisionTime::wall_only(at_us),
+        metadata,
+    )
+}
+
+/// Reauthorize one step with explicit wall/monotonic decision times and audit
+/// metadata. This is the form used by the long-running checkpoint.
+///
+/// # Errors
+/// Returns the fail-closed denial from the gate.
+pub fn require_plan_step_with_time(
+    plan: &OperationPlan,
+    operation: Operation,
+    gate: &AuthorizationGate,
+    time: DecisionTime,
+    metadata: AuditContext,
 ) -> anyhow::Result<()> {
     let step = plan
         .step_for_operation(operation)
@@ -553,17 +980,9 @@ pub fn require_plan_step(
         }
         .into());
     }
-    let metadata = AuditContext {
-        plan_id: Some(plan.plan_id.clone()),
-        step_id: Some(step.step_id.clone()),
-        side_effect_boundary: Some(step.side_effect_boundary.as_str().to_owned()),
-        ..AuditContext::default()
-    };
     match &step.request {
-        PlanRequest::Egress(intent) => {
-            gate.require_egress_with_plan_context(intent, at_us, metadata)
-        }
-        PlanRequest::Local(scope) => gate.check_scope_active_with_context(scope, at_us, metadata),
+        PlanRequest::Egress(intent) => gate.require_egress_with_time(intent, time, metadata),
+        PlanRequest::Local(scope) => gate.check_scope_active_with_time(scope, time, metadata),
     }
 }
 

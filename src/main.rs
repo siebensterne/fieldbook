@@ -1,6 +1,7 @@
 //! Collector binary entry point.
 
 use std::io::Write;
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::CommandFactory as _;
@@ -10,8 +11,10 @@ use tracing_subscriber::EnvFilter;
 use fieldbook::{
     completeness,
     config::Settings,
-    coordinator, coverage, inspect, journal, latency,
-    operation_plan::{self, PlanRequest},
+    coordinator, coverage,
+    egress_intent::SystemClock,
+    inspect, journal, latency,
+    operation_plan::{self, PlanRequest, SessionAuthorization},
     probe, replay,
     report::write_json_atomic,
     verify,
@@ -44,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         .chain(gated_operations(&command))
         .copied()
         .collect();
+    let mut plan_authorization = None;
     if !required_operations.is_empty() {
         let mut plan = settings.governance.declared_plan.clone().ok_or_else(|| {
             anyhow::anyhow!(
@@ -51,7 +55,9 @@ async fn main() -> anyhow::Result<()> {
             )
         })?;
         plan.require_complete(&required_operations)?;
-        operation_plan::authorize_plan(&settings, &mut plan)?;
+        // Retain the authority handle and the gate for the long-running
+        // session; a checkpoint observes runtime revocation through it.
+        plan_authorization = Some(operation_plan::authorize_plan(&settings, &mut plan)?);
         // Bind the transport to the authorized step, never to a separate
         // declaration that happens to name the same venue.
         for operation in [
@@ -74,7 +80,11 @@ async fn main() -> anyhow::Result<()> {
             // live at the boundary before any archive can be created.
             gate_step(&settings, Operation::RealTimeCapture)?;
             gate_step(&settings, Operation::RawStorage)?;
-            let report = coordinator::run(settings).await?;
+            let authorization = SessionAuthorization::new(
+                plan_authorization.context("collect requires an authorized plan")?,
+                Arc::new(SystemClock),
+            )?;
+            let report = coordinator::run(settings, authorization).await?;
             eprintln!(
                 "collector stopped: {} SBE messages, {} bytes, {} symbols, reason={}",
                 report.writer.messages,
