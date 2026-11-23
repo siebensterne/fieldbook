@@ -13,7 +13,7 @@ data and no replacement synthetic observation.
 
 This is the dated path/hash/size record for the crypto and prediction-market
 product-scope removal. Every SHA-256 and byte size below was measured with
-`shasum -a 256` and `stat -f %z` on the bytes actually removed from this branch
+`shasum -a 256` and `stat -f %z` on the bytes removed from this branch
 head `b0cbf4d`. The Fieldbook retirement manifest measured the same paths at its
 reviewed head `3c3279b`; where a value differs, the intervening RRP-002 PR
 edited that file (for example, removing market-shaped test modules) before this
