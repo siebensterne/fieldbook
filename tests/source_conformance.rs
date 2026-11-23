@@ -27,7 +27,6 @@ use fieldbook::adapter::{
     AccessStatus, HistoricalCapability, Protocol, RecoveryCapability, SourceCapabilityManifest,
     TimestampCapability, Transport,
 };
-use fieldbook::config::ExchangeKind;
 use fieldbook::conformance::{
     ConformanceDeclaration, ConformanceFixture, ExpectedObservation, run_conformance,
 };
@@ -43,9 +42,17 @@ use fieldbook::rights::{
     AuthorizationRecord,   //
     AuthorizationScope,    //
     DecisionAudit,         //
+    DeliveryMethod,        //
+    Licensee,              //
     LicensingRegistry,     //
     Operation,             //
+    Purpose,               //
+    Recipient,             //
+    Retention,             //
     RightDecision,         //
+    ScopeSet,              //
+    TimeWindow,            //
+    UsageMode,             //
     UsageRight,            //
 };
 use fieldbook::taxonomy::{
@@ -183,18 +190,31 @@ fn licensing() -> LicensingRegistry {
     registry
         .register(AuthorizationRecord {
             identity: AuthorizationIdentity {
-                scope: AuthorizationScope::for_exchange(
-                    ExchangeKind::Kalshi,
-                    Operation::InternalAnalytics,
-                )
-                .with(|scope| {
-                    scope.venue = "fixture-provider".to_owned();
-                    scope.provider_id = "fixture-provider".to_owned();
-                    scope.source_id = "fixture-source".to_owned();
-                    scope.dataset_id = "trades".to_owned();
-                    scope.product_id = "trades".to_owned();
-                    scope.usage_right = UsageRight::InternalProcessing;
-                }),
+                scope: AuthorizationScope::request()
+                    .licensee(Licensee::system())
+                    .venue("fixture-provider")
+                    .provider_id("fixture-provider")
+                    .source_id("fixture-source")
+                    .dataset_id("trades")
+                    .product_id("trades")
+                    .segment("conformance-scope")
+                    .territory(CountryCode::new("US").expect("country code"))
+                    .operation(Operation::InternalAnalytics)
+                    .usage_right(UsageRight::InternalProcessing)
+                    .usage_mode(UsageMode::NonDisplay)
+                    .recipient(Recipient::Internal)
+                    .purpose(Purpose::InternalAnalysis)
+                    .delivery_method(DeliveryMethod::File)
+                    .retention(Retention::NONE)
+                    .instruments(ScopeSet::Universe("conformance-universe-1".to_owned()))
+                    .fields(ScopeSet::Universe("conformance-universe-1".to_owned()))
+                    .modalities(ScopeSet::Universe("conformance-universe-1".to_owned()))
+                    .data_time_window(TimeWindow {
+                        from_us: Some(0),
+                        to_us: Some(4_102_444_800_000_000),
+                    })
+                    .build()
+                    .expect("explicit fixture rights"),
                 valid_from: 0,
                 valid_until: Some(200),
             },

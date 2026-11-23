@@ -33,22 +33,23 @@ provider_id = "provider-a"
 source_id = "provider-source"
 dataset_id = "market-data"
 product_id = "market-data-feed"       # the source product, never the command name
-segment = "live-capture"
+segment = "venue-equity-cash"          # the actual venue market segment
 territory = "US"
 operation = "real_time_capture"       # lifecycle vocabulary, not a CLI command
 usage_right = "real_time_access"
 usage_mode = "non_display"            # separate display/non-display concept
 recipient = "internal"
-purpose = "internal_analysis"
+purpose = "internal_analysis"         # replace with the exact reviewed wording,
+                                      # e.g. "proprietary_own_account_trading_research"
 delivery_method = "stream"
-instruments = "all"                   # replace with { only = [...] } to narrow
-fields = "all"
-modalities = "all"                    # l1, l2, l3, order_by_order
+instruments = { universe = "declared-universe-1" } # or { named = [...] } / "not_applicable"
+fields = { universe = "declared-universe-1" }
+modalities = { universe = "declared-universe-1" } # l1, l2, l3, order_by_order
 valid_from = 0
 valid_until = 4102444800000000        # effective interval, distinct from data window
 
 [rights.identity.retention]
-max_age_secs = 86400
+limit = { bounded = 86400 }           # or "none" or "indefinite"
 purge_required = true
 
 [rights.identity.data_time_window]
