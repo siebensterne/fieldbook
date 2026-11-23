@@ -4096,7 +4096,11 @@ mod tests {
         let second = object(ObjectKind::RawArchive, "archive-b", "v1");
         assert_eq!(first.kind, second.kind, "both are raw archives");
         assert_ne!(first, second, "a shared kind is not a shared object");
-        assert_eq!(ObjectKind::RawArchive.as_str(), "raw_archive");
+        assert_eq!(
+            ObjectKind::RawArchive.as_str(),
+            "raw_archive",
+            "archive kind label"
+        );
     }
 
     #[test]
@@ -4303,18 +4307,42 @@ mod tests {
         let event: DecisionAuditEvent =
             serde_json::from_str(&std::fs::read_to_string(path).expect("event text"))
                 .expect("valid event");
-        assert_eq!(event.actor, "nirnay_consumer");
-        assert_eq!(event.data_object.kind, ObjectKind::ResearchDataset);
-        assert_eq!(event.data_object.id.as_str(), "research-ds-a");
-        assert_eq!(event.data_object.version.as_str(), "v3");
-        assert_eq!(event.recipient_class, "participant");
-        assert_eq!(event.recipient_identity, "participant-a");
+        assert_eq!(event.actor, "nirnay_consumer", "actor recorded in audit");
         assert_eq!(
-            event.grant_evidence_reference.as_deref(),
-            Some("contract-1#1")
+            event.data_object.kind,
+            ObjectKind::ResearchDataset,
+            "object kind recorded"
         );
-        assert_eq!(event.reference.as_deref(), Some("contract-1"));
-        assert!(event.grant_snapshot_id.is_some());
+        assert_eq!(
+            event.data_object.id.as_str(),
+            "research-ds-a",
+            "object id recorded"
+        );
+        assert_eq!(
+            event.data_object.version.as_str(),
+            "v3",
+            "object version recorded"
+        );
+        assert_eq!(
+            event.recipient_class, "participant",
+            "recipient class recorded"
+        );
+        assert_eq!(
+            event.recipient_identity, "participant-a",
+            "recipient identity recorded"
+        );
+        let evidence_ref = event.grant_evidence_reference.as_deref();
+        assert_eq!(
+            evidence_ref,
+            Some("contract-1#1"),
+            "evidence clause recorded"
+        );
+        assert_eq!(
+            event.reference.as_deref(),
+            Some("contract-1"),
+            "reference recorded"
+        );
+        assert!(event.grant_snapshot_id.is_some(), "snapshot id recorded");
         assert_ne!(
             event.grant_evidence_reference, event.grant_snapshot_id,
             "written evidence and immutable snapshot are separate references"
