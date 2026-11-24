@@ -8,9 +8,9 @@
     "release_identity": {
       "release_id": "conformance-release-2",
       "release_version": "2",
-      "as_of_ns": "2000",
-      "publication_state": "STAGING_CREATED",
-      "created_at_utc_ns": "2100"
+      "as_of_ns": "3000",
+      "publication_state": "AVAILABLE",
+      "created_at_utc_ns": "3100"
     },
     "source_scope": {
       "provider_id": "provider-abstract",
@@ -144,7 +144,7 @@
     },
     "publication_identity": {
       "publisher_identity": "publisher-abstract",
-      "signing_key_id": "conformance-test-key-1",
+      "signing_key_id": "conformance-key-1",
       "signature_reference": "signature.json",
       "archive_reference": "archive-abstract"
     },
@@ -236,7 +236,7 @@
         "supporting_document_references": [
           {
             "reference": "docref-abstract-1",
-            "digest_sha256": "6666666666666666666666666666666666666666666666666666666666666666"
+            "digest_sha256": "7777777777777777777777777777777777777777777777777777777777777777"
           }
         ],
         "contract_revision": "review-abstract-1",
@@ -289,7 +289,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-1",
@@ -306,7 +306,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-2",
@@ -323,7 +323,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-3",
@@ -340,7 +340,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-4",
@@ -357,7 +357,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-5",
@@ -374,7 +374,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-6",
@@ -391,7 +391,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-7",
@@ -408,7 +408,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-8",
@@ -425,7 +425,7 @@
         "count_basis": "count-basis-abstract",
         "missing_count": 1,
         "rejected_count": 0,
-        "as_of_ns": "2000",
+        "as_of_ns": "3000",
         "gaps": [
           {
             "gap_id": "gap-abstract-9",
