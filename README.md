@@ -93,6 +93,9 @@ rather than a rewrite of history.
 - [Bottom-up directory durability](docs/fb-pub-019-directory-durability-2026-11-24.md)
   — FB-PUB-019 journal schema v2, directory-entry and tree barriers, legacy
   compatibility rule and gate record.
+- [Restart-independent publication recovery](docs/fb-pub-020-restart-independent-recovery-2026-11-24.md)
+  — FB-PUB-020 immutable intent, v2 intent binding, fresh-process recovery and
+  quarantine rule with gate record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)

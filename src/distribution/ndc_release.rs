@@ -33,6 +33,13 @@
 //! process-crash evidence on the declared filesystem. It is not an OS-crash or
 //! power-loss qualification (P-D1) until the filesystem is qualified.
 //!
+//! Before any release-root change the builder syncs an immutable intent that
+//! carries the full artifact inventory, every receipt field and the sidecar
+//! digest. Every schema-v2 journal record binds the intent digest. Recovery
+//! therefore rebuilds its evidence from the ledger and the release tree; a
+//! fresh process needs no heap state from the interrupted publisher. A rename
+//! without durable ownership evidence stays quarantined without a receipt.
+//!
 //! Non-claim: a signature proves publisher-key control over exact signed
 //! bytes. It proves no source authenticity, coverage, right, dataset
 //! entitlement or observation truth.
@@ -45,6 +52,7 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
 use std::path::Path;
 use std::path::PathBuf;
@@ -56,6 +64,7 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::Verifier as _;
 use ed25519_dalek::VerifyingKey;
 use flate2::Compression as GzipCompression;
+use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::Deserialize;
 use serde::Serialize;
@@ -89,6 +98,12 @@ pub const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 /// Predecessor digest bound to the first record of a journal chain.
 pub const JOURNAL_GENESIS_DIGEST: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Layout version of the immutable intent persisted before any v2 claim.
+pub const INTENT_SCHEMA_VERSION: u32 = 2;
+
+/// Canonical wire mapping profile bound into every v2 publication intent.
+pub const INTENT_WIRE_PROFILE: &str = "NDC-V2-PROFILE-1";
 
 /// Sidecar signature algorithm literal.
 pub const SIGNATURE_ALGORITHM: &str = "Ed25519";
@@ -222,6 +237,11 @@ pub enum RecoveryOutcome {
     RecoveredPublished,
     /// A matching receipt and availability marker were already present.
     AlreadyAvailable,
+    /// Durable evidence cannot prove ownership; the operation is quarantined.
+    ///
+    /// Recovery preserved every durable record and wrote no receipt or marker.
+    /// An operator must reconcile the operation before any new attempt.
+    UncertainPublicationQuarantined,
 }
 
 /// State in the ratified publication state machine.
@@ -432,6 +452,12 @@ pub struct PublicationOperation {
     pub supersedes_release_id: Option<String>,
     /// Digest of the expected receipt bytes bound into this journal chain.
     pub expected_receipt_sha256: String,
+    /// Digest of the immutable v2 intent bound into this chain.
+    ///
+    /// Schema-v1 records omit this member; its absence preserves their
+    /// published canonical bytes and digest inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent_sha256: Option<String>,
     /// Stage recorded by this evidence file.
     pub stage: PublicationState,
     /// Digest of this record's canonical bytes, excluding this member.
@@ -461,6 +487,123 @@ pub struct PublicationEvidence {
     pub expected_receipt: PublicationReceipt,
     /// Digest of the exact receipt bytes committed by the builder.
     pub receipt_sha256: String,
+}
+
+/// Record-order profile as persisted in an immutable v2 intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum IntentRecordOrderProfile {
+    /// Sequenced key domain and epoch.
+    Sequenced {
+        /// Sequence domain identity.
+        sequence_domain: String,
+        /// Epoch or session-reset identity.
+        sequence_epoch: String,
+    },
+    /// Unsequenced reference order.
+    Reference,
+}
+
+/// One persisted artifact descriptor with its exact committed digests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntentArtifact {
+    /// Logical partition identity.
+    pub logical_partition_id: String,
+    /// Shard ordinal within the logical partition.
+    pub shard_ordinal: u32,
+    /// Release-relative POSIX artifact path.
+    pub path: String,
+    /// Declared record ordering profile.
+    pub record_order_profile: IntentRecordOrderProfile,
+    /// Declared record encoding.
+    pub encoding: String,
+    /// Declared compression mode.
+    pub compression: String,
+    /// Declared compression version.
+    pub compression_version: String,
+    /// Exact stored byte count.
+    pub stored_bytes: u64,
+    /// Digest of the exact stored bytes.
+    pub stored_sha256: String,
+    /// Exact uncompressed byte count.
+    pub uncompressed_bytes: u64,
+    /// Digest of the exact uncompressed canonical stream.
+    pub uncompressed_sha256: String,
+    /// Exact record count.
+    pub record_count: u64,
+}
+
+impl From<&ArtifactDescriptor> for IntentArtifact {
+    fn from(value: &ArtifactDescriptor) -> Self {
+        let profile = match &value.record_order_profile {
+            RecordOrderProfile::Sequenced {
+                sequence_domain,
+                sequence_epoch,
+            } => IntentRecordOrderProfile::Sequenced {
+                sequence_domain: sequence_domain.clone(),
+                sequence_epoch: sequence_epoch.clone(),
+            },
+            RecordOrderProfile::Reference => IntentRecordOrderProfile::Reference,
+        };
+        Self {
+            logical_partition_id: value.logical_partition_id.clone(),
+            shard_ordinal: value.shard_ordinal,
+            path: value.path.clone(),
+            record_order_profile: profile,
+            encoding: value.encoding.clone(),
+            compression: value.compression.clone(),
+            compression_version: value.compression_version.clone(),
+            stored_bytes: value.stored_bytes,
+            stored_sha256: value.stored_sha256.clone(),
+            uncompressed_bytes: value.uncompressed_bytes,
+            uncompressed_sha256: value.uncompressed_sha256.clone(),
+            record_count: value.record_count,
+        }
+    }
+}
+
+/// Immutable v2 publication intent written before any release-root change.
+///
+/// The intent is the sole durable source of the complete recovery inventory.
+/// It binds every field a fresh process needs to rebuild the expected receipt,
+/// validate the release tree and verify operation ownership. No private key,
+/// secret or live credential appears in this record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationIntentV2 {
+    /// Intent layout version.
+    pub schema_version: u32,
+    /// Unique publication operation identifier.
+    pub operation_id: String,
+    /// Immutable release identity.
+    pub release_id: String,
+    /// Digest of the canonical manifest bytes.
+    pub manifest_sha256: String,
+    /// Digest of the canonical signature sidecar bytes.
+    pub sidecar_sha256: String,
+    /// Dataset digest over ordered uncompressed streams.
+    pub data_sha256: String,
+    /// Commit position bound into the receipt.
+    pub commit_position: String,
+    /// Staging directory path relative to the publication root.
+    pub staging_directory: String,
+    /// Final release directory path relative to the publication root.
+    pub final_directory: String,
+    /// Immediate predecessor release, when this is a correction.
+    pub supersedes_release_id: Option<String>,
+    /// Complete expected receipt with every ratified field.
+    pub expected_receipt: PublicationReceipt,
+    /// Digest of the exact expected receipt bytes.
+    pub expected_receipt_sha256: String,
+    /// Full artifact inventory with stored and uncompressed digests.
+    pub artifacts: Vec<IntentArtifact>,
+    /// Canonical wire mapping profile literal.
+    pub wire_profile: String,
+    /// Bound resource profile identifier.
+    pub resource_profile: String,
+    /// Digest of this intent's canonical bytes, excluding this member.
+    pub intent_sha256: String,
 }
 
 /// Typed resource policy. Every numeric maximum is supplied by the caller;
@@ -1099,9 +1242,10 @@ impl PublicationOperation {
 
 impl ToJcs for PublicationOperation {
     /// Canonical digest input for this record. The checksum member is excluded
-    /// so the digest remains self-consistency free.
+    /// so the digest remains self-consistency free. Schema-v2 records carry the
+    /// intent digest; schema-v1 records keep their published member set.
     fn to_jcs(&self) -> Result<JcsValue, ProducerError> {
-        Ok(jcs_object(vec![
+        let mut entries = vec![
             (
                 "schema_version",
                 jcs_integer(u64::from(self.schema_version))?,
@@ -1129,7 +1273,122 @@ impl ToJcs for PublicationOperation {
                 "expected_receipt_sha256",
                 jcs_string(self.expected_receipt_sha256.clone()),
             ),
-            ("stage", self.stage.to_jcs()?),
+        ];
+        if self.schema_version == JOURNAL_SCHEMA_VERSION {
+            let digest = self.intent_sha256.as_ref().ok_or_else(|| {
+                ProducerError::PublicationJournal(
+                    "a schema-v2 journal record lacks its intent digest".to_owned(),
+                )
+            })?;
+            entries.push(("intent_sha256", jcs_string(digest.clone())));
+        }
+        entries.push(("stage", self.stage.to_jcs()?));
+        Ok(jcs_object(entries))
+    }
+}
+
+impl ToJcs for IntentRecordOrderProfile {
+    fn to_jcs(&self) -> Result<JcsValue, ProducerError> {
+        match self {
+            Self::Sequenced {
+                sequence_domain,
+                sequence_epoch,
+            } => Ok(jcs_object(vec![
+                ("kind", jcs_string("sequenced")),
+                ("sequence_domain", jcs_string(sequence_domain.clone())),
+                ("sequence_epoch", jcs_string(sequence_epoch.clone())),
+            ])),
+            Self::Reference => Ok(jcs_object(vec![("kind", jcs_string("reference"))])),
+        }
+    }
+}
+
+impl ToJcs for IntentArtifact {
+    fn to_jcs(&self) -> Result<JcsValue, ProducerError> {
+        Ok(jcs_object(vec![
+            (
+                "logical_partition_id",
+                jcs_string(self.logical_partition_id.clone()),
+            ),
+            ("shard_ordinal", jcs_integer(u64::from(self.shard_ordinal))?),
+            ("path", jcs_string(self.path.clone())),
+            ("record_order_profile", self.record_order_profile.to_jcs()?),
+            ("encoding", jcs_string(self.encoding.clone())),
+            ("compression", jcs_string(self.compression.clone())),
+            (
+                "compression_version",
+                jcs_string(self.compression_version.clone()),
+            ),
+            ("stored_bytes", jcs_integer(self.stored_bytes)?),
+            ("stored_sha256", jcs_string(self.stored_sha256.clone())),
+            ("uncompressed_bytes", jcs_integer(self.uncompressed_bytes)?),
+            (
+                "uncompressed_sha256",
+                jcs_string(self.uncompressed_sha256.clone()),
+            ),
+            ("record_count", jcs_integer(self.record_count)?),
+        ]))
+    }
+}
+
+impl PublicationIntentV2 {
+    /// Canonical JSON for the on-disk intent, including its own digest.
+    fn to_jcs_record(&self) -> Result<JcsValue, ProducerError> {
+        let JcsValue::Object(mut entries) = self.to_jcs()? else {
+            return Err(ProducerError::PublicationEvidence(
+                "publication intent does not canonicalize to an object".to_owned(),
+            ));
+        };
+        entries.push((
+            "intent_sha256".to_owned(),
+            jcs_string(self.intent_sha256.clone()),
+        ));
+        Ok(JcsValue::Object(entries))
+    }
+}
+
+impl ToJcs for PublicationIntentV2 {
+    /// Canonical digest input. The self-digest member is excluded.
+    fn to_jcs(&self) -> Result<JcsValue, ProducerError> {
+        Ok(jcs_object(vec![
+            (
+                "schema_version",
+                jcs_integer(u64::from(self.schema_version))?,
+            ),
+            ("operation_id", jcs_string(self.operation_id.clone())),
+            ("release_id", jcs_string(self.release_id.clone())),
+            ("manifest_sha256", jcs_string(self.manifest_sha256.clone())),
+            ("sidecar_sha256", jcs_string(self.sidecar_sha256.clone())),
+            ("data_sha256", jcs_string(self.data_sha256.clone())),
+            ("commit_position", jcs_string(self.commit_position.clone())),
+            (
+                "staging_directory",
+                jcs_string(self.staging_directory.clone()),
+            ),
+            ("final_directory", jcs_string(self.final_directory.clone())),
+            (
+                "supersedes_release_id",
+                jcs_option(&self.supersedes_release_id),
+            ),
+            ("expected_receipt", self.expected_receipt.to_jcs()?),
+            (
+                "expected_receipt_sha256",
+                jcs_string(self.expected_receipt_sha256.clone()),
+            ),
+            (
+                "artifacts",
+                JcsValue::Array(
+                    self.artifacts
+                        .iter()
+                        .map(|artifact| artifact.to_jcs())
+                        .collect::<Result<Vec<_>, _>>()?,
+                ),
+            ),
+            ("wire_profile", jcs_string(self.wire_profile.clone())),
+            (
+                "resource_profile",
+                jcs_string(self.resource_profile.clone()),
+            ),
         ]))
     }
 }
@@ -2401,6 +2660,133 @@ fn stage_path(ledger: &Path, operation_id: &str, ordinal: u32) -> PathBuf {
     ledger.join(format!("{operation_id}.stage.{ordinal:04}.json"))
 }
 
+/// Immutable intent file for one operation.
+fn intent_path(ledger: &Path, operation_id: &str) -> PathBuf {
+    ledger.join(format!("{operation_id}.intent.json"))
+}
+
+/// Digest of the canonical intent bytes with the self-digest member excluded.
+fn intent_checksum(
+    intent: &PublicationIntentV2,
+    policy: &ResourcePolicy,
+) -> Result<String, ProducerError> {
+    Ok(hex_encode(&sha256(&canonicalize_strict(
+        &intent.to_jcs()?,
+        policy,
+    )?)))
+}
+
+/// Canonical on-disk intent bytes with one trailing LF.
+fn intent_file_bytes(
+    intent: &PublicationIntentV2,
+    policy: &ResourcePolicy,
+) -> Result<Vec<u8>, ProducerError> {
+    let mut bytes = canonicalize_strict(&intent.to_jcs_record()?, policy)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Commit the immutable intent before any journal stage or release-root entry.
+fn write_intent(
+    ledger: &Path,
+    intent: &PublicationIntentV2,
+    policy: &ResourcePolicy,
+    fs: &dyn PublicationFs,
+) -> Result<(), ProducerError> {
+    let bytes = intent_file_bytes(intent, policy)?;
+    fs.commit_intent(&intent_path(ledger, &intent.operation_id), &bytes, ledger)
+}
+
+/// Load and verify one immutable intent from durable ledger state.
+fn load_intent(
+    ledger: &Path,
+    operation_id: &str,
+    policy: &ResourcePolicy,
+) -> Result<Option<PublicationIntentV2>, ProducerError> {
+    let path = intent_path(ledger, operation_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path)
+        .map_err(|error| io_error(&format!("read intent {}", path.display()), error))?;
+    let intent: PublicationIntentV2 = serde_json::from_slice(&bytes).map_err(|error| {
+        ProducerError::PublicationEvidence(format!("invalid intent evidence: {error}"))
+    })?;
+    if intent.schema_version != INTENT_SCHEMA_VERSION {
+        return Err(ProducerError::PublicationEvidence(format!(
+            "intent declares schema version {} instead of {}",
+            intent.schema_version, INTENT_SCHEMA_VERSION
+        )));
+    }
+    if intent.operation_id != operation_id {
+        return Err(ProducerError::PublicationEvidence(format!(
+            "intent declares operation {} instead of {operation_id}",
+            intent.operation_id
+        )));
+    }
+    if intent.intent_sha256 != intent_checksum(&intent, policy)? {
+        return Err(ProducerError::PublicationEvidence(
+            "intent digest differs from its canonical bytes".to_owned(),
+        ));
+    }
+    if bytes != intent_file_bytes(&intent, policy)? {
+        return Err(ProducerError::PublicationEvidence(
+            "intent is not in canonical on-disk representation".to_owned(),
+        ));
+    }
+    Ok(Some(intent))
+}
+
+/// Stable identifier derived from every caller-supplied policy bound.
+fn resource_profile_id(policy: &ResourcePolicy) -> String {
+    let mut material = Vec::new();
+    for bound in [
+        policy.max_manifest_bytes,
+        policy.max_artifact_count,
+        policy.max_stored_bytes_per_artifact,
+        policy.max_uncompressed_bytes_per_artifact,
+        policy.max_total_stored_bytes,
+        policy.max_total_uncompressed_bytes,
+        policy.max_record_bytes,
+        policy.max_records_per_artifact,
+        policy.max_path_component_bytes,
+    ] {
+        material.extend_from_slice(&bound.to_be_bytes());
+    }
+    for bound in [
+        policy.max_nesting_depth,
+        policy.max_object_members,
+        policy.max_array_elements,
+    ] {
+        material.extend_from_slice(&bound.to_be_bytes());
+    }
+    material.extend_from_slice(&policy.max_sidecar_bytes.to_be_bytes());
+    format!("resource-policy-sha256:{}", hex_encode(&sha256(&material)))
+}
+
+/// Rebuild the caller-retained evidence shape from an immutable intent.
+fn evidence_from_intent(intent: &PublicationIntentV2) -> PublicationEvidence {
+    PublicationEvidence {
+        release_id: intent.release_id.clone(),
+        manifest_sha256: intent.manifest_sha256.clone(),
+        data_sha256: intent.data_sha256.clone(),
+        publication_operation_id: intent.operation_id.clone(),
+        commit_position: intent.commit_position.clone(),
+        artifact_paths: intent
+            .artifacts
+            .iter()
+            .map(|item| item.path.clone())
+            .collect(),
+        artifact_stored_sha256: intent
+            .artifacts
+            .iter()
+            .map(|item| item.stored_sha256.clone())
+            .collect(),
+        expected_receipt: intent.expected_receipt.clone(),
+        receipt_sha256: intent.expected_receipt_sha256.clone(),
+    }
+}
+
 /// Digest of the canonical record bytes with the checksum member excluded.
 fn journal_checksum(
     operation: &PublicationOperation,
@@ -2618,6 +3004,17 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
         {
             return Err(ProducerError::PublicationJournal(format!(
                 "stage {ordinal} conflicts with the lineage at ordinal 0"
+            )));
+        }
+        if operation.schema_version == JOURNAL_SCHEMA_VERSION {
+            if operation.intent_sha256.is_none() || operation.intent_sha256 != first.intent_sha256 {
+                return Err(ProducerError::PublicationJournal(format!(
+                    "stage {ordinal} does not carry the chain intent digest"
+                )));
+            }
+        } else if operation.intent_sha256.is_some() {
+            return Err(ProducerError::PublicationJournal(format!(
+                "legacy stage {ordinal} carries a schema-v2 intent digest"
             )));
         }
         let expected_state = order.get(index).ok_or_else(|| {
@@ -2874,6 +3271,267 @@ fn validate_artifact_set(
     Ok(())
 }
 
+/// Read one directory descriptor without following a symlink at its own path.
+fn read_no_follow_directory(path: &Path) -> Result<BTreeSet<String>, ProducerError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(&format!("read descriptor {}", path.display()), error))?;
+    if !metadata.file_type().is_dir() {
+        return Err(ProducerError::UncertainPublication(format!(
+            "release descriptor {} is not a real directory",
+            path.display()
+        )));
+    }
+    let mut names = BTreeSet::new();
+    for entry in fs::read_dir(path)
+        .map_err(|error| io_error(&format!("read release {}", path.display()), error))?
+    {
+        let entry = entry.map_err(|error| io_error("read release entry", error))?;
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| io_error(&format!("read entry {}", entry.path().display()), error))?;
+        if !metadata.file_type().is_dir() && !metadata.file_type().is_file() {
+            return Err(ProducerError::UncertainPublication(format!(
+                "release entry {} is neither a directory nor a regular file",
+                entry.path().display()
+            )));
+        }
+        names.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    Ok(names)
+}
+
+/// Read one regular file descriptor without following a symlink at its path.
+fn read_no_follow_regular(path: &Path) -> Result<Vec<u8>, ProducerError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| io_error(&format!("read descriptor {}", path.display()), error))?;
+    if !metadata.file_type().is_file() {
+        return Err(ProducerError::UncertainPublication(format!(
+            "release descriptor {} is not a regular file",
+            path.display()
+        )));
+    }
+    fs::read(path).map_err(|error| io_error(&format!("read {}", path.display()), error))
+}
+
+/// Recover the exact uncompressed stream declared by one artifact descriptor.
+fn decompress_stream(stored: &[u8], compression: &str) -> Result<Vec<u8>, ProducerError> {
+    match compression {
+        COMPRESSION_NONE => Ok(stored.to_vec()),
+        COMPRESSION_GZIP => {
+            let mut decoder = GzDecoder::new(stored);
+            let mut output = Vec::new();
+            decoder
+                .read_to_end(&mut output)
+                .map_err(|error| io_error("decode gzip artifact", error))?;
+            Ok(output)
+        }
+        other => Err(ProducerError::UncertainPublication(format!(
+            "unsupported compression literal {other}"
+        ))),
+    }
+}
+
+/// Resolve one declared artifact path relative to the artifact descriptor root.
+fn descriptor_relative_path(path: &str) -> Result<&str, ProducerError> {
+    path.strip_prefix("artifacts/").ok_or_else(|| {
+        ProducerError::InvalidArtifactPath(
+            path.to_owned(),
+            "declared artifact path is not relative under artifacts/".to_owned(),
+        )
+    })
+}
+
+/// Validate the exact release tree against a verified immutable intent.
+fn validate_intent_tree(
+    directory: &Path,
+    intent: &PublicationIntentV2,
+    policy: &ResourcePolicy,
+) -> Result<(), ProducerError> {
+    let top = read_no_follow_directory(directory)?;
+    let expected_top: BTreeSet<String> = [
+        MANIFEST_FILE_NAME.to_owned(),
+        SIDECAR_FILE_NAME.to_owned(),
+        ARTIFACT_DIRECTORY.to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    if top != expected_top {
+        return Err(ProducerError::UncertainPublication(format!(
+            "release {} has an unexpected top-level tree",
+            intent.release_id
+        )));
+    }
+    let manifest_bytes = read_no_follow_regular(&directory.join(MANIFEST_FILE_NAME))?;
+    if hex_encode(&sha256(&manifest_bytes)) != intent.manifest_sha256 {
+        return Err(ProducerError::UncertainPublication(
+            "manifest digest disagrees with the verified intent".to_owned(),
+        ));
+    }
+    let sidecar_bytes = read_no_follow_regular(&directory.join(SIDECAR_FILE_NAME))?;
+    if hex_encode(&sha256(&sidecar_bytes)) != intent.sidecar_sha256 {
+        return Err(ProducerError::UncertainPublication(
+            "signature sidecar digest disagrees with the verified intent".to_owned(),
+        ));
+    }
+    let artifact_root = directory.join(ARTIFACT_DIRECTORY);
+    let actual = read_no_follow_directory(&artifact_root)?;
+    let mut expected = BTreeSet::new();
+    for descriptor in &intent.artifacts {
+        validate_artifact_path(&descriptor.path, policy)?;
+        let relative = descriptor_relative_path(&descriptor.path)?;
+        expected.insert(relative.to_owned());
+        let bytes = read_no_follow_regular(&artifact_root.join(relative))?;
+        let stored_length = u64::try_from(bytes.len()).map_err(|_| {
+            ProducerError::PolicyExceeded("artifact stream exceeds addressable length".to_owned())
+        })?;
+        if stored_length != descriptor.stored_bytes
+            || hex_encode(&sha256(&bytes)) != descriptor.stored_sha256
+        {
+            return Err(ProducerError::UncertainPublication(format!(
+                "stored artifact {relative} disagrees with the verified intent"
+            )));
+        }
+        let uncompressed = decompress_stream(&bytes, &descriptor.compression)?;
+        let plain_length = u64::try_from(uncompressed.len()).map_err(|_| {
+            ProducerError::PolicyExceeded("artifact stream exceeds addressable length".to_owned())
+        })?;
+        if plain_length != descriptor.uncompressed_bytes
+            || hex_encode(&sha256(&uncompressed)) != descriptor.uncompressed_sha256
+        {
+            return Err(ProducerError::UncertainPublication(format!(
+                "uncompressed artifact {relative} disagrees with the verified intent"
+            )));
+        }
+    }
+    if actual != expected {
+        return Err(ProducerError::UncertainPublication(format!(
+            "release {} artifact set differs from the verified inventory",
+            intent.release_id
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a release directory name that is not one safe relative component.
+fn require_single_component(name: &str, label: &str) -> Result<(), ProducerError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err(ProducerError::UncertainPublication(format!(
+            "{label} is not one safe relative directory component"
+        )));
+    }
+    Ok(())
+}
+
+/// All durable evidence needed to reconcile one operation without caller heap.
+struct VerifiedIntentRecovery {
+    /// Rebuilt evidence with the full receipt and artifact inventory.
+    evidence: PublicationEvidence,
+    /// Verified immutable journal chain.
+    stages: Vec<(u32, PublicationOperation)>,
+    /// Last committed operation record.
+    operation: PublicationOperation,
+    /// Verified immutable intent.
+    intent: PublicationIntentV2,
+}
+
+/// Verify intent, chain, tree and receipt order before any recovery write.
+fn verify_durable_intent(
+    root: &Path,
+    ledger: &Path,
+    operation_id: &str,
+    policy: &ResourcePolicy,
+    intent: PublicationIntentV2,
+) -> Result<VerifiedIntentRecovery, ProducerError> {
+    if intent.wire_profile != INTENT_WIRE_PROFILE
+        || intent.resource_profile != resource_profile_id(policy)
+    {
+        return Err(ProducerError::UncertainPublication(
+            "intent profile disagrees with the declared profiles".to_owned(),
+        ));
+    }
+    if intent.staging_directory != staging_name(operation_id)
+        || intent.final_directory != intent.release_id
+    {
+        return Err(ProducerError::UncertainPublication(
+            "intent does not bind the declared staging and final directories".to_owned(),
+        ));
+    }
+    require_single_component(&intent.staging_directory, "staging directory")?;
+    require_single_component(&intent.final_directory, "final directory")?;
+
+    let stages = read_stage_operations(ledger, operation_id, policy)?;
+    if stages.is_empty() {
+        return Err(ProducerError::UncertainPublication(
+            "a durable intent without journal stages cannot prove ownership".to_owned(),
+        ));
+    }
+    let evidence = evidence_from_intent(&intent);
+    validate_stage_history(&stages, &evidence)?;
+    for (ordinal, operation) in &stages {
+        if operation.intent_sha256.as_deref() != Some(intent.intent_sha256.as_str()) {
+            return Err(ProducerError::UncertainPublication(format!(
+                "stage {ordinal} does not bind the verified intent"
+            )));
+        }
+    }
+    let receipt = recovery_receipt(&evidence);
+    let receipt_bytes = receipt_file_bytes(&receipt, policy)?;
+    if hex_encode(&sha256(&receipt_bytes)) != intent.expected_receipt_sha256 {
+        return Err(ProducerError::UncertainPublication(
+            "expected receipt bytes cannot be reconstructed from durable evidence".to_owned(),
+        ));
+    }
+    let operation = stages
+        .last()
+        .map(|(_, staged)| staged.clone())
+        .ok_or_else(|| {
+            ProducerError::UncertainPublication("no durable stage to reconcile".to_owned())
+        })?;
+
+    let final_dir = root.join(&intent.final_directory);
+    let staging = root.join(&intent.staging_directory);
+    if final_dir.exists() {
+        validate_intent_tree(&final_dir, &intent, policy)?;
+        verify_operation_identity(&final_dir, &evidence, &operation, ledger, policy)?;
+    } else if staging.exists() {
+        validate_intent_tree(&staging, &intent, policy)?;
+        if operation.schema_version != JOURNAL_SCHEMA_VERSION
+            || operation.stage.rank() < PublicationState::StagingTreeDurable.rank()
+        {
+            return Err(ProducerError::UncertainPublication(
+                "staging tree lacks a durable v2 tree claim".to_owned(),
+            ));
+        }
+    } else {
+        return Err(ProducerError::UncertainPublication(
+            "neither staging nor final release evidence is present".to_owned(),
+        ));
+    }
+    Ok(VerifiedIntentRecovery {
+        evidence,
+        stages,
+        operation,
+        intent,
+    })
+}
+
+/// Conditions that withhold acknowledgement and preserve durable evidence.
+fn is_quarantine_condition(error: &ProducerError) -> bool {
+    matches!(
+        error,
+        ProducerError::UncertainPublication(_)
+            | ProducerError::PublicationEvidence(_)
+            | ProducerError::PublicationJournal(_)
+            | ProducerError::ArtifactSetMismatch(_)
+            | ProducerError::InvalidArtifactPath(..)
+    )
+}
+
 /// Injection points used by the offline crash-state tests. Production passes
 /// the default value, which enables every transition in sequence.
 #[derive(Debug, Clone, Copy, Default)]
@@ -2997,6 +3655,9 @@ trait PublicationFs {
     /// Sync the parent that carries a provisioned directory entry.
     fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError>;
 
+    /// Commit the immutable intent and sync the ledger entry that carries it.
+    fn commit_intent(&self, path: &Path, bytes: &[u8], ledger: &Path) -> Result<(), ProducerError>;
+
     /// Commit one journal file and sync the ledger entry that carries it.
     fn commit_journal_record(
         &self,
@@ -3032,6 +3693,11 @@ impl PublicationFs for RealPublicationFs {
 
     fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError> {
         sync_directory(parent)
+    }
+
+    fn commit_intent(&self, path: &Path, bytes: &[u8], ledger: &Path) -> Result<(), ProducerError> {
+        write_new_file(path, bytes)?;
+        sync_directory(ledger)
     }
 
     fn commit_journal_record(
@@ -3179,6 +3845,13 @@ fn ensure_sibling_release_paths(staging: &Path, final_dir: &Path) -> Result<(), 
 
 /// Rename a fully synced staging tree with the legacy schema-v1 stage order.
 /// Legacy records stay readable through this path and are not rewritten.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "legacy v1 recovery is retained for the evidence-based compatibility helper"
+    )
+)]
 #[expect(
     clippy::too_many_arguments,
     reason = "the publication boundary carries two paths, operation evidence, a policy, injected faults and a filesystem boundary"
@@ -3490,17 +4163,81 @@ fn recover_final_directory(
     Ok(RecoveryOutcome::RecoveredPublished)
 }
 
-/// Reconcile an interrupted publication from durable operation evidence.
+/// Reconcile an interrupted publication from durable ledger and filesystem
+/// state alone.
+///
+/// The caller supplies only the root, the ledger, the operation id and a
+/// resource policy. No build outcome, publication evidence, build request or
+/// state from the dead process is required. An operation whose durable records
+/// cannot prove ownership is quarantined without a receipt or marker.
 pub fn recover_interrupted(
     root: &Path,
     ledger: &Path,
-    evidence: &PublicationEvidence,
+    operation_id: &str,
     policy: &ResourcePolicy,
 ) -> Result<RecoveryOutcome, ProducerError> {
     let fs = RealPublicationFs;
-    recover_interrupted_inner(root, ledger, evidence, policy, &fs)
+    recover_from_durable_state(root, ledger, operation_id, policy, &fs)
 }
 
+/// Fresh-process recovery path built entirely from persisted evidence.
+fn recover_from_durable_state(
+    root: &Path,
+    ledger: &Path,
+    operation_id: &str,
+    policy: &ResourcePolicy,
+    fs: &dyn PublicationFs,
+) -> Result<RecoveryOutcome, ProducerError> {
+    let intent = match load_intent(ledger, operation_id, policy) {
+        Ok(Some(intent)) => intent,
+        Ok(None) => return Ok(RecoveryOutcome::NoEvidence),
+        Err(error) if is_quarantine_condition(&error) => {
+            return Ok(RecoveryOutcome::UncertainPublicationQuarantined);
+        }
+        Err(error) => return Err(error),
+    };
+    let verified = match verify_durable_intent(root, ledger, operation_id, policy, intent) {
+        Ok(value) => value,
+        Err(error) if is_quarantine_condition(&error) => {
+            return Ok(RecoveryOutcome::UncertainPublicationQuarantined);
+        }
+        Err(error) => return Err(error),
+    };
+    let VerifiedIntentRecovery {
+        evidence,
+        stages,
+        mut operation,
+        intent,
+    } = verified;
+    let final_dir = root.join(&intent.final_directory);
+    if !final_dir.exists() {
+        let staging = root.join(&intent.staging_directory);
+        sync_directory(&staging)?;
+        sync_directory(&staging.join(ARTIFACT_DIRECTORY))?;
+        let receipt = recovery_receipt(&evidence);
+        finalize_publication_v2(
+            root,
+            ledger,
+            &operation,
+            &staging,
+            &final_dir,
+            &receipt,
+            policy,
+            PublicationFaults::default(),
+            fs,
+        )?;
+        return Ok(RecoveryOutcome::RecoveredStaged);
+    }
+    recover_final_directory(root, ledger, &evidence, policy, &mut operation, &stages, fs)
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the evidence-based helper is retained for legacy v1 compatibility tests"
+    )
+)]
 fn recover_interrupted_inner(
     root: &Path,
     ledger: &Path,
@@ -3606,6 +4343,39 @@ fn build_release_inner(
     let prepared = prepare_release(request)?;
     provision_directory(request.ledger_dir, "ledger", fs)?;
     provision_directory(request.release_root, "release root", fs)?;
+    let intent = PublicationIntentV2 {
+        schema_version: INTENT_SCHEMA_VERSION,
+        operation_id: request.operation_id.to_owned(),
+        release_id: prepared.evidence.release_id.clone(),
+        manifest_sha256: prepared.evidence.manifest_sha256.clone(),
+        sidecar_sha256: hex_encode(&sha256(&prepared.sidecar_bytes)),
+        data_sha256: prepared.evidence.data_sha256.clone(),
+        commit_position: request.commit_position.to_owned(),
+        staging_directory: staging_name(request.operation_id),
+        final_directory: prepared.evidence.release_id.clone(),
+        supersedes_release_id: prepared
+            .evidence
+            .expected_receipt
+            .supersedes_release_id
+            .clone(),
+        expected_receipt: prepared.receipt.clone(),
+        expected_receipt_sha256: prepared.evidence.receipt_sha256.clone(),
+        artifacts: prepared
+            .descriptors
+            .iter()
+            .map(IntentArtifact::from)
+            .collect(),
+        wire_profile: INTENT_WIRE_PROFILE.to_owned(),
+        resource_profile: resource_profile_id(request.policy),
+        intent_sha256: String::new(),
+    };
+    let intent_digest = intent_checksum(&intent, request.policy)?;
+    let intent = PublicationIntentV2 {
+        intent_sha256: intent_digest.clone(),
+        ..intent
+    };
+    // The intent file and its ledger entry are synced before the first stage.
+    write_intent(request.ledger_dir, &intent, request.policy, fs)?;
     let mut operation = PublicationOperation {
         schema_version: JOURNAL_SCHEMA_VERSION,
         sequence_number: 0,
@@ -3623,6 +4393,7 @@ fn build_release_inner(
             .supersedes_release_id
             .clone(),
         expected_receipt_sha256: prepared.evidence.receipt_sha256.clone(),
+        intent_sha256: Some(intent_digest),
         stage: PublicationState::OperationIntentDurable,
         record_sha256: String::new(),
     };
@@ -3714,14 +4485,27 @@ impl CanonicalRecord {
 mod tests {
     use std::cell::Cell;
     use std::cell::RefCell;
+    use std::env;
     use std::error::Error as StdError;
     use std::fs;
+    use std::process;
+    use std::process::Command;
 
     use super::*;
     use crate::distribution::ndc_wire;
     use tempfile::TempDir;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Evidence-based recovery for legacy schema-v1 compatibility tests.
+    fn recover_interrupted(
+        root: &Path,
+        ledger: &Path,
+        evidence: &PublicationEvidence,
+        policy: &ResourcePolicy,
+    ) -> Result<RecoveryOutcome, ProducerError> {
+        recover_interrupted_inner(root, ledger, evidence, policy, &RealPublicationFs)
+    }
 
     const SPEC: &str = include_str!(
         "../../docs/specifications/ndc-conformance-producer-spec-example-2026-11-24.json"
@@ -3935,6 +4719,16 @@ mod tests {
             sync_directory(parent)
         }
 
+        fn commit_intent(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            ledger: &Path,
+        ) -> Result<(), ProducerError> {
+            write_new_file(path, bytes)?;
+            sync_directory(ledger)
+        }
+
         fn commit_journal_record(
             &self,
             path: &Path,
@@ -4089,7 +4883,7 @@ mod tests {
         ledger: &Path,
         operation_id: &str,
         faults: PublicationFaults,
-        fs: &RecordingPublicationFs,
+        fs: &dyn PublicationFs,
     ) -> Result<BuildOutcome, ProducerError> {
         let receipts: Vec<PublicationReceipt> = Vec::new();
         let lineage = LineageContext {
@@ -4218,6 +5012,7 @@ mod tests {
             final_directory: evidence.release_id.clone(),
             supersedes_release_id: evidence.expected_receipt.supersedes_release_id.clone(),
             expected_receipt_sha256: evidence.receipt_sha256.clone(),
+            intent_sha256: Some("44".repeat(32)),
             stage: PublicationState::OperationIntentDurable,
             record_sha256: String::new(),
         }
@@ -4236,6 +5031,10 @@ mod tests {
         staged.record_sha256 = String::new();
         if ordinal > 0 {
             let stages = read_stage_operations(ledger, &operation.operation_id, policy)?;
+            staged.intent_sha256 = stages
+                .first()
+                .and_then(|(_, item)| item.intent_sha256.clone())
+                .or(staged.intent_sha256);
             staged.previous_record_sha256 = stages
                 .last()
                 .map(|(_, item)| item.record_sha256.clone())
@@ -4291,6 +5090,7 @@ mod tests {
         clear_stages(ledger, operation_id)?;
         let mut operation = operation_from_evidence(evidence, operation_id);
         operation.schema_version = LEGACY_JOURNAL_SCHEMA_VERSION;
+        operation.intent_sha256 = None;
         operation.stage = states[0];
         let fs = RecordingPublicationFs::new(PublicationFaults::default());
         write_stage_sequence(ledger, &operation, states, &policy, &fs)
@@ -7578,6 +8378,7 @@ mod tests {
         let prior_bytes = fs::read(stage_path(&ledger, "operation-journal-rules", 2))?;
         let prior: PublicationOperation = serde_json::from_slice(&prior_bytes)?;
         unrecognized.previous_record_sha256 = prior.record_sha256;
+        unrecognized.intent_sha256 = prior.intent_sha256.clone();
         write_stage(&ledger, &mut unrecognized, 3, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
@@ -8240,6 +9041,652 @@ mod tests {
         assert!(
             matches!(result, Err(ProducerError::PublicationJournal(_))),
             "a journal chain never mixes schema v1 and schema v2 records"
+        );
+        Ok(())
+    }
+
+    fn durable_chain_bytes(
+        ledger: &Path,
+        operation_id: &str,
+    ) -> Result<Vec<u8>, Box<dyn StdError>> {
+        let mut combined = Vec::new();
+        let mut ordinal = 0_u32;
+        loop {
+            let path = stage_path(ledger, operation_id, ordinal);
+            if !path.exists() {
+                break;
+            }
+            combined.extend_from_slice(&fs::read(path)?);
+            ordinal = ordinal.saturating_add(1);
+        }
+        Ok(combined)
+    }
+
+    #[test]
+    fn intent_is_durable_before_the_first_journal_stage() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (signing, verifying) = test_keys();
+        let manifest = boundary_manifest("release-intent-first");
+        let artifacts = boundary_artifacts(&policy);
+        let faults = PublicationFaults {
+            fail_before_journal_dir_sync_at: Some(1),
+            ..PublicationFaults::default()
+        };
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-intent-first",
+            faults,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the first journal sync failure stops the build"
+        );
+        let intent = load_intent(&ledger, "operation-intent-first", &policy)?;
+        assert!(
+            intent.is_some(),
+            "the verified intent precedes the first journal stage"
+        );
+        let outcome =
+            super::recover_interrupted(&root, &ledger, "operation-intent-first", &policy)?;
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::UncertainPublicationQuarantined,
+            "a journal without a committed stage cannot prove ownership"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_v2_journal_record_binds_the_verified_intent() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (signing, verifying) = test_keys();
+        let manifest = boundary_manifest("release-intent-chain");
+        let artifacts = boundary_artifacts(&policy);
+        build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-intent-chain",
+            PublicationFaults::default(),
+        )?;
+        let intent = load_intent(&ledger, "operation-intent-chain", &policy)?
+            .ok_or_else(|| io::Error::other("the durable intent is absent"))?;
+        let stages = read_stage_operations(&ledger, "operation-intent-chain", &policy)?;
+        assert_eq!(
+            stages.len(),
+            V2_STAGE_ORDER.len(),
+            "the v2 chain commits one record per barrier"
+        );
+        assert!(
+            stages
+                .iter()
+                .all(|(_, item)| item.intent_sha256.as_deref()
+                    == Some(intent.intent_sha256.as_str())),
+            "every v2 record binds the immutable intent digest"
+        );
+        assert_eq!(
+            intent.artifacts.len(),
+            1,
+            "the intent carries the complete artifact inventory"
+        );
+        assert_eq!(
+            intent.wire_profile, INTENT_WIRE_PROFILE,
+            "the intent binds the canonical wire profile"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_recovery_rebuilds_the_receipt_without_caller_memory() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (_, stage) = interrupt_boundary(
+            PublicationFaults {
+                fail_before_rename: true,
+                ..PublicationFaults::default()
+            },
+            "operation-durable",
+            "release-durable",
+            &root,
+            &ledger,
+        )?;
+        assert_eq!(
+            stage,
+            PublicationState::StagingTreeDurable,
+            "the crash follows the durable tree stage"
+        );
+        let first = super::recover_interrupted(&root, &ledger, "operation-durable", &policy)?;
+        assert_eq!(
+            first,
+            RecoveryOutcome::RecoveredStaged,
+            "a complete staging tree finishes from durable evidence alone"
+        );
+        let second = super::recover_interrupted(&root, &ledger, "operation-durable", &policy)?;
+        assert_eq!(
+            second,
+            RecoveryOutcome::AlreadyAvailable,
+            "a repeated recovery observes the durable acknowledgement"
+        );
+        let receipt = load_receipt(&ledger, "release-durable")?
+            .map(|(_, value)| value)
+            .ok_or_else(|| io::Error::other("the durable receipt is absent"))?;
+        assert_eq!(
+            receipt.publication_operation_id, "operation-durable",
+            "the rebuilt receipt binds the recovered operation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_recovery_quarantines_an_unowned_final_directory() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let _ = interrupt_boundary(
+            PublicationFaults {
+                fail_after_rename_before_root_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-unowned",
+            "release-unowned",
+            &root,
+            &ledger,
+        )?;
+        let before = durable_chain_bytes(&ledger, "operation-unowned")?;
+        let outcome = super::recover_interrupted(&root, &ledger, "operation-unowned", &policy)?;
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::UncertainPublicationQuarantined,
+            "a rename without durable ownership evidence is quarantined"
+        );
+        assert_eq!(
+            durable_chain_bytes(&ledger, "operation-unowned")?,
+            before,
+            "quarantine preserves the operation chain"
+        );
+        assert!(
+            root.join("release-unowned").exists(),
+            "quarantine preserves the renamed directory"
+        );
+        assert!(
+            !ledger.join("release-unowned.receipt.json").exists(),
+            "quarantine writes no receipt"
+        );
+        assert!(
+            !ledger.join("release-unowned.available").exists(),
+            "quarantine writes no availability marker"
+        );
+        let (signing, verifying) = test_keys();
+        let retry = build_with_faults(
+            &boundary_manifest("release-unowned"),
+            &boundary_artifacts(&policy),
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-unowned-retry",
+            PublicationFaults::default(),
+        );
+        assert!(
+            matches!(retry, Err(ProducerError::PublicationCollision(_))),
+            "quarantine permits no automatic retry under a new operation id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_recovery_quarantines_manifest_intent_disagreement() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let _ = interrupt_boundary(
+            PublicationFaults {
+                fail_before_rename: true,
+                ..PublicationFaults::default()
+            },
+            "operation-disagreement",
+            "release-disagreement",
+            &root,
+            &ledger,
+        )?;
+        let manifest = root
+            .join(staging_name("operation-disagreement"))
+            .join(MANIFEST_FILE_NAME);
+        fs::write(&manifest, b"{}")?;
+        let outcome =
+            super::recover_interrupted(&root, &ledger, "operation-disagreement", &policy)?;
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::UncertainPublicationQuarantined,
+            "a manifest that disagrees with the intent withholds acknowledgement"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durable_recovery_quarantines_a_corrupt_journal() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let _ = interrupt_boundary(
+            PublicationFaults {
+                fail_before_rename: true,
+                ..PublicationFaults::default()
+            },
+            "operation-corrupt",
+            "release-corrupt",
+            &root,
+            &ledger,
+        )?;
+        fs::write(stage_path(&ledger, "operation-corrupt", 2), b"{}")?;
+        let outcome = super::recover_interrupted(&root, &ledger, "operation-corrupt", &policy)?;
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::UncertainPublicationQuarantined,
+            "a corrupt journal record withholds acknowledgement"
+        );
+        Ok(())
+    }
+
+    const CHILD_MODE_ENV: &str = "FB_PUB020_CHILD_MODE";
+    const CHILD_ROOT_ENV: &str = "FB_PUB020_ROOT";
+    const CHILD_LEDGER_ENV: &str = "FB_PUB020_LEDGER";
+    const CHILD_OPERATION_ENV: &str = "FB_PUB020_OPERATION_ID";
+    const CHILD_RELEASE_ENV: &str = "FB_PUB020_RELEASE_ID";
+    const CHILD_PROFILE_ENV: &str = "FB_PUB020_RESOURCE_PROFILE";
+    const TEST_RESOURCE_PROFILE: &str = "test-policy-v1";
+    const FRESH_PROCESS_TEST: &str =
+        "distribution::ndc_release::tests::fresh_process_recovery_from_durable_state";
+
+    fn policy_for_profile(profile: &str) -> Result<ResourcePolicy, ProducerError> {
+        if profile == TEST_RESOURCE_PROFILE {
+            Ok(test_policy())
+        } else {
+            Err(ProducerError::PolicyExceeded(format!(
+                "unknown resource profile {profile}"
+            )))
+        }
+    }
+
+    /// Filesystem that ends the publisher process at one declared boundary.
+    struct ExitPublicationFs {
+        inner: RealPublicationFs,
+        exit_at_boundary: Option<PublicationBoundary>,
+        exit_after_journal_sync: Option<u32>,
+        journal_syncs: Cell<u32>,
+    }
+
+    impl ExitPublicationFs {
+        fn new(
+            exit_at_boundary: Option<PublicationBoundary>,
+            exit_after_journal_sync: Option<u32>,
+        ) -> Self {
+            Self {
+                inner: RealPublicationFs,
+                exit_at_boundary,
+                exit_after_journal_sync,
+                journal_syncs: Cell::new(0),
+            }
+        }
+    }
+
+    impl PublicationFs for ExitPublicationFs {
+        fn record(&self, event: PublicationRecoveryEvent) {
+            self.inner.record(event);
+        }
+
+        fn boundary(&self, boundary: PublicationBoundary) -> Result<(), ProducerError> {
+            if self.exit_at_boundary == Some(boundary) {
+                println!("FB_PUB020_PUBLISHER_EXIT={boundary:?}");
+                process::exit(0);
+            }
+            self.inner.boundary(boundary)
+        }
+
+        fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError> {
+            self.inner.sync_provisioned_parent(parent)
+        }
+
+        fn commit_intent(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            ledger: &Path,
+        ) -> Result<(), ProducerError> {
+            self.inner.commit_intent(path, bytes, ledger)
+        }
+
+        fn commit_journal_record(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            ledger: &Path,
+        ) -> Result<(), ProducerError> {
+            self.inner.commit_journal_record(path, bytes, ledger)?;
+            let ordinal = self.journal_syncs.get().saturating_add(1);
+            self.journal_syncs.set(ordinal);
+            if self.exit_after_journal_sync == Some(ordinal) {
+                println!("FB_PUB020_PUBLISHER_EXIT=JOURNAL_SYNC_{ordinal}");
+                process::exit(0);
+            }
+            Ok(())
+        }
+
+        fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError> {
+            self.inner.sync_release_parent(root)
+        }
+
+        fn sync_staging_entry_parent(&self, root: &Path) -> Result<(), ProducerError> {
+            self.inner.sync_staging_entry_parent(root)
+        }
+
+        fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
+            self.inner.commit_receipt(path, bytes)
+        }
+
+        fn sync_receipt_ledger(&self, ledger: &Path) -> Result<(), ProducerError> {
+            self.inner.sync_receipt_ledger(ledger)
+        }
+
+        fn commit_availability_marker(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+        ) -> Result<(), ProducerError> {
+            self.inner.commit_availability_marker(path, bytes)
+        }
+    }
+
+    fn child_publish(
+        mode: &str,
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+        release_id: &str,
+    ) -> ! {
+        let policy = test_policy();
+        let manifest = boundary_manifest(release_id);
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let fs = match mode {
+            "before_journal_commit" => {
+                ExitPublicationFs::new(Some(PublicationBoundary::RenameCommitted), None)
+            }
+            "after_staging_commit" => ExitPublicationFs::new(None, Some(3)),
+            "after_rename_commit" => ExitPublicationFs::new(None, Some(4)),
+            _ => process::exit(99),
+        };
+        let _ = build_with_faults_and_fs(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            root,
+            ledger,
+            operation_id,
+            PublicationFaults::default(),
+            &fs,
+        );
+        process::exit(21)
+    }
+
+    fn child_recover(root: &Path, ledger: &Path, operation_id: &str, profile: &str) -> ! {
+        let policy = policy_for_profile(profile).unwrap_or_else(|_| process::exit(22));
+        let outcome = super::recover_interrupted(root, ledger, operation_id, &policy);
+        let label = match outcome {
+            Ok(RecoveryOutcome::NoEvidence) => "NO_EVIDENCE",
+            Ok(RecoveryOutcome::RecoveredStaged) => "RECOVERED_STAGED",
+            Ok(RecoveryOutcome::RecoveredPublished) => "RECOVERED_PUBLISHED",
+            Ok(RecoveryOutcome::AlreadyAvailable) => "ALREADY_AVAILABLE",
+            Ok(RecoveryOutcome::UncertainPublicationQuarantined) => {
+                "UNCERTAIN_PUBLICATION_QUARANTINED"
+            }
+            Err(_) => "ERROR",
+        };
+        println!("FB_PUB020_OUTCOME={label}");
+        process::exit(0)
+    }
+
+    fn fresh_process_child(mode: &str) -> ! {
+        let root = PathBuf::from(env::var(CHILD_ROOT_ENV).unwrap_or_default());
+        let ledger = PathBuf::from(env::var(CHILD_LEDGER_ENV).unwrap_or_default());
+        let operation_id = env::var(CHILD_OPERATION_ENV).unwrap_or_default();
+        let release_id = env::var(CHILD_RELEASE_ENV).unwrap_or_default();
+        match mode {
+            "publish_before" => child_publish(
+                "before_journal_commit",
+                &root,
+                &ledger,
+                &operation_id,
+                &release_id,
+            ),
+            "publish_staging" => child_publish(
+                "after_staging_commit",
+                &root,
+                &ledger,
+                &operation_id,
+                &release_id,
+            ),
+            "publish_rename" => child_publish(
+                "after_rename_commit",
+                &root,
+                &ledger,
+                &operation_id,
+                &release_id,
+            ),
+            "recover" => child_recover(
+                &root,
+                &ledger,
+                &operation_id,
+                &env::var(CHILD_PROFILE_ENV).unwrap_or_default(),
+            ),
+            _ => process::exit(99),
+        }
+    }
+
+    fn spawn_fresh_process(
+        mode: &str,
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+        release_id: &str,
+        profile: &str,
+    ) -> Result<String, Box<dyn StdError>> {
+        let output = Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg(FRESH_PROCESS_TEST)
+            .arg("--nocapture")
+            .env(CHILD_MODE_ENV, mode)
+            .env(CHILD_ROOT_ENV, root)
+            .env(CHILD_LEDGER_ENV, ledger)
+            .env(CHILD_OPERATION_ENV, operation_id)
+            .env(CHILD_RELEASE_ENV, release_id)
+            .env(CHILD_PROFILE_ENV, profile)
+            .output()?;
+        let status = output.status;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            status.success(),
+            "fresh-process child {mode} exited with {status}: {stderr}"
+        );
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn outcome_label(stdout: &str) -> String {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("FB_PUB020_OUTCOME="))
+            .unwrap_or("MISSING")
+            .to_owned()
+    }
+
+    #[test]
+    fn fresh_process_recovery_from_durable_state() -> TestResult {
+        if let Ok(mode) = env::var(CHILD_MODE_ENV) {
+            fresh_process_child(&mode);
+        }
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&ledger)?;
+
+        let missing = spawn_fresh_process(
+            "recover",
+            &root,
+            &ledger,
+            "operation-no-evidence",
+            "release-no-evidence",
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert_eq!(
+            outcome_label(&missing),
+            "NO_EVIDENCE",
+            "a fresh ledger without durable intent yields no evidence"
+        );
+
+        let uncertain = "operation-process-rename";
+        let uncertain_release = "release-process-rename";
+        let publisher = spawn_fresh_process(
+            "publish_before",
+            &root,
+            &ledger,
+            uncertain,
+            uncertain_release,
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert!(
+            publisher.contains("FB_PUB020_PUBLISHER_EXIT=RenameCommitted"),
+            "the publisher exited after the rename syscall before its journal commit"
+        );
+        let quarantined = spawn_fresh_process(
+            "recover",
+            &root,
+            &ledger,
+            uncertain,
+            uncertain_release,
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert_eq!(
+            outcome_label(&quarantined),
+            "UNCERTAIN_PUBLICATION_QUARANTINED",
+            "a fresh process cannot adopt a rename without durable ownership evidence"
+        );
+        assert!(
+            !ledger
+                .join(format!("{uncertain_release}.receipt.json"))
+                .exists(),
+            "quarantine writes no receipt"
+        );
+        assert!(
+            !ledger
+                .join(format!("{uncertain_release}.available"))
+                .exists(),
+            "quarantine writes no availability marker"
+        );
+
+        let staged_operation = "operation-process-staging";
+        let staged_release = "release-process-staging";
+        let staged_publisher = spawn_fresh_process(
+            "publish_staging",
+            &root,
+            &ledger,
+            staged_operation,
+            staged_release,
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert!(
+            staged_publisher.contains("FB_PUB020_PUBLISHER_EXIT=JOURNAL_SYNC_3"),
+            "the publisher exited after the staging-tree journal commit"
+        );
+        let staged = spawn_fresh_process(
+            "recover",
+            &root,
+            &ledger,
+            staged_operation,
+            staged_release,
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert_eq!(
+            outcome_label(&staged),
+            "RECOVERED_STAGED",
+            "a durable staging tree completes publication without caller memory"
+        );
+
+        let operation = "operation-process-recovery";
+        let release = "release-process-recovery";
+        let publisher = spawn_fresh_process(
+            "publish_rename",
+            &root,
+            &ledger,
+            operation,
+            release,
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert!(
+            publisher.contains("FB_PUB020_PUBLISHER_EXIT=JOURNAL_SYNC_4"),
+            "the publisher exited after the rename journal commit was durable"
+        );
+        let first = spawn_fresh_process(
+            "recover",
+            &root,
+            &ledger,
+            operation,
+            release,
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert_eq!(
+            outcome_label(&first),
+            "RECOVERED_PUBLISHED",
+            "a durable rename claim lets a fresh process finish the receipt"
+        );
+        let receipt_path = ledger.join(format!("{release}.receipt.json"));
+        let first_receipt = fs::read(&receipt_path)?;
+        let first_chain = durable_chain_bytes(&ledger, operation)?;
+        let second = spawn_fresh_process(
+            "recover",
+            &root,
+            &ledger,
+            operation,
+            release,
+            TEST_RESOURCE_PROFILE,
+        )?;
+        assert_eq!(
+            outcome_label(&second),
+            "ALREADY_AVAILABLE",
+            "the second recovery observes the durable acknowledgement"
+        );
+        assert_eq!(
+            fs::read(&receipt_path)?,
+            first_receipt,
+            "receipt bytes stay identical across fresh recoveries"
+        );
+        assert_eq!(
+            durable_chain_bytes(&ledger, operation)?,
+            first_chain,
+            "the operation chain stays byte-identical across fresh recoveries"
         );
         Ok(())
     }
