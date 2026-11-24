@@ -4449,6 +4449,12 @@ trait PublicationFs {
 
     /// Create, write and sync one availability marker file.
     fn commit_availability_marker(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError>;
+
+    /// Report a validated staging tree before the final rename claim.
+    ///
+    /// Production leaves this hook empty. The process-termination harness
+    /// ends the publisher process here to cover the validation boundary.
+    fn after_staging_validation(&self) {}
 }
 
 struct RealPublicationFs;
@@ -5229,6 +5235,7 @@ fn build_release_inner(
         Some(&sidecar_sha256),
         request.policy,
     )?;
+    fs.after_staging_validation();
     let final_dir = request.release_root.join(&prepared.evidence.release_id);
     finalize_publication_v2(
         request.release_root,
@@ -10817,7 +10824,10 @@ mod tests {
         Ok(())
     }
 
+    // --- FB-DUR-002 fresh-process publication boundary matrix ---
+
     const CHILD_MODE_ENV: &str = "FB_PUB020_CHILD_MODE";
+    const CHILD_BOUNDARY_ENV: &str = "FB_PUB020_BOUNDARY";
     const CHILD_ROOT_ENV: &str = "FB_PUB020_ROOT";
     const CHILD_LEDGER_ENV: &str = "FB_PUB020_LEDGER";
     const CHILD_OPERATION_ENV: &str = "FB_PUB020_OPERATION_ID";
@@ -10826,6 +10836,217 @@ mod tests {
     const TEST_RESOURCE_PROFILE: &str = "test-policy-v1";
     const FRESH_PROCESS_TEST: &str =
         "distribution::ndc_release::tests::fresh_process_recovery_from_durable_state";
+    const PUBLISHER_EXIT_PREFIX: &str = "FB_PUB020_PUBLISHER_EXIT=";
+    const OUTCOME_PREFIX: &str = "FB_PUB020_OUTCOME=";
+    const COMMIT_POSITION: &str = "position-1";
+
+    /// Point in the real publisher path where a child ends its process.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ExitPoint {
+        /// Before any intent byte or ledger entry is written.
+        BeforeIntent,
+        /// After the intent file is created and written, before its sync.
+        IntentFileWritten,
+        /// After the intent file sync, before the ledger directory sync.
+        IntentFileSynced,
+        /// After the intent ledger directory sync, before the first stage.
+        IntentLedgerSynced,
+        /// After one declared filesystem boundary.
+        FsBoundary(PublicationBoundary),
+        /// After the numbered journal commit, counted from one.
+        JournalCommit(u32),
+        /// After staging validation and before the rename claim.
+        StagingValidated,
+    }
+
+    /// One durable boundary exercised by a fresh publisher child process.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct SubprocessBoundary {
+        /// Environment value and publisher exit marker for this boundary.
+        name: &'static str,
+        /// Durable-evidence outcome expected from a recovery child.
+        expected: RecoveryOutcome,
+        /// Point where the publisher child terminates.
+        exit: ExitPoint,
+    }
+
+    /// Boundary matrix fixed before any test in this module runs.
+    ///
+    /// Expected outcomes follow durable evidence only. An absent intent has
+    /// no evidence. An intent without a complete validated staging tree, or a
+    /// final name without a durable rename claim, is quarantine. A verified
+    /// staging tree is recovered by rename and acknowledgement. A durable
+    /// rename claim completes the receipt and marker. A committed availability
+    /// stage is already available. Artifact writes and syncs are numbered per
+    /// release file: manifest, sidecar, then the declared artifact.
+    const SUBPROCESS_BOUNDARIES: [SubprocessBoundary; 28] = [
+        SubprocessBoundary {
+            name: "before_intent_creation",
+            expected: RecoveryOutcome::NoEvidence,
+            exit: ExitPoint::BeforeIntent,
+        },
+        SubprocessBoundary {
+            name: "intent_file_written",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::IntentFileWritten,
+        },
+        SubprocessBoundary {
+            name: "intent_file_synced",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::IntentFileSynced,
+        },
+        SubprocessBoundary {
+            name: "intent_ledger_synced",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::IntentLedgerSynced,
+        },
+        SubprocessBoundary {
+            name: "staging_mkdir",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::StagingDirectoryCreated),
+        },
+        SubprocessBoundary {
+            name: "release_root_synced",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::StagingEntryRootSynced),
+        },
+        SubprocessBoundary {
+            name: "staging_entry_durable",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::JournalCommit(2),
+        },
+        SubprocessBoundary {
+            name: "artifact_dir_created",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ArtifactDirectoryCreated),
+        },
+        SubprocessBoundary {
+            name: "artifact_write_1",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReleaseFileWritten(1)),
+        },
+        SubprocessBoundary {
+            name: "artifact_write_2",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReleaseFileWritten(2)),
+        },
+        SubprocessBoundary {
+            name: "artifact_write_3",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReleaseFileWritten(3)),
+        },
+        SubprocessBoundary {
+            name: "artifact_sync_1",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReleaseFileSynced(1)),
+        },
+        SubprocessBoundary {
+            name: "artifact_sync_2",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReleaseFileSynced(2)),
+        },
+        SubprocessBoundary {
+            name: "artifact_sync_3",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReleaseFileSynced(3)),
+        },
+        SubprocessBoundary {
+            name: "artifact_dir_synced",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ArtifactDirectorySynced),
+        },
+        SubprocessBoundary {
+            name: "staging_dir_synced",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::StagingDirectorySynced),
+        },
+        SubprocessBoundary {
+            name: "staging_tree_durable",
+            expected: RecoveryOutcome::RecoveredStaged,
+            exit: ExitPoint::JournalCommit(3),
+        },
+        SubprocessBoundary {
+            name: "staging_validated",
+            expected: RecoveryOutcome::RecoveredStaged,
+            exit: ExitPoint::StagingValidated,
+        },
+        SubprocessBoundary {
+            name: "rename_committed",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::RenameCommitted),
+        },
+        SubprocessBoundary {
+            name: "rename_root_synced",
+            expected: RecoveryOutcome::UncertainPublicationQuarantined,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::RenameRootSynced),
+        },
+        SubprocessBoundary {
+            name: "rename_durable",
+            expected: RecoveryOutcome::RecoveredPublished,
+            exit: ExitPoint::JournalCommit(4),
+        },
+        SubprocessBoundary {
+            name: "receipt_written",
+            expected: RecoveryOutcome::RecoveredPublished,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReceiptFileWritten),
+        },
+        SubprocessBoundary {
+            name: "receipt_synced",
+            expected: RecoveryOutcome::RecoveredPublished,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReceiptFileSynced),
+        },
+        SubprocessBoundary {
+            name: "receipt_ledger_synced",
+            expected: RecoveryOutcome::RecoveredPublished,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::ReceiptLedgerSynced),
+        },
+        SubprocessBoundary {
+            name: "marker_written",
+            expected: RecoveryOutcome::RecoveredPublished,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::MarkerFileWritten),
+        },
+        SubprocessBoundary {
+            name: "marker_synced",
+            expected: RecoveryOutcome::RecoveredPublished,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::MarkerFileSynced),
+        },
+        SubprocessBoundary {
+            name: "marker_ledger_synced",
+            expected: RecoveryOutcome::RecoveredPublished,
+            exit: ExitPoint::FsBoundary(PublicationBoundary::MarkerLedgerSynced),
+        },
+        SubprocessBoundary {
+            name: "available",
+            expected: RecoveryOutcome::AlreadyAvailable,
+            exit: ExitPoint::JournalCommit(5),
+        },
+    ];
+
+    fn boundary_by_name(name: &str) -> Option<SubprocessBoundary> {
+        SUBPROCESS_BOUNDARIES
+            .iter()
+            .copied()
+            .find(|boundary| boundary.name == name)
+    }
+
+    fn recovery_outcome_label(outcome: RecoveryOutcome) -> &'static str {
+        match outcome {
+            RecoveryOutcome::NoEvidence => "NO_EVIDENCE",
+            RecoveryOutcome::RecoveredStaged => "RECOVERED_STAGED",
+            RecoveryOutcome::RecoveredPublished => "RECOVERED_PUBLISHED",
+            RecoveryOutcome::AlreadyAvailable => "ALREADY_AVAILABLE",
+            RecoveryOutcome::UncertainPublicationQuarantined => "UNCERTAIN_PUBLICATION_QUARANTINED",
+        }
+    }
+
+    fn is_recovered(outcome: RecoveryOutcome) -> bool {
+        matches!(
+            outcome,
+            RecoveryOutcome::RecoveredStaged
+                | RecoveryOutcome::RecoveredPublished
+                | RecoveryOutcome::AlreadyAvailable
+        )
+    }
 
     fn policy_for_profile(profile: &str) -> Result<ResourcePolicy, ProducerError> {
         if profile == TEST_RESOURCE_PROFILE {
@@ -10840,22 +11061,26 @@ mod tests {
     /// Filesystem that ends the publisher process at one declared boundary.
     struct ExitPublicationFs {
         inner: RealPublicationFs,
-        exit_at_boundary: Option<PublicationBoundary>,
-        exit_after_journal_sync: Option<u32>,
-        journal_syncs: Cell<u32>,
+        boundary: SubprocessBoundary,
+        marker: &'static str,
+        journal_commits: Cell<u32>,
+        ledger_syncs: Cell<u32>,
     }
 
     impl ExitPublicationFs {
-        fn new(
-            exit_at_boundary: Option<PublicationBoundary>,
-            exit_after_journal_sync: Option<u32>,
-        ) -> Self {
+        fn new(boundary: SubprocessBoundary, marker: &'static str) -> Self {
             Self {
                 inner: RealPublicationFs,
-                exit_at_boundary,
-                exit_after_journal_sync,
-                journal_syncs: Cell::new(0),
+                boundary,
+                marker,
+                journal_commits: Cell::new(0),
+                ledger_syncs: Cell::new(0),
             }
+        }
+
+        fn exit_here(&self) -> ! {
+            println!("{PUBLISHER_EXIT_PREFIX}{}", self.marker);
+            process::exit(0)
         }
     }
 
@@ -10865,9 +11090,8 @@ mod tests {
         }
 
         fn boundary(&self, boundary: PublicationBoundary) -> Result<(), ProducerError> {
-            if self.exit_at_boundary == Some(boundary) {
-                println!("FB_PUB020_PUBLISHER_EXIT={boundary:?}");
-                process::exit(0);
+            if self.boundary.exit == ExitPoint::FsBoundary(boundary) {
+                self.exit_here();
             }
             self.inner.boundary(boundary)
         }
@@ -10882,7 +11106,29 @@ mod tests {
             bytes: &[u8],
             ledger: &Path,
         ) -> Result<(), ProducerError> {
-            self.inner.commit_intent(path, bytes, ledger)
+            if !matches!(
+                self.boundary.exit,
+                ExitPoint::IntentFileWritten
+                    | ExitPoint::IntentFileSynced
+                    | ExitPoint::IntentLedgerSynced
+            ) {
+                return self.inner.commit_intent(path, bytes, ledger);
+            }
+            // Split the production create/write/sync sequence so the child
+            // can end the process between the three durable intent steps.
+            write_release_file(path, bytes)?;
+            if self.boundary.exit == ExitPoint::IntentFileWritten {
+                self.exit_here();
+            }
+            sync_file(path)?;
+            if self.boundary.exit == ExitPoint::IntentFileSynced {
+                self.exit_here();
+            }
+            sync_directory(ledger)?;
+            if self.boundary.exit == ExitPoint::IntentLedgerSynced {
+                self.exit_here();
+            }
+            Ok(())
         }
 
         fn commit_journal_record(
@@ -10892,11 +11138,10 @@ mod tests {
             ledger: &Path,
         ) -> Result<(), ProducerError> {
             self.inner.commit_journal_record(path, bytes, ledger)?;
-            let ordinal = self.journal_syncs.get().saturating_add(1);
-            self.journal_syncs.set(ordinal);
-            if self.exit_after_journal_sync == Some(ordinal) {
-                println!("FB_PUB020_PUBLISHER_EXIT=JOURNAL_SYNC_{ordinal}");
-                process::exit(0);
+            let ordinal = self.journal_commits.get().saturating_add(1);
+            self.journal_commits.set(ordinal);
+            if self.boundary.exit == ExitPoint::JournalCommit(ordinal) {
+                self.exit_here();
             }
             Ok(())
         }
@@ -10910,11 +11155,33 @@ mod tests {
         }
 
         fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
-            self.inner.commit_receipt(path, bytes)
+            match self.boundary.exit {
+                ExitPoint::FsBoundary(PublicationBoundary::ReceiptFileWritten) => {
+                    write_release_file(path, bytes)?;
+                    self.exit_here();
+                }
+                ExitPoint::FsBoundary(PublicationBoundary::ReceiptFileSynced) => {
+                    write_release_file(path, bytes)?;
+                    sync_file(path)?;
+                    self.exit_here();
+                }
+                _ => self.inner.commit_receipt(path, bytes),
+            }
         }
 
         fn sync_receipt_ledger(&self, ledger: &Path) -> Result<(), ProducerError> {
-            self.inner.sync_receipt_ledger(ledger)
+            self.inner.sync_receipt_ledger(ledger)?;
+            let ordinal = self.ledger_syncs.get().saturating_add(1);
+            self.ledger_syncs.set(ordinal);
+            let expected = match ordinal {
+                1 => PublicationBoundary::ReceiptLedgerSynced,
+                2 => PublicationBoundary::MarkerLedgerSynced,
+                _ => return Ok(()),
+            };
+            if self.boundary.exit == ExitPoint::FsBoundary(expected) {
+                self.exit_here();
+            }
+            Ok(())
         }
 
         fn commit_availability_marker(
@@ -10922,12 +11189,30 @@ mod tests {
             path: &Path,
             bytes: &[u8],
         ) -> Result<(), ProducerError> {
-            self.inner.commit_availability_marker(path, bytes)
+            match self.boundary.exit {
+                ExitPoint::FsBoundary(PublicationBoundary::MarkerFileWritten) => {
+                    write_release_file(path, bytes)?;
+                    self.exit_here();
+                }
+                ExitPoint::FsBoundary(PublicationBoundary::MarkerFileSynced) => {
+                    write_release_file(path, bytes)?;
+                    sync_file(path)?;
+                    self.exit_here();
+                }
+                _ => self.inner.commit_availability_marker(path, bytes),
+            }
+        }
+
+        fn after_staging_validation(&self) {
+            if self.boundary.exit == ExitPoint::StagingValidated {
+                self.exit_here();
+            }
         }
     }
 
     fn child_publish(
-        mode: &str,
+        boundary: SubprocessBoundary,
+        marker: &'static str,
         root: &Path,
         ledger: &Path,
         operation_id: &str,
@@ -10937,14 +11222,10 @@ mod tests {
         let manifest = boundary_manifest(release_id);
         let artifacts = boundary_artifacts(&policy);
         let (signing, verifying) = test_keys();
-        let fs = match mode {
-            "before_journal_commit" => {
-                ExitPublicationFs::new(Some(PublicationBoundary::RenameCommitted), None)
-            }
-            "after_staging_commit" => ExitPublicationFs::new(None, Some(3)),
-            "after_rename_commit" => ExitPublicationFs::new(None, Some(4)),
-            _ => process::exit(99),
-        };
+        let fs = ExitPublicationFs::new(boundary, marker);
+        if boundary.exit == ExitPoint::BeforeIntent {
+            fs.exit_here();
+        }
         let _ = build_with_faults_and_fs(
             &manifest,
             &artifacts,
@@ -10963,17 +11244,8 @@ mod tests {
     fn child_recover(root: &Path, ledger: &Path, operation_id: &str, profile: &str) -> ! {
         let policy = policy_for_profile(profile).unwrap_or_else(|_| process::exit(22));
         let outcome = super::recover_interrupted(root, ledger, operation_id, &policy);
-        let label = match outcome {
-            Ok(RecoveryOutcome::NoEvidence) => "NO_EVIDENCE",
-            Ok(RecoveryOutcome::RecoveredStaged) => "RECOVERED_STAGED",
-            Ok(RecoveryOutcome::RecoveredPublished) => "RECOVERED_PUBLISHED",
-            Ok(RecoveryOutcome::AlreadyAvailable) => "ALREADY_AVAILABLE",
-            Ok(RecoveryOutcome::UncertainPublicationQuarantined) => {
-                "UNCERTAIN_PUBLICATION_QUARANTINED"
-            }
-            Err(_) => "ERROR",
-        };
-        println!("FB_PUB020_OUTCOME={label}");
+        let label = outcome.map(recovery_outcome_label).unwrap_or("ERROR");
+        println!("{OUTCOME_PREFIX}{label}");
         process::exit(0)
     }
 
@@ -10981,58 +11253,113 @@ mod tests {
         let root = PathBuf::from(env::var(CHILD_ROOT_ENV).unwrap_or_default());
         let ledger = PathBuf::from(env::var(CHILD_LEDGER_ENV).unwrap_or_default());
         let operation_id = env::var(CHILD_OPERATION_ENV).unwrap_or_default();
-        let release_id = env::var(CHILD_RELEASE_ENV).unwrap_or_default();
         match mode {
-            "publish_before" => child_publish(
-                "before_journal_commit",
-                &root,
-                &ledger,
-                &operation_id,
-                &release_id,
-            ),
-            "publish_staging" => child_publish(
-                "after_staging_commit",
-                &root,
-                &ledger,
-                &operation_id,
-                &release_id,
-            ),
-            "publish_rename" => child_publish(
-                "after_rename_commit",
-                &root,
-                &ledger,
-                &operation_id,
-                &release_id,
-            ),
             "recover" => child_recover(
                 &root,
                 &ledger,
                 &operation_id,
                 &env::var(CHILD_PROFILE_ENV).unwrap_or_default(),
             ),
-            _ => process::exit(99),
+            "publish_boundary" => {
+                let name = env::var(CHILD_BOUNDARY_ENV).unwrap_or_default();
+                let Some(boundary) = boundary_by_name(&name) else {
+                    process::exit(99);
+                };
+                child_publish(
+                    boundary,
+                    boundary.name,
+                    &root,
+                    &ledger,
+                    &operation_id,
+                    &env::var(CHILD_RELEASE_ENV).unwrap_or_default(),
+                )
+            }
+            // FB-PUB-020 aliases retained for the earlier three-mode harness.
+            "publish_before" => child_publish(
+                boundary_by_name("rename_committed").expect("rename_committed is in the matrix"),
+                "RenameCommitted",
+                &root,
+                &ledger,
+                &operation_id,
+                &env::var(CHILD_RELEASE_ENV).unwrap_or_default(),
+            ),
+            "publish_staging" => child_publish(
+                boundary_by_name("staging_tree_durable")
+                    .expect("staging_tree_durable is in the matrix"),
+                "JOURNAL_SYNC_3",
+                &root,
+                &ledger,
+                &operation_id,
+                &env::var(CHILD_RELEASE_ENV).unwrap_or_default(),
+            ),
+            "publish_rename" => child_publish(
+                boundary_by_name("rename_durable").expect("rename_durable is in the matrix"),
+                "JOURNAL_SYNC_4",
+                &root,
+                &ledger,
+                &operation_id,
+                &env::var(CHILD_RELEASE_ENV).unwrap_or_default(),
+            ),
+            // Each boundary name also serves as a child mode in its own right.
+            other => {
+                let Some(boundary) = boundary_by_name(other) else {
+                    process::exit(99);
+                };
+                child_publish(
+                    boundary,
+                    boundary.name,
+                    &root,
+                    &ledger,
+                    &operation_id,
+                    &env::var(CHILD_RELEASE_ENV).unwrap_or_default(),
+                )
+            }
         }
     }
 
-    fn spawn_fresh_process(
+    fn spawn_child(
         mode: &str,
         root: &Path,
         ledger: &Path,
         operation_id: &str,
-        release_id: &str,
-        profile: &str,
+        release_id: Option<&str>,
+        profile: Option<&str>,
+        boundary: Option<&str>,
     ) -> Result<String, Box<dyn StdError>> {
-        let output = Command::new(env::current_exe()?)
+        let mut command = Command::new(env::current_exe()?);
+        command
             .arg("--exact")
             .arg(FRESH_PROCESS_TEST)
             .arg("--nocapture")
             .env(CHILD_MODE_ENV, mode)
             .env(CHILD_ROOT_ENV, root)
             .env(CHILD_LEDGER_ENV, ledger)
-            .env(CHILD_OPERATION_ENV, operation_id)
-            .env(CHILD_RELEASE_ENV, release_id)
-            .env(CHILD_PROFILE_ENV, profile)
-            .output()?;
+            .env(CHILD_OPERATION_ENV, operation_id);
+        match release_id {
+            Some(release_id) => {
+                command.env(CHILD_RELEASE_ENV, release_id);
+            }
+            None => {
+                command.env_remove(CHILD_RELEASE_ENV);
+            }
+        }
+        match profile {
+            Some(profile) => {
+                command.env(CHILD_PROFILE_ENV, profile);
+            }
+            None => {
+                command.env_remove(CHILD_PROFILE_ENV);
+            }
+        }
+        match boundary {
+            Some(boundary) => {
+                command.env(CHILD_BOUNDARY_ENV, boundary);
+            }
+            None => {
+                command.env_remove(CHILD_BOUNDARY_ENV);
+            }
+        }
+        let output = command.output()?;
         let status = output.status;
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         assert!(
@@ -11042,12 +11369,112 @@ mod tests {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    fn spawn_publisher(
+        mode: &str,
+        boundary: Option<&str>,
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+        release_id: &str,
+    ) -> Result<String, Box<dyn StdError>> {
+        spawn_child(
+            mode,
+            root,
+            ledger,
+            operation_id,
+            Some(release_id),
+            None,
+            boundary,
+        )
+    }
+
+    fn spawn_recover(
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+        profile: &str,
+    ) -> Result<String, Box<dyn StdError>> {
+        spawn_child(
+            "recover",
+            root,
+            ledger,
+            operation_id,
+            None,
+            Some(profile),
+            None,
+        )
+    }
+
     fn outcome_label(stdout: &str) -> String {
         stdout
             .lines()
-            .find_map(|line| line.strip_prefix("FB_PUB020_OUTCOME="))
+            .find_map(|line| line.strip_prefix(OUTCOME_PREFIX))
             .unwrap_or("MISSING")
             .to_owned()
+    }
+
+    /// Check the identity fields that a second recovery must preserve.
+    fn assert_recovery_identity(
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+        release_id: &str,
+        context: &str,
+    ) -> Result<(), Box<dyn StdError>> {
+        let receipt_path = ledger.join(format!("{release_id}.receipt.json"));
+        let receipt_bytes = fs::read(&receipt_path)?;
+        let receipt: PublicationReceipt = serde_json::from_slice(&receipt_bytes)?;
+        assert_eq!(
+            receipt.publication_operation_id, operation_id,
+            "{context}: the receipt keeps the original operation id"
+        );
+        assert_eq!(
+            receipt.release_id, release_id,
+            "{context}: the receipt keeps the final release identity"
+        );
+        assert_eq!(
+            receipt.commit_position, COMMIT_POSITION,
+            "{context}: the receipt keeps the commit position"
+        );
+        assert!(
+            receipt.supersedes_release_id.is_none(),
+            "{context}: the receipt keeps the absent predecessor"
+        );
+        assert_eq!(
+            receipt.result,
+            PublicationState::Available,
+            "{context}: the receipt keeps the available result"
+        );
+        assert_eq!(
+            last_stage(ledger, operation_id)?,
+            PublicationState::Available,
+            "{context}: the final durable stage stays available"
+        );
+        assert!(
+            root.join(release_id).is_dir(),
+            "{context}: the final release directory is present"
+        );
+        let marker_path = ledger.join(format!("{release_id}.available"));
+        assert_eq!(
+            fs::read(&marker_path)?,
+            operation_id.as_bytes(),
+            "{context}: the marker binds the original operation id"
+        );
+        let markers: Vec<_> = fs::read_dir(ledger)?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "available")
+            })
+            .collect();
+        assert_eq!(
+            markers.len(),
+            1,
+            "{context}: recovery writes one availability marker"
+        );
+        Ok(())
     }
 
     #[test]
@@ -11060,12 +11487,10 @@ mod tests {
         let ledger = temp.path().join("ledger");
         fs::create_dir_all(&ledger)?;
 
-        let missing = spawn_fresh_process(
-            "recover",
+        let missing = spawn_recover(
             &root,
             &ledger,
             "operation-no-evidence",
-            "release-no-evidence",
             TEST_RESOURCE_PROFILE,
         )?;
         assert_eq!(
@@ -11076,26 +11501,19 @@ mod tests {
 
         let uncertain = "operation-process-rename";
         let uncertain_release = "release-process-rename";
-        let publisher = spawn_fresh_process(
+        let publisher = spawn_publisher(
             "publish_before",
+            None,
             &root,
             &ledger,
             uncertain,
             uncertain_release,
-            TEST_RESOURCE_PROFILE,
         )?;
         assert!(
             publisher.contains("FB_PUB020_PUBLISHER_EXIT=RenameCommitted"),
             "the publisher exited after the rename syscall before its journal commit"
         );
-        let quarantined = spawn_fresh_process(
-            "recover",
-            &root,
-            &ledger,
-            uncertain,
-            uncertain_release,
-            TEST_RESOURCE_PROFILE,
-        )?;
+        let quarantined = spawn_recover(&root, &ledger, uncertain, TEST_RESOURCE_PROFILE)?;
         assert_eq!(
             outcome_label(&quarantined),
             "UNCERTAIN_PUBLICATION_QUARANTINED",
@@ -11116,26 +11534,19 @@ mod tests {
 
         let staged_operation = "operation-process-staging";
         let staged_release = "release-process-staging";
-        let staged_publisher = spawn_fresh_process(
+        let staged_publisher = spawn_publisher(
             "publish_staging",
+            None,
             &root,
             &ledger,
             staged_operation,
             staged_release,
-            TEST_RESOURCE_PROFILE,
         )?;
         assert!(
             staged_publisher.contains("FB_PUB020_PUBLISHER_EXIT=JOURNAL_SYNC_3"),
             "the publisher exited after the staging-tree journal commit"
         );
-        let staged = spawn_fresh_process(
-            "recover",
-            &root,
-            &ledger,
-            staged_operation,
-            staged_release,
-            TEST_RESOURCE_PROFILE,
-        )?;
+        let staged = spawn_recover(&root, &ledger, staged_operation, TEST_RESOURCE_PROFILE)?;
         assert_eq!(
             outcome_label(&staged),
             "RECOVERED_STAGED",
@@ -11144,26 +11555,13 @@ mod tests {
 
         let operation = "operation-process-recovery";
         let release = "release-process-recovery";
-        let publisher = spawn_fresh_process(
-            "publish_rename",
-            &root,
-            &ledger,
-            operation,
-            release,
-            TEST_RESOURCE_PROFILE,
-        )?;
+        let publisher =
+            spawn_publisher("publish_rename", None, &root, &ledger, operation, release)?;
         assert!(
             publisher.contains("FB_PUB020_PUBLISHER_EXIT=JOURNAL_SYNC_4"),
             "the publisher exited after the rename journal commit was durable"
         );
-        let first = spawn_fresh_process(
-            "recover",
-            &root,
-            &ledger,
-            operation,
-            release,
-            TEST_RESOURCE_PROFILE,
-        )?;
+        let first = spawn_recover(&root, &ledger, operation, TEST_RESOURCE_PROFILE)?;
         assert_eq!(
             outcome_label(&first),
             "RECOVERED_PUBLISHED",
@@ -11172,14 +11570,7 @@ mod tests {
         let receipt_path = ledger.join(format!("{release}.receipt.json"));
         let first_receipt = fs::read(&receipt_path)?;
         let first_chain = durable_chain_bytes(&ledger, operation)?;
-        let second = spawn_fresh_process(
-            "recover",
-            &root,
-            &ledger,
-            operation,
-            release,
-            TEST_RESOURCE_PROFILE,
-        )?;
+        let second = spawn_recover(&root, &ledger, operation, TEST_RESOURCE_PROFILE)?;
         assert_eq!(
             outcome_label(&second),
             "ALREADY_AVAILABLE",
@@ -11195,6 +11586,68 @@ mod tests {
             first_chain,
             "the operation chain stays byte-identical across fresh recoveries"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn subprocess_boundary_matrix_exhausts_durable_evidence() -> TestResult {
+        if let Ok(mode) = env::var(CHILD_MODE_ENV) {
+            fresh_process_child(&mode);
+        }
+        for boundary in SUBPROCESS_BOUNDARIES {
+            let temp = TempDir::new()?;
+            let root = temp.path().join("releases");
+            let ledger = temp.path().join("ledger");
+            fs::create_dir_all(&ledger)?;
+            let context = boundary.name;
+            let operation_id = format!("operation-matrix-{context}");
+            let release_id = format!("release-matrix-{context}");
+
+            let publisher = spawn_publisher(
+                "publish_boundary",
+                Some(boundary.name),
+                &root,
+                &ledger,
+                &operation_id,
+                &release_id,
+            )?;
+            assert!(
+                publisher.contains(&format!("{PUBLISHER_EXIT_PREFIX}{context}")),
+                "{context}: publisher ended at the declared boundary: {publisher}"
+            );
+
+            let first = spawn_recover(&root, &ledger, &operation_id, TEST_RESOURCE_PROFILE)?;
+            assert_eq!(
+                outcome_label(&first),
+                recovery_outcome_label(boundary.expected),
+                "{context}: recovery follows durable evidence"
+            );
+
+            if !is_recovered(boundary.expected) {
+                continue;
+            }
+
+            let receipt_path = ledger.join(format!("{release_id}.receipt.json"));
+            let first_receipt = fs::read(&receipt_path)?;
+            let first_chain = durable_chain_bytes(&ledger, &operation_id)?;
+            let second = spawn_recover(&root, &ledger, &operation_id, TEST_RESOURCE_PROFILE)?;
+            assert_eq!(
+                outcome_label(&second),
+                "ALREADY_AVAILABLE",
+                "{context}: the second recovery observes the committed acknowledgement"
+            );
+            assert_eq!(
+                fs::read(&receipt_path)?,
+                first_receipt,
+                "{context}: receipt bytes stay identical across recoveries"
+            );
+            assert_eq!(
+                durable_chain_bytes(&ledger, &operation_id)?,
+                first_chain,
+                "{context}: the journal chain stays byte-identical across recoveries"
+            );
+            assert_recovery_identity(&root, &ledger, &operation_id, &release_id, boundary.name)?;
+        }
         Ok(())
     }
 
