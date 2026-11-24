@@ -17,20 +17,24 @@
 //! path is NFC without conversion, and non-ASCII input fails closed, so no
 //! ambiguous normalized duplicate can arise.
 //!
-//! Publication uses exclusive creation plus hard links as the no-replace
-//! primitive available on this platform. Linux `renameat2(RENAME_NOREPLACE)`
-//! is not available here; the dated record states this limitation. A durable
-//! receipt, not directory presence, is the local durability evidence.
+//! Publication moves one complete, synced staging directory into its final
+//! name with a single no-replace directory rename. Linux uses
+//! `renameat2(RENAME_NOREPLACE)` and macOS uses `renamex_np(RENAME_EXCL)`;
+//! other targets fail closed. A durable receipt, not directory presence, is
+//! the local acknowledgement. The dated record states the platform bounds.
 //!
 //! Non-claim: a signature proves publisher-key control over exact signed
 //! bytes. It proves no source authenticity, coverage, right, dataset
 //! entitlement or observation truth.
 
 use std::collections::BTreeSet;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io;
 use std::io::Write as IoWrite;
 use std::path::Path;
 use std::path::PathBuf;
@@ -157,6 +161,10 @@ pub enum ProducerError {
     /// A release identity was already present in the publication root.
     #[error("publication collision for release: {0}")]
     PublicationCollision(String),
+
+    /// Staging and final release paths were not siblings on one filesystem.
+    #[error("invalid publication topology: {0}")]
+    PublicationTopology(String),
 
     /// Publication evidence was absent or inconsistent with the request.
     #[error("publication evidence error: {0}")]
@@ -2287,72 +2295,196 @@ fn validate_artifact_set(
     Ok(())
 }
 
-fn link_into_release(
-    staging: &Path,
-    final_dir: &Path,
-    prepared: &PreparedRelease,
-) -> Result<(), ProducerError> {
-    let mut names = vec![MANIFEST_FILE_NAME.to_owned(), SIDECAR_FILE_NAME.to_owned()];
-    names.extend(
-        prepared
-            .evidence
-            .artifact_paths
-            .iter()
-            .map(|path| path.rsplit('/').next().unwrap_or(path).to_owned()),
-    );
-    for name in names {
-        fs::hard_link(staging.join(&name), final_dir.join(&name)).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                ProducerError::PublicationCollision(format!(
-                    "release target file {name} already exists"
-                ))
-            } else {
-                io_error(&format!("hard link {name}"), error)
-            }
-        })?;
+/// Injection points used by the offline crash-state tests. Production passes
+/// the default value, which enables every transition in sequence.
+#[derive(Debug, Clone, Copy, Default)]
+struct PublicationFaults {
+    /// Return an error after staging sync and before the directory rename.
+    fail_before_rename: bool,
+    /// Return an error after the rename and before the parent directory sync.
+    fail_parent_dir_sync: bool,
+    /// Return an error after the parent sync and before the receipt commit.
+    fail_receipt_commit: bool,
+    /// Return an error after the receipt and before the availability marker.
+    fail_marker_commit: bool,
+}
+
+#[cfg(target_os = "linux")]
+#[expect(
+    unsafe_code,
+    reason = "the kernel exposes renameat2 only through an unsafe libc syscall"
+)]
+fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `from` and `to` own their byte buffers, so both pointers are
+    // non-null and live for this call. The two allocations cannot alias.
+    // `AT_FDCWD` is the libc current-directory sentinel; the kernel reads the
+    // two path pointers and the `RENAME_NOREPLACE` flag as the syscall ABI
+    // declares, so no destination is replaced.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2 as libc::c_long,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[expect(
+    unsafe_code,
+    reason = "the Darwin no-replace primitive is an unsafe libc function"
+)]
+fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let from = CString::new(from.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let to = CString::new(to.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: `from` and `to` own their byte buffers, so both pointers are
+    // non-null and live for this call. The two allocations cannot alias.
+    // `RENAME_EXCL` asks Darwin to reject an existing destination rather than
+    // replacing it; the returned status is checked before success is reported.
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn atomic_no_replace_rename(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic no-replace directory rename requires Linux renameat2 or macOS renamex_np",
+    ))
+}
+
+fn ensure_sibling_release_paths(staging: &Path, final_dir: &Path) -> Result<(), ProducerError> {
+    let staging_parent = staging.parent().ok_or_else(|| {
+        ProducerError::PublicationTopology("staging path has no parent directory".to_owned())
+    })?;
+    let final_parent = final_dir.parent().ok_or_else(|| {
+        ProducerError::PublicationTopology("final path has no parent directory".to_owned())
+    })?;
+    let staging_canonical = fs::canonicalize(staging_parent)
+        .map_err(|error| io_error("canonicalize staging parent", error))?;
+    let final_canonical = fs::canonicalize(final_parent)
+        .map_err(|error| io_error("canonicalize final parent", error))?;
+    if staging_canonical != final_canonical {
+        return Err(ProducerError::PublicationTopology(
+            "staging and final release directories are not siblings".to_owned(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let staging_device = fs::metadata(staging)
+            .map_err(|error| {
+                io_error(
+                    &format!("read staging metadata {}", staging.display()),
+                    error,
+                )
+            })?
+            .dev();
+        let parent_device = fs::metadata(&final_canonical)
+            .map_err(|error| io_error("read final parent metadata", error))?
+            .dev();
+        if staging_device != parent_device {
+            return Err(ProducerError::PublicationTopology(
+                "staging and final release directories are on different filesystems".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the publication boundary carries its two paths, evidence, durability policy and injected faults"
+)]
 fn finalize_publication(
     root: &Path,
     ledger: &Path,
     operation: &PublicationOperation,
     staging: &Path,
     final_dir: &Path,
-    prepared: &PreparedRelease,
+    receipt: &PublicationReceipt,
     policy: &ResourcePolicy,
+    faults: PublicationFaults,
 ) -> Result<(), ProducerError> {
-    fs::create_dir(final_dir).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::AlreadyExists {
+    ensure_sibling_release_paths(staging, final_dir)?;
+    let start = next_stage_ordinal(ledger, &operation.operation_id)?;
+
+    if faults.fail_before_rename {
+        return Err(io_error(
+            "injected failure before the directory rename",
+            io::Error::other("injected failure before the directory rename"),
+        ));
+    }
+    atomic_no_replace_rename(staging, final_dir).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
             ProducerError::PublicationCollision(operation.release_id.clone())
         } else {
-            io_error(
-                &format!("create final release {}", final_dir.display()),
-                error,
-            )
+            io_error("atomic no-replace directory rename", error)
         }
     })?;
-    let start = next_stage_ordinal(ledger, &operation.operation_id)?;
-    let mut linked = operation.clone();
-    linked.stage = PublicationState::AtomicNoReplaceRename;
-    write_stage(ledger, &linked, start, policy)?;
-    link_into_release(staging, final_dir, prepared)?;
-    sync_directory(final_dir)?;
+    // The rename has committed before this label is written. No stage record
+    // claims a rename that did not run.
+    let mut renamed = operation.clone();
+    renamed.stage = PublicationState::AtomicNoReplaceRename;
+    write_stage(ledger, &renamed, start, policy)?;
+
+    if faults.fail_parent_dir_sync {
+        return Err(io_error(
+            "injected parent directory sync failure",
+            io::Error::other("injected parent directory sync failure"),
+        ));
+    }
     sync_directory(root)?;
     let mut synced = operation.clone();
     synced.stage = PublicationState::ParentDirFsynced;
     write_stage(ledger, &synced, start + 1, policy)?;
-    let bytes = canonicalize_strict(&prepared.receipt.to_jcs()?, policy)?;
+
+    if faults.fail_receipt_commit {
+        return Err(io_error(
+            "injected receipt commit failure",
+            io::Error::other("injected receipt commit failure"),
+        ));
+    }
+    let bytes = canonicalize_strict(&receipt.to_jcs()?, policy)?;
     let mut bytes = bytes;
     bytes.push(b'\n');
-    let receipt_path = ledger.join(format!("{}.receipt.json", prepared.evidence.release_id));
+    let receipt_path = ledger.join(format!("{}.receipt.json", receipt.release_id));
     write_new_file(&receipt_path, &bytes)?;
     sync_directory(ledger)?;
     let mut received = operation.clone();
     received.stage = PublicationState::DurablePublicationReceipt;
     write_stage(ledger, &received, start + 2, policy)?;
-    let marker = ledger.join(format!("{}.available", prepared.evidence.release_id));
+
+    if faults.fail_marker_commit {
+        return Err(io_error(
+            "injected availability marker failure",
+            io::Error::other("injected availability marker failure"),
+        ));
+    }
+    let marker = ledger.join(format!("{}.available", receipt.release_id));
     write_new_file(&marker, operation.operation_id.as_bytes())?;
     sync_directory(ledger)?;
     let mut available = operation.clone();
@@ -2454,17 +2586,30 @@ pub fn recover_interrupted(
         return Ok(RecoveryOutcome::RecoveredPublished);
     }
     if staging.exists() {
+        if !matches!(
+            operation.stage,
+            PublicationState::StagingDirFsynced
+                | PublicationState::AtomicNoReplaceRename
+                | PublicationState::ParentDirFsynced
+                | PublicationState::DurablePublicationReceipt
+                | PublicationState::Available
+        ) {
+            return Err(ProducerError::UncertainPublication(
+                "incomplete staging evidence; publication is not acknowledged".to_owned(),
+            ));
+        }
         validate_artifact_set(&staging, evidence)?;
-        let prepared = PreparedRelease {
-            manifest_bytes: Vec::new(),
-            sidecar_bytes: Vec::new(),
-            descriptors: Vec::new(),
-            artifacts: Vec::new(),
-            evidence: evidence.clone(),
-            receipt: recovery_receipt(evidence),
-        };
+        sync_directory(&staging)?;
+        let receipt = recovery_receipt(evidence);
         finalize_publication(
-            root, ledger, operation, &staging, &final_dir, &prepared, policy,
+            root,
+            ledger,
+            operation,
+            &staging,
+            &final_dir,
+            &receipt,
+            policy,
+            PublicationFaults::default(),
         )?;
         return Ok(RecoveryOutcome::RecoveredStaged);
     }
@@ -2475,6 +2620,13 @@ pub fn recover_interrupted(
 
 /// Validate, sign and publish one NDC v2 release as a single boundary.
 pub fn build_release(request: &BuildRequest<'_>) -> Result<BuildOutcome, ProducerError> {
+    build_release_inner(request, PublicationFaults::default())
+}
+
+fn build_release_inner(
+    request: &BuildRequest<'_>,
+    faults: PublicationFaults,
+) -> Result<BuildOutcome, ProducerError> {
     let prepared = prepare_release(request)?;
     fs::create_dir_all(request.ledger_dir)
         .map_err(|error| io_error("create ledger directory", error))?;
@@ -2502,14 +2654,14 @@ pub fn build_release(request: &BuildRequest<'_>) -> Result<BuildOutcome, Produce
     write_stage(request.ledger_dir, &operation, 0, request.policy)?;
 
     write_new_file(&staging.join(MANIFEST_FILE_NAME), &prepared.manifest_bytes)?;
-    let mut written = operation.clone();
-    written.stage = PublicationState::FilesWritten;
-    write_stage(request.ledger_dir, &written, 1, request.policy)?;
     write_new_file(&staging.join(SIDECAR_FILE_NAME), &prepared.sidecar_bytes)?;
     for (path, bytes) in &prepared.artifacts {
         let name = path.rsplit('/').next().unwrap_or(path);
         write_new_file(&staging.join(name), bytes)?;
     }
+    let mut written = operation.clone();
+    written.stage = PublicationState::FilesWritten;
+    write_stage(request.ledger_dir, &written, 1, request.policy)?;
     let mut synced_files = operation.clone();
     synced_files.stage = PublicationState::FilesSynced;
     write_stage(request.ledger_dir, &synced_files, 2, request.policy)?;
@@ -2525,8 +2677,9 @@ pub fn build_release(request: &BuildRequest<'_>) -> Result<BuildOutcome, Produce
         &operation,
         &staging,
         &final_dir,
-        &prepared,
+        &prepared.receipt,
         request.policy,
+        faults,
     )?;
     Ok(BuildOutcome {
         manifest_bytes: prepared.manifest_bytes,
@@ -2719,7 +2872,11 @@ mod tests {
         }
     }
 
-    fn build_fixture(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fixture passes the full build boundary plus one injected fault setting"
+    )]
+    fn build_with_faults(
         manifest: &ReleaseManifest,
         artifacts: &[ArtifactInput],
         signing: &SigningKey,
@@ -2727,6 +2884,8 @@ mod tests {
         policy: &ResourcePolicy,
         root: &Path,
         ledger: &Path,
+        operation_id: &str,
+        faults: PublicationFaults,
     ) -> Result<BuildOutcome, ProducerError> {
         let receipts: Vec<PublicationReceipt> = Vec::new();
         let lineage = LineageContext {
@@ -2742,7 +2901,7 @@ mod tests {
         let request = BuildRequest {
             release_root: root,
             ledger_dir: ledger,
-            operation_id: "operation-1",
+            operation_id,
             commit_position: "position-1",
             manifest,
             artifacts,
@@ -2750,7 +2909,83 @@ mod tests {
             policy,
             lineage,
         };
-        build_release(&request)
+        build_release_inner(&request, faults)
+    }
+
+    fn build_fixture(
+        manifest: &ReleaseManifest,
+        artifacts: &[ArtifactInput],
+        signing: &SigningKey,
+        verifying: &VerifyingKey,
+        policy: &ResourcePolicy,
+        root: &Path,
+        ledger: &Path,
+    ) -> Result<BuildOutcome, ProducerError> {
+        build_with_faults(
+            manifest,
+            artifacts,
+            signing,
+            verifying,
+            policy,
+            root,
+            ledger,
+            "operation-1",
+            PublicationFaults::default(),
+        )
+    }
+
+    fn operation_from_evidence(
+        evidence: &PublicationEvidence,
+        operation_id: &str,
+    ) -> PublicationOperation {
+        PublicationOperation {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            operation_id: operation_id.to_owned(),
+            release_id: evidence.release_id.clone(),
+            manifest_sha256: evidence.manifest_sha256.clone(),
+            data_sha256: evidence.data_sha256.clone(),
+            commit_position: evidence.commit_position.clone(),
+            staging_directory: staging_name(operation_id),
+            final_directory: evidence.release_id.clone(),
+            stage: PublicationState::StagingCreated,
+        }
+    }
+
+    fn write_stage_sequence(
+        ledger: &Path,
+        operation: &PublicationOperation,
+        states: &[PublicationState],
+        policy: &ResourcePolicy,
+    ) -> Result<(), Box<dyn StdError>> {
+        for (ordinal, state) in states.iter().enumerate() {
+            let mut staged = operation.clone();
+            staged.stage = *state;
+            write_stage(ledger, &staged, u32::try_from(ordinal)?, policy)?;
+        }
+        Ok(())
+    }
+
+    fn clear_stages(ledger: &Path, operation_id: &str) -> Result<(), Box<dyn StdError>> {
+        let prefix = format!("{operation_id}.stage.");
+        for entry in fs::read_dir(ledger)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(&prefix) {
+                fs::remove_file(entry.path())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn last_stage(
+        ledger: &Path,
+        operation_id: &str,
+    ) -> Result<PublicationState, Box<dyn StdError>> {
+        let stages = read_stage_operations(ledger, operation_id)?;
+        let (_, operation) = stages
+            .last()
+            .ok_or_else(|| io::Error::other("no stage evidence"))?;
+        Ok(operation.stage)
     }
 
     #[test]
@@ -3431,6 +3666,589 @@ mod tests {
         Ok(())
     }
 
+    fn evidence_for_operation(
+        manifest: &ReleaseManifest,
+        artifacts: &[ArtifactInput],
+        signing: &SigningKey,
+        verifying: &VerifyingKey,
+        policy: &ResourcePolicy,
+        operation_id: &str,
+    ) -> Result<PublicationEvidence, Box<dyn StdError>> {
+        let temp = TempDir::new()?;
+        let outcome = build_with_faults(
+            manifest,
+            artifacts,
+            signing,
+            verifying,
+            policy,
+            &temp.path().join("releases"),
+            &temp.path().join("ledger"),
+            operation_id,
+            PublicationFaults::default(),
+        )?;
+        Ok(outcome.evidence)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn no_replace_rename_moves_one_directory_without_replacing() -> TestResult {
+        let temp = TempDir::new()?;
+        let source = temp.path().join("source");
+        let target = temp.path().join("target");
+        fs::create_dir(&source)?;
+        fs::write(source.join("abstract"), b"payload")?;
+        atomic_no_replace_rename(&source, &target)?;
+        assert!(!source.exists(), "the rename consumes the source name");
+        assert_eq!(
+            fs::read(target.join("abstract"))?,
+            b"payload",
+            "the byte stream follows the renamed directory"
+        );
+
+        let second = temp.path().join("second");
+        fs::create_dir(&second)?;
+        let result = atomic_no_replace_rename(&second, &target);
+        assert!(
+            matches!(result, Err(error) if error.kind() == io::ErrorKind::AlreadyExists),
+            "the platform primitive rejects an existing target"
+        );
+        assert!(second.exists(), "the rejected source directory is retained");
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[test]
+    fn no_replace_rename_fails_closed_on_other_platforms() -> TestResult {
+        let result = atomic_no_replace_rename(Path::new("from"), Path::new("to"));
+        assert!(
+            matches!(result, Err(error) if error.kind() == io::ErrorKind::Unsupported),
+            "unsupported targets report a typed error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_topology_rejects_non_siblings() -> TestResult {
+        let temp = TempDir::new()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first)?;
+        fs::create_dir(&second)?;
+        let staging = first.join("staging");
+        fs::create_dir(&staging)?;
+        let result = ensure_sibling_release_paths(&staging, &second.join("release"));
+        assert!(
+            matches!(result, Err(ProducerError::PublicationTopology(_))),
+            "staging and final paths under different parents fail closed"
+        );
+        assert!(
+            ensure_sibling_release_paths(&staging, &first.join("release")).is_ok(),
+            "sibling paths on one filesystem are accepted"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_stage_order_follows_the_committed_rename() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-stage-order");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        build_fixture(
+            &manifest, &artifacts, &signing, &verifying, &policy, &root, &ledger,
+        )?;
+        let stages = read_stage_operations(&ledger, "operation-1")?;
+        let observed: Vec<PublicationState> = stages.iter().map(|(_, item)| item.stage).collect();
+        assert_eq!(
+            observed,
+            vec![
+                PublicationState::StagingCreated,
+                PublicationState::FilesWritten,
+                PublicationState::FilesSynced,
+                PublicationState::StagingDirFsynced,
+                PublicationState::AtomicNoReplaceRename,
+                PublicationState::ParentDirFsynced,
+                PublicationState::DurablePublicationReceipt,
+                PublicationState::Available,
+            ],
+            "stage evidence follows the committed transition order"
+        );
+        assert!(
+            !root.join(".staging-operation-1").exists(),
+            "the staging name is consumed by the final directory rename"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let link_count =
+                fs::metadata(root.join("release-stage-order").join(MANIFEST_FILE_NAME))?.nlink();
+            assert_eq!(
+                link_count, 1,
+                "publication uses a directory rename rather than file hard links"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn final_directory_is_absent_before_the_rename() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-before-rename");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_before_rename: true,
+            ..PublicationFaults::default()
+        };
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-before-rename",
+            faults,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the injected pre-rename failure is typed"
+        );
+        assert!(
+            !root.join("release-before-rename").exists(),
+            "the final release stays invisible before the rename"
+        );
+        assert!(
+            root.join(".staging-operation-before-rename").exists(),
+            "the complete staging directory is retained"
+        );
+        assert_eq!(
+            last_stage(&ledger, "operation-before-rename")?,
+            PublicationState::StagingDirFsynced,
+            "no rename stage is claimed before the rename"
+        );
+        let evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-before-rename",
+        )?;
+        validate_artifact_set(&root.join(".staging-operation-before-rename"), &evidence)?;
+        assert!(
+            !ledger.join("release-before-rename.receipt.json").exists(),
+            "no acknowledgement exists before the rename"
+        );
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
+        assert_eq!(
+            recovered,
+            RecoveryOutcome::RecoveredStaged,
+            "complete unpublished staging is reconciled by a later recovery"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rename_collision_does_not_expose_a_partial_release() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-rename-collision");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&root)?;
+        let occupied = root.join("release-rename-collision");
+        fs::create_dir(&occupied)?;
+        fs::write(occupied.join("holder"), b"unchanged")?;
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-rename-collision",
+            PublicationFaults::default(),
+        );
+        assert!(
+            matches!(result, Err(ProducerError::PublicationCollision(_))),
+            "an occupied release identity is rejected by the rename"
+        );
+        assert_eq!(
+            fs::read(occupied.join("holder"))?,
+            b"unchanged",
+            "the existing release identity keeps its content"
+        );
+        assert_eq!(
+            fs::read_dir(&occupied)?.count(),
+            1,
+            "no staged file is linked into the occupied directory"
+        );
+        assert_ne!(
+            last_stage(&ledger, "operation-rename-collision")?,
+            PublicationState::AtomicNoReplaceRename,
+            "a failed rename is not labelled as committed"
+        );
+        assert!(
+            !ledger
+                .join("release-rename-collision.receipt.json")
+                .exists(),
+            "a failed rename writes no receipt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_publications_have_exactly_one_winner() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-concurrent");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let shared = (
+            &manifest, &artifacts, &signing, &verifying, &policy, &root, &ledger,
+        );
+        let results = std::thread::scope(
+            |scope| -> Result<Vec<Result<BuildOutcome, ProducerError>>, Box<dyn StdError>> {
+                let mut handles = Vec::new();
+                for index in 0..4 {
+                    let operation_id = format!("operation-concurrent-{index}");
+                    handles.push(scope.spawn(move || {
+                        build_with_faults(
+                            shared.0,
+                            shared.1,
+                            shared.2,
+                            shared.3,
+                            shared.4,
+                            shared.5,
+                            shared.6,
+                            &operation_id,
+                            PublicationFaults::default(),
+                        )
+                    }));
+                }
+                let mut results = Vec::new();
+                for handle in handles {
+                    results.push(
+                        handle
+                            .join()
+                            .map_err(|_| io::Error::other("publication thread panicked"))?,
+                    );
+                }
+                Ok(results)
+            },
+        )?;
+        let winners: Vec<&BuildOutcome> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect();
+        assert_eq!(winners.len(), 1, "exactly one no-replace rename wins");
+        for result in &results {
+            if let Err(error) = result {
+                assert!(
+                    matches!(error, ProducerError::PublicationCollision(_)),
+                    "every losing attempt reports a collision"
+                );
+            }
+        }
+        validate_artifact_set(&root.join("release-concurrent"), &winners[0].evidence)?;
+        let receipts = fs::read_dir(&ledger)?
+            .filter(|entry| {
+                entry.as_ref().is_ok_and(|item| {
+                    item.file_name()
+                        .to_string_lossy()
+                        .ends_with(".receipt.json")
+                })
+            })
+            .count();
+        assert_eq!(receipts, 1, "one durable receipt is committed");
+        Ok(())
+    }
+
+    #[test]
+    fn parent_sync_failure_leaves_an_uncertain_publication() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-parent-fault");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_parent_dir_sync: true,
+            ..PublicationFaults::default()
+        };
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-parent-fault",
+            faults,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the injected parent sync failure is typed"
+        );
+        let mut evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-parent-fault",
+        )?;
+        evidence.publication_operation_id = "operation-parent-fault".to_owned();
+        let final_dir = root.join("release-parent-fault");
+        validate_artifact_set(&final_dir, &evidence)?;
+        assert_eq!(
+            last_stage(&ledger, "operation-parent-fault")?,
+            PublicationState::AtomicNoReplaceRename,
+            "the rename is recorded before the parent directory sync"
+        );
+        assert!(
+            !ledger.join("release-parent-fault.receipt.json").exists(),
+            "an uncertain publication carries no committed acknowledgement"
+        );
+        assert!(
+            !ledger.join("release-parent-fault.available").exists(),
+            "an uncertain publication carries no availability marker"
+        );
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
+        assert_eq!(
+            recovered,
+            RecoveryOutcome::RecoveredPublished,
+            "reconciliation commits the receipt for the verified final directory"
+        );
+        let receipt = load_receipt(&ledger, "release-parent-fault")?
+            .ok_or_else(|| io::Error::other("missing reconciled receipt"))?;
+        assert_eq!(
+            receipt.result,
+            PublicationState::Available,
+            "recovery commits an acknowledgement that the failed run did not write"
+        );
+        assert!(
+            ledger.join("release-parent-fault.available").exists(),
+            "recovery writes the availability marker after the receipt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_commit_failure_does_not_mark_available() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-receipt-fault");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_receipt_commit: true,
+            ..PublicationFaults::default()
+        };
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-receipt-fault",
+            faults,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the injected receipt failure is typed"
+        );
+        assert_eq!(
+            last_stage(&ledger, "operation-receipt-fault")?,
+            PublicationState::ParentDirFsynced,
+            "the publication exists with the parent directory synced"
+        );
+        assert!(
+            !ledger.join("release-receipt-fault.receipt.json").exists(),
+            "no receipt is committed on the receipt failure path"
+        );
+        assert!(
+            !ledger.join("release-receipt-fault.available").exists(),
+            "no availability marker is committed on the receipt failure path"
+        );
+        let mut evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-receipt-fault",
+        )?;
+        evidence.publication_operation_id = "operation-receipt-fault".to_owned();
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
+        assert_eq!(
+            recovered,
+            RecoveryOutcome::RecoveredPublished,
+            "an unresolved receipt is reconciled from the verified release"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn marker_commit_failure_keeps_the_receipt_without_an_acknowledgement() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-marker-fault");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_marker_commit: true,
+            ..PublicationFaults::default()
+        };
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-marker-fault",
+            faults,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the injected marker failure is typed"
+        );
+        assert_eq!(
+            last_stage(&ledger, "operation-marker-fault")?,
+            PublicationState::DurablePublicationReceipt,
+            "the receipt is committed before the availability marker"
+        );
+        assert!(
+            load_receipt(&ledger, "release-marker-fault")?.is_some(),
+            "the receipt survives the marker failure"
+        );
+        assert!(
+            !ledger.join("release-marker-fault.available").exists(),
+            "the acknowledgement is absent until recovery writes it"
+        );
+        let mut evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-marker-fault",
+        )?;
+        evidence.publication_operation_id = "operation-marker-fault".to_owned();
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
+        assert_eq!(
+            recovered,
+            RecoveryOutcome::RecoveredPublished,
+            "recovery completes a committed receipt that lacked a marker"
+        );
+        assert!(
+            ledger.join("release-marker-fault.available").exists(),
+            "the availability marker is present after recovery"
+        );
+        let again = recover_interrupted(&root, &ledger, &evidence, &policy)?;
+        assert_eq!(
+            again,
+            RecoveryOutcome::AlreadyAvailable,
+            "a second recovery recognizes the durable acknowledgement"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn incomplete_staging_is_not_promoted_by_recovery() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-incomplete");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_before_rename: true,
+            ..PublicationFaults::default()
+        };
+        let interrupted = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-incomplete",
+            faults,
+        );
+        assert!(
+            matches!(interrupted, Err(ProducerError::Io(..))),
+            "the injected pre-rename failure is typed"
+        );
+        let evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-incomplete",
+        )?;
+        fs::remove_file(root.join(".staging-operation-incomplete").join("a.jsonl"))?;
+        clear_stages(&ledger, "operation-incomplete")?;
+        write_stage_sequence(
+            &ledger,
+            &operation_from_evidence(&evidence, "operation-incomplete"),
+            &[
+                PublicationState::StagingCreated,
+                PublicationState::FilesWritten,
+            ],
+            &policy,
+        )?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "an interrupted write is not acknowledged by recovery"
+        );
+        assert!(
+            !root.join("release-incomplete").exists(),
+            "no partial final release is promoted"
+        );
+        assert!(
+            !ledger.join("release-incomplete.receipt.json").exists(),
+            "recovery writes no receipt for incomplete staging"
+        );
+        Ok(())
+    }
+
     #[test]
     fn receipt_is_bound_to_release_and_digests() -> TestResult {
         let temp = TempDir::new()?;
@@ -3554,13 +4372,38 @@ mod tests {
         let (signing, verifying) = test_keys();
         let root = temp.path().join("releases");
         let ledger = temp.path().join("ledger");
-        let outcome = build_fixture(
-            &manifest, &artifacts, &signing, &verifying, &policy, &root, &ledger,
+        let faults = PublicationFaults {
+            fail_before_rename: true,
+            ..PublicationFaults::default()
+        };
+        let interrupted = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-stage-recovery",
+            faults,
+        );
+        assert!(
+            matches!(interrupted, Err(ProducerError::Io(..))),
+            "the injected pre-rename failure is typed"
+        );
+        assert!(
+            !root.join("release-stage-recovery").exists(),
+            "staging is unpublished before recovery"
+        );
+        let evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-stage-recovery",
         )?;
-        fs::remove_dir_all(root.join("release-stage-recovery"))?;
-        fs::remove_file(ledger.join("release-stage-recovery.receipt.json"))?;
-        fs::remove_file(ledger.join("release-stage-recovery.available"))?;
-        let recovered = recover_interrupted(&root, &ledger, &outcome.evidence, &policy)?;
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
         assert_eq!(
             recovered,
             RecoveryOutcome::RecoveredStaged,
@@ -3570,6 +4413,7 @@ mod tests {
             root.join("release-stage-recovery").exists(),
             "final directory exists after staged recovery"
         );
+        validate_artifact_set(&root.join("release-stage-recovery"), &evidence)?;
         Ok(())
     }
 
