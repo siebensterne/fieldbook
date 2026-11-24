@@ -13,6 +13,9 @@ use std::fmt;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::domain::framed_identity;
+use crate::domain::framed_identity::IdentityFormat;
+use crate::domain::framed_identity::IdentityV2Error;
 use crate::domain::identity::OpaqueId;
 use crate::domain::information::Bitemporal;
 
@@ -156,9 +159,39 @@ pub enum ReferenceCoreError {
     /// A coverage cell with identical dimensions was already stored.
     #[error("duplicate coverage cell")]
     DuplicateCoverageCell,
+    /// Declared identity text did not match a supported format.
+    #[error("invalid identity format: {0}")]
+    InvalidIdentityFormat(String),
+    /// Framing or validation of an identity preimage failed.
+    #[error("invalid identity framing: {0}")]
+    InvalidIdentityFraming(String),
+    /// An identity or subject was bound to a conflicting declaration.
+    #[error("identity registration conflict: {0}")]
+    IdentityConflict(String),
+}
+
+impl From<IdentityV2Error> for ReferenceCoreError {
+    fn from(error: IdentityV2Error) -> Self {
+        match error {
+            IdentityV2Error::EmptyField { .. } | IdentityV2Error::FieldTooLong { .. } => {
+                Self::InvalidIdentityFraming(error.to_string())
+            }
+            IdentityV2Error::ConflictingRegistration { .. }
+            | IdentityV2Error::AmbiguousMigration { .. } => {
+                Self::IdentityConflict(error.to_string())
+            }
+            _ => Self::InvalidIdentityFormat(error.to_string()),
+        }
+    }
 }
 
 /// Opaque identity of one canonical financial object.
+///
+/// The stored text keeps a transparent serde representation for persisted
+/// compatibility. Version-2 text is produced by [`Self::derive`]; legacy text
+/// still parses through [`Self::parse_declared`]. Ingress validation belongs to
+/// [`Self::parse_declared`] because the derive of `Deserialize` preserves the
+/// historical wire shape without consulting a validator.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ObjectId(OpaqueId);
@@ -180,9 +213,7 @@ impl ObjectId {
         if stable_key.is_empty() {
             return Err(ReferenceCoreError::EmptyStableKey);
         }
-        Ok(Self::from_validated(
-            class, namespace, authority, stable_key,
-        ))
+        Self::from_validated(class, namespace, authority, stable_key)
     }
 
     fn from_validated(
@@ -190,18 +221,34 @@ impl ObjectId {
         namespace: &str,
         authority: &str,
         stable_key: &str,
-    ) -> Self {
-        Self(OpaqueId::derive(
-            class.as_str(),
-            namespace,
-            authority,
-            stable_key,
-        ))
+    ) -> Result<Self, ReferenceCoreError> {
+        let identity =
+            framed_identity::derive_v2(class.as_str(), namespace, authority, stable_key)?;
+        let opaque = OpaqueId::from_declared(identity.into_string())?;
+        Ok(Self(opaque))
     }
 
     /// Return the opaque identity text.
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// Detect the format of the stored identity text.
+    pub fn identity_format(&self) -> Result<IdentityFormat, ReferenceCoreError> {
+        Ok(framed_identity::detect_format(self.as_str())?)
+    }
+
+    /// Validate declared identity text at a deserialization boundary.
+    ///
+    /// Legacy text is accepted for persisted compatibility. Version-2 text is
+    /// checked against the full serialized shape; malformed text is rejected.
+    pub fn parse_declared(text: &str) -> Result<Self, ReferenceCoreError> {
+        let format = framed_identity::detect_format(text)?;
+        if format == IdentityFormat::V2 {
+            let _ = text.parse::<framed_identity::V2Identity>()?;
+        }
+        let opaque = OpaqueId::from_declared(text.to_owned())?;
+        Ok(Self(opaque))
     }
 }
 
@@ -439,8 +486,11 @@ impl<T> BitemporalAssertion<T> {
         self.bitemporal.as_of(valid_us, knowledge_us)
     }
 
-    /// Derive the identity of this assertion record.
-    pub fn assertion_id(&self) -> ObjectId {
+    /// Derive the version-2 identity of this assertion record.
+    ///
+    /// Framing failures surface as `ReferenceCoreError` instead of producing
+    /// text in an unvalidated format.
+    pub fn assertion_id(&self) -> Result<ObjectId, ReferenceCoreError> {
         ObjectId::from_validated(
             ObjectClass::IdentifierAssertion,
             self.subject.id().as_str(),
@@ -451,9 +501,12 @@ impl<T> BitemporalAssertion<T> {
 
     /// Report whether this record explicitly supersedes another one.
     pub fn supersedes(&self, other: &Self) -> bool {
+        let Ok(other_id) = other.assertion_id() else {
+            return false;
+        };
         self.subject == other.subject
             && self.revision > other.revision
-            && self.predecessor.as_ref() == Some(&other.assertion_id())
+            && self.predecessor.as_ref() == Some(&other_id)
     }
 
     /// Validate the record without consulting any clock.
@@ -525,7 +578,7 @@ impl<T> BitemporalLedger<T> {
                 assertion.subject.id().to_string(),
             ));
         }
-        let own_id = assertion.assertion_id();
+        let own_id = assertion.assertion_id()?;
         if assertion.predecessor.as_ref() == Some(&own_id) {
             return Err(ReferenceCoreError::PredecessorCycle(own_id.to_string()));
         }
@@ -564,13 +617,18 @@ impl<T> BitemporalLedger<T> {
             _ => {}
         }
 
+        let ids_by_index: BTreeMap<usize, &ObjectId> =
+            self.by_id.iter().map(|(id, index)| (*index, id)).collect();
         let heads: Vec<usize> = candidates
             .iter()
             .copied()
             .filter(|index| {
-                let id = self.entries[*index].assertion_id();
+                let id = ids_by_index.get(index).copied();
                 !candidates.iter().any(|other| {
-                    *other != *index && self.entries[*other].predecessor.as_ref() == Some(&id)
+                    *other != *index
+                        && id.is_some_and(|candidate| {
+                            self.entries[*other].predecessor.as_ref() == Some(candidate)
+                        })
                 })
             })
             .collect();
@@ -615,7 +673,7 @@ impl<T> BitemporalLedger<T> {
         let mut visited = BTreeSet::new();
         let mut cursor = Some(start);
         while let Some(index) = cursor {
-            if !visited.insert(index) || self.entries[index].assertion_id() == *target {
+            if !visited.insert(index) || self.by_id.get(target) == Some(&index) {
                 return true;
             }
             cursor = self.entries[index]
@@ -982,6 +1040,72 @@ mod tests {
     }
 
     #[test]
+    fn object_id_derivation_uses_versioned_framing() {
+        let derived = ObjectId::derive(ObjectClass::Security, "ns-a", "authority-a", "key-7")
+            .expect("versioned object id");
+        assert!(
+            derived.as_str().starts_with("security:v2:"),
+            "derived text must carry the class and version"
+        );
+        assert_eq!(
+            derived.identity_format(),
+            Ok(IdentityFormat::V2),
+            "derived identity must detect as v2"
+        );
+        assert_eq!(
+            ObjectId::parse_declared(derived.as_str()).expect("round-trip parse"),
+            derived,
+            "declared v2 text must round-trip"
+        );
+    }
+
+    #[test]
+    fn legacy_object_id_text_is_accepted_without_coercion() {
+        let legacy = OpaqueId::derive("inst", "ns-a", "authority-a", "key-a").to_string();
+        let parsed = ObjectId::parse_declared(&legacy).expect("legacy declared identity");
+        assert_eq!(
+            parsed.identity_format(),
+            Ok(IdentityFormat::Legacy),
+            "legacy text must remain detectable as legacy"
+        );
+        assert_eq!(
+            parsed.as_str(),
+            legacy,
+            "legacy text must be retained verbatim"
+        );
+    }
+
+    #[test]
+    fn malformed_declared_identity_is_rejected() {
+        for invalid in [
+            "",
+            "not-an-identity",
+            "security:v2:abc",
+            "inst:nothexdigits000000000000",
+        ] {
+            assert!(
+                matches!(
+                    ObjectId::parse_declared(invalid),
+                    Err(ReferenceCoreError::InvalidIdentityFormat(_))
+                ),
+                "malformed declared text `{invalid}` must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn framing_failure_maps_to_reference_core_error() {
+        let overlength = "x".repeat(framed_identity::MAX_FIELD_BYTES + 1);
+        assert!(
+            matches!(
+                ObjectId::derive(ObjectClass::Security, &overlength, "authority-a", "key-a"),
+                Err(ReferenceCoreError::InvalidIdentityFraming(_))
+            ),
+            "overlength framing input must map to a framing error"
+        );
+    }
+
+    #[test]
     fn assertion_applies_only_inside_valid_and_knowledge_intervals() {
         let subject = object_ref(ObjectClass::Security, "key-1");
         let item = assertion("value-a", &subject, "authority-a", 100, Some(200), 50, 1);
@@ -1124,7 +1248,7 @@ mod tests {
             bitemporal: Bitemporal::new(10, 40),
             source: "source-a".to_owned(),
             revision: 2,
-            predecessor: Some(first.assertion_id()),
+            predecessor: Some(first.assertion_id().expect("first assertion identity")),
         };
         assert!(
             second.supersedes(&first),
@@ -1214,7 +1338,7 @@ mod tests {
             revision: 4,
             predecessor: None,
         };
-        let own_id = cycle.assertion_id();
+        let own_id = cycle.assertion_id().expect("cycle assertion identity");
         cycle.predecessor = Some(own_id);
         let mut ledger = BitemporalLedger::new();
         assert!(
@@ -1243,7 +1367,7 @@ mod tests {
             bitemporal: Bitemporal::new(10, 30),
             source: "source-a".to_owned(),
             revision: 2,
-            predecessor: Some(first.assertion_id()),
+            predecessor: Some(first.assertion_id().expect("first assertion identity")),
         };
         let third = BitemporalAssertion {
             subject: subject.clone(),
@@ -1251,7 +1375,7 @@ mod tests {
             bitemporal: Bitemporal::new(10, 40),
             source: "source-a".to_owned(),
             revision: 3,
-            predecessor: Some(second.assertion_id()),
+            predecessor: Some(second.assertion_id().expect("second assertion identity")),
         };
         let mut ledger = BitemporalLedger::new();
         ledger.insert(first).expect("first record");

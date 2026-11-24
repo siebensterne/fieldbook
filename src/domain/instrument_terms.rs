@@ -1395,7 +1395,13 @@ mod tests {
             rebalance_frequency: RebalanceFrequency::Annual,
         });
         let first = revision(&subject, payload.clone(), 1, 10, None);
-        let second = revision(&subject, payload, 2, 40, Some(first.assertion_id()));
+        let second = revision(
+            &subject,
+            payload,
+            2,
+            40,
+            Some(first.assertion_id().expect("first assertion identity")),
+        );
         let mut registry = TermsRegistry::new();
         registry.insert(first).expect("first revision");
         let head = registry.insert(second).expect("second revision");

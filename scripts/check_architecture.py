@@ -108,6 +108,7 @@ SOURCE_RESPONSIBILITIES = {
     "src/market_state/histogram.rs": "fixed-bucket stage-latency histograms, nearest-rank percentiles and unavailable-boundary reporting",
     "src/distribution/inspect.rs": "offline SBE capture inspection command",
     "src/domain/identity.rs": "persistent opaque instrument/venue/listing identities, effective-dated mappings and as-of resolution",
+    "src/domain/framed_identity.rs": "versioned length-framed object identity derivation, strict format detection, parsing and fail-closed identity/subject registration",
     "src/integrity/journal.rs": "raw-frame journal writer, segment/manifest format, verification, ordered reading",
     "src/integrity/journal/tests.rs": "journal unit tests for framing, checksums, durability, recovery, and failure handling",
     "src/integrity/latency.rs": "latency experiment orchestration and result output",
