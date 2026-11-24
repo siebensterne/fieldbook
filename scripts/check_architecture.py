@@ -146,6 +146,8 @@ SOURCE_RESPONSIBILITIES = {
     "src/distribution/metrics.rs": "metrics registry, Prometheus text encoding, HTTP health/metrics endpoint",
     "src/distribution/ndc_release.rs": "NDC v2 release producer: strict typed manifest and sidecar, RFC 8785 JCS, canonical record streams, dataset digests, injected-key signing, interruption recovery and no-replace durable publication",
     "src/distribution/ndc_wire.rs": "canonical NDC v2 Profile 1 wire mapping: strict typed wire values, byte-derived record ordering, full rights and PROV evidence, registration checks, conformance release assembly and exclusive release writing",
+    "src/distribution/ndc_stream.rs": "bounded streaming NDC v2 producer: one-record source and framer, byte-derived incremental order check, stored and expanded digests, deterministic gzip staging, two-intent seal, replay proof and spool quarantine",
+    "src/distribution/stream_profile.rs": "immutable versioned resource-profile contract with validated private limits, domain-separated digest, four processing roles and trusted local test-only selection",
     "src/bin/ndc-conformance-producer.rs": "conformance producer executable: abstract spec parsing, fixed test-only Ed25519 seed, canonical release writing and typed nonzero failure",
     "src/domain/model.rs": "normalized market, source, event, control, and output domain types",
     "src/market_state/orderbook.rs": "normalized order-book representation and mutation invariants",
