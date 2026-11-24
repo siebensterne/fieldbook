@@ -90,6 +90,9 @@ rather than a rewrite of history.
 - [Publication journal durability](docs/fb-pub-017-journal-durability-2026-11-24.md)
   — FB-PUB-017 stage-record digest chain, ledger directory barriers,
   provisioning requirement and gate record.
+- [Bottom-up directory durability](docs/fb-pub-019-directory-durability-2026-11-24.md)
+  — FB-PUB-019 journal schema v2, directory-entry and tree barriers, legacy
+  compatibility rule and gate record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)
