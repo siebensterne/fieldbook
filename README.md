@@ -78,6 +78,8 @@ rather than a rewrite of history.
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Instrument classes and typed terms](docs/fb-ref-002-instrument-terms-2026-11-24.md)
   — FB-REF-002 unit-bearing measures, family terms and revision record.
+- [Jurisdiction, venue and product registry](docs/fb-ref-004-market-registry-2026-11-24.md)
+  — FB-REF-004 country packs, typed assertions and registry resolution record.
 
 Format contracts: [replay format](docs/replay-format.md),
 [raw-frame journal](docs/raw-frame-journal.md),
