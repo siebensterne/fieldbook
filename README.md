@@ -96,6 +96,9 @@ rather than a rewrite of history.
 - [Restart-independent publication recovery](docs/fb-pub-020-restart-independent-recovery-2026-11-24.md)
   — FB-PUB-020 immutable intent, v2 intent binding, fresh-process recovery and
   quarantine rule with gate record.
+- [Descriptor-relative artifact tree validation](docs/fb-pub-021-artifact-tree-validation-2026-11-24.md)
+  — FB-PUB-021 no-follow descriptor access, exact entry sets, digest binding,
+  hard-link policy and platform limits with gate record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)
