@@ -244,6 +244,62 @@ impl PublicationState {
             Self::Available => "AVAILABLE",
         }
     }
+
+    /// Position of this state in the ratified transition sequence.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::StagingCreated => 0,
+            Self::FilesWritten => 1,
+            Self::FilesSynced => 2,
+            Self::StagingDirFsynced => 3,
+            Self::AtomicNoReplaceRename => 4,
+            Self::ParentDirFsynced => 5,
+            Self::DurablePublicationReceipt => 6,
+            Self::Available => 7,
+        }
+    }
+}
+
+const STAGE_ORDER: [PublicationState; 8] = [
+    PublicationState::StagingCreated,
+    PublicationState::FilesWritten,
+    PublicationState::FilesSynced,
+    PublicationState::StagingDirFsynced,
+    PublicationState::AtomicNoReplaceRename,
+    PublicationState::ParentDirFsynced,
+    PublicationState::DurablePublicationReceipt,
+    PublicationState::Available,
+];
+
+/// Ordered events emitted by the publication filesystem during recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "durable events are constructed by the offline recording filesystem"
+    )
+)]
+enum PublicationRecoveryEvent {
+    /// The final directory name was observed.
+    FinalDirectoryFound,
+    /// Final directory bytes were verified against the validated intent.
+    VerifyFinalDirectory,
+    /// Durable operation evidence was bound to this operation and release.
+    VerifyOperationIdentity,
+    /// The release parent directory was synced.
+    SyncReleaseParent,
+    /// The synced stage was read back and validated.
+    VerifyDurabilityTransition,
+    /// The receipt file was committed.
+    CommitReceipt,
+    /// The receipt ledger directory was synced.
+    SyncReceiptLedger,
+    /// The availability marker was committed.
+    CommitAvailabilityMarker,
+    /// The final available stage was committed.
+    Available,
 }
 
 /// Durable publication receipt. The receipt, not directory presence, is the
@@ -310,6 +366,12 @@ pub struct PublicationEvidence {
     pub artifact_paths: Vec<String>,
     /// Stored digests aligned with `artifact_paths`.
     pub artifact_stored_sha256: Vec<String>,
+    /// Receipt built by `prepare_release` from the complete validated intent,
+    /// including manifest lineage. Recovery does not rebuild this value from
+    /// the other, narrower fields.
+    pub expected_receipt: PublicationReceipt,
+    /// Digest of the exact receipt bytes committed by the builder.
+    pub receipt_sha256: String,
 }
 
 /// Typed resource policy. Every numeric maximum is supplied by the caller;
@@ -981,6 +1043,8 @@ impl ToJcs for PublicationEvidence {
                         .collect(),
                 ),
             ),
+            ("expected_receipt", self.expected_receipt.to_jcs()?),
+            ("receipt_sha256", jcs_string(self.receipt_sha256.clone())),
         ]))
     }
 }
@@ -2101,28 +2165,31 @@ fn prepare_release(request: &BuildRequest<'_>) -> Result<PreparedRelease, Produc
         stored_digests.push(item.descriptor.stored_sha256.clone());
         artifacts.push((item.descriptor.path, item.stored));
     }
-    let evidence = PublicationEvidence {
+    let receipt = PublicationReceipt {
+        schema_version: MANIFEST_SCHEMA_VERSION,
         release_id: manifest.release_identity.release_id.clone(),
         manifest_sha256: manifest_sha256.clone(),
         data_sha256: data_sha256.clone(),
         publication_operation_id: request.operation_id.to_owned(),
         commit_position: request.commit_position.to_owned(),
-        artifact_paths: stored_paths,
-        artifact_stored_sha256: stored_digests,
-    };
-    let receipt = PublicationReceipt {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        release_id: evidence.release_id.clone(),
-        manifest_sha256: manifest_sha256.clone(),
-        data_sha256: data_sha256.clone(),
-        publication_operation_id: evidence.publication_operation_id.clone(),
-        commit_position: evidence.commit_position.clone(),
         result: PublicationState::Available,
         supersedes_release_id: manifest
             .lineage
             .supersedes
             .as_ref()
             .map(|value| value.supersedes_release_id.clone()),
+    };
+    let receipt_bytes = receipt_file_bytes(&receipt, request.policy)?;
+    let evidence = PublicationEvidence {
+        release_id: receipt.release_id.clone(),
+        manifest_sha256: manifest_sha256.clone(),
+        data_sha256: data_sha256.clone(),
+        publication_operation_id: request.operation_id.to_owned(),
+        commit_position: request.commit_position.to_owned(),
+        artifact_paths: stored_paths,
+        artifact_stored_sha256: stored_digests,
+        expected_receipt: receipt.clone(),
+        receipt_sha256: hex_encode(&sha256(&receipt_bytes)),
     };
     Ok(PreparedRelease {
         manifest_bytes,
@@ -2188,35 +2255,226 @@ fn next_stage_ordinal(ledger: &Path, operation_id: &str) -> Result<u32, Producer
         .map_or(0, |(ordinal, _)| ordinal.saturating_add(1)))
 }
 
-fn read_stage_operations(
+fn receipt_file_bytes(
+    receipt: &PublicationReceipt,
+    policy: &ResourcePolicy,
+) -> Result<Vec<u8>, ProducerError> {
+    let mut bytes = canonicalize_strict(&receipt.to_jcs()?, policy)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn stage_for_state(
+    operation: &PublicationOperation,
+    state: PublicationState,
+) -> PublicationOperation {
+    let mut staged = operation.clone();
+    staged.stage = state;
+    staged
+}
+
+fn stage_file_parts(name: &str) -> Option<(String, u32)> {
+    let stem = name.strip_suffix(".json")?;
+    let (operation_id, ordinal_text) = stem.rsplit_once(".stage.")?;
+    if operation_id.is_empty() {
+        return None;
+    }
+    let ordinal = ordinal_text.parse::<u32>().ok()?;
+    Some((operation_id.to_owned(), ordinal))
+}
+
+fn read_all_stage_operations(
     ledger: &Path,
-    operation_id: &str,
-) -> Result<Vec<(u32, PublicationOperation)>, ProducerError> {
+) -> Result<Vec<(String, u32, PublicationOperation)>, ProducerError> {
     let entries = fs::read_dir(ledger)
         .map_err(|error| io_error(&format!("read ledger {}", ledger.display()), error))?;
     let mut found = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| io_error("read ledger entry", error))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        let prefix = format!("{operation_id}.stage.");
-        let Some(rest) = name.strip_prefix(&prefix) else {
+        let Some((operation_id, ordinal)) = stage_file_parts(&name) else {
             continue;
         };
-        let Some(ordinal_text) = rest.strip_suffix(".json") else {
-            continue;
-        };
-        let ordinal = ordinal_text
-            .parse::<u32>()
-            .map_err(|_| ProducerError::PublicationEvidence("invalid stage ordinal".to_owned()))?;
         let bytes = fs::read(entry.path())
             .map_err(|error| io_error(&format!("read stage {name}"), error))?;
         let operation: PublicationOperation = serde_json::from_slice(&bytes).map_err(|error| {
             ProducerError::PublicationEvidence(format!("invalid stage evidence: {error}"))
         })?;
-        found.push((ordinal, operation));
+        found.push((operation_id, ordinal, operation));
     }
-    found.sort_by_key(|(ordinal, _)| *ordinal);
+    found.sort_by_key(|(operation_id, ordinal, _)| (operation_id.clone(), *ordinal));
     Ok(found)
+}
+
+fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(), ProducerError> {
+    let Some((first_ordinal, first)) = stages.first() else {
+        return Ok(());
+    };
+    if *first_ordinal != 0 {
+        return Err(ProducerError::PublicationEvidence(format!(
+            "stage history starts at ordinal {first_ordinal} instead of 0"
+        )));
+    }
+    let mut previous: Option<&PublicationOperation> = None;
+    for (index, (ordinal, operation)) in stages.iter().enumerate() {
+        let expected_ordinal = u32::try_from(index).map_err(|_| {
+            ProducerError::PublicationEvidence("stage ordinal exceeds addressable range".to_owned())
+        })?;
+        if *ordinal != expected_ordinal {
+            return Err(ProducerError::PublicationEvidence(format!(
+                "stage ordinal {ordinal} repeats or skips position {expected_ordinal}"
+            )));
+        }
+        let expected_state = STAGE_ORDER.get(index).ok_or_else(|| {
+            ProducerError::PublicationEvidence("stage history exceeds the state machine".to_owned())
+        })?;
+        if operation.stage != *expected_state {
+            return Err(ProducerError::PublicationEvidence(format!(
+                "stage {ordinal} records {} instead of {}",
+                operation.stage.as_str(),
+                expected_state.as_str()
+            )));
+        }
+        if operation.schema_version != MANIFEST_SCHEMA_VERSION {
+            return Err(ProducerError::PublicationEvidence(format!(
+                "stage {ordinal} carries schema version {}",
+                operation.schema_version
+            )));
+        }
+        if operation.operation_id != first.operation_id
+            || operation.release_id != first.release_id
+            || operation.manifest_sha256 != first.manifest_sha256
+            || operation.data_sha256 != first.data_sha256
+            || operation.commit_position != first.commit_position
+            || operation.staging_directory != first.staging_directory
+            || operation.final_directory != first.final_directory
+        {
+            return Err(ProducerError::PublicationEvidence(format!(
+                "stage {ordinal} conflicts with the operation identity at ordinal 0"
+            )));
+        }
+        if let Some(prior) = previous
+            && operation.stage.rank() < prior.stage.rank()
+        {
+            return Err(ProducerError::PublicationEvidence(format!(
+                "stage {ordinal} regresses from {} to {}",
+                prior.stage.as_str(),
+                operation.stage.as_str()
+            )));
+        }
+        previous = Some(operation);
+    }
+    Ok(())
+}
+
+fn validate_stage_history(
+    stages: &[(u32, PublicationOperation)],
+    evidence: &PublicationEvidence,
+) -> Result<(), ProducerError> {
+    validate_stage_sequence(stages)?;
+    for (ordinal, operation) in stages {
+        if operation.operation_id != evidence.publication_operation_id
+            || operation.release_id != evidence.release_id
+            || operation.manifest_sha256 != evidence.manifest_sha256
+            || operation.data_sha256 != evidence.data_sha256
+            || operation.commit_position != evidence.commit_position
+        {
+            return Err(ProducerError::UncertainPublication(format!(
+                "stage {ordinal} does not bind to the supplied publication intent"
+            )));
+        }
+        if operation.staging_directory != staging_name(&operation.operation_id)
+            || operation.final_directory != evidence.release_id
+        {
+            return Err(ProducerError::UncertainPublication(format!(
+                "stage {ordinal} does not bind to the declared staging and final paths"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_stage_operations(
+    ledger: &Path,
+    operation_id: &str,
+) -> Result<Vec<(u32, PublicationOperation)>, ProducerError> {
+    let all = read_all_stage_operations(ledger)?;
+    let mut found: Vec<(u32, PublicationOperation)> = all
+        .into_iter()
+        .filter(|(name, _ordinal, operation)| {
+            name == operation_id && operation.operation_id == *name
+        })
+        .map(|(_, ordinal, operation)| (ordinal, operation))
+        .collect();
+    found.sort_by_key(|(ordinal, _)| *ordinal);
+    validate_stage_sequence(&found)?;
+    Ok(found)
+}
+
+fn verify_durable_stage(
+    ledger: &Path,
+    evidence: &PublicationEvidence,
+    minimum: PublicationState,
+) -> Result<(), ProducerError> {
+    let stages = read_stage_operations(ledger, &evidence.publication_operation_id)?;
+    validate_stage_history(&stages, evidence)?;
+    let (_, operation) = stages.last().ok_or_else(|| {
+        ProducerError::UncertainPublication("no durable stage evidence to verify".to_owned())
+    })?;
+    if operation.stage.rank() < minimum.rank() {
+        return Err(ProducerError::UncertainPublication(format!(
+            "durable stage {} precedes required {}",
+            operation.stage.as_str(),
+            minimum.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn find_foreign_rename_evidence(
+    ledger: &Path,
+    evidence: &PublicationEvidence,
+) -> Result<(), ProducerError> {
+    let all = read_all_stage_operations(ledger)?;
+    for (operation_id, ordinal, operation) in all {
+        if operation_id == evidence.publication_operation_id
+            || operation.release_id != evidence.release_id
+            || operation.stage.rank() < PublicationState::AtomicNoReplaceRename.rank()
+        {
+            continue;
+        }
+        return Err(ProducerError::UncertainPublication(format!(
+            "release {} was renamed by operation {} at stage {ordinal}",
+            evidence.release_id, operation_id
+        )));
+    }
+    Ok(())
+}
+
+fn verify_operation_identity(
+    final_dir: &Path,
+    evidence: &PublicationEvidence,
+    operation: &PublicationOperation,
+    ledger: &Path,
+) -> Result<(), ProducerError> {
+    if operation.stage.rank() < PublicationState::AtomicNoReplaceRename.rank() {
+        return Err(ProducerError::UncertainPublication(format!(
+            "operation {} has no durable rename evidence",
+            operation.operation_id
+        )));
+    }
+    if operation.final_directory != evidence.release_id
+        || operation.staging_directory != staging_name(&operation.operation_id)
+        || final_dir
+            .file_name()
+            .is_none_or(|name| name != evidence.release_id.as_str())
+    {
+        return Err(ProducerError::UncertainPublication(format!(
+            "operation {} does not own the final release directory",
+            operation.operation_id
+        )));
+    }
+    find_foreign_rename_evidence(ledger, evidence)
 }
 
 fn validate_artifact_set(
@@ -2307,15 +2565,74 @@ fn validate_artifact_set(
 /// Injection points used by the offline crash-state tests. Production passes
 /// the default value, which enables every transition in sequence.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "boundary faults are configured by the offline crash tests"
+    )
+)]
 struct PublicationFaults {
     /// Return an error after staging sync and before the directory rename.
     fail_before_rename: bool,
-    /// Return an error after the rename and before the parent directory sync.
+    /// Return an error after the rename syscall and before its stage record.
+    fail_after_rename_before_stage: bool,
+    /// Return an error after the rename stage and before the parent sync.
+    fail_after_rename: bool,
+    /// Return an error before the parent directory sync runs.
     fail_parent_dir_sync: bool,
     /// Return an error after the parent sync and before the receipt commit.
+    fail_after_parent_sync: bool,
+    /// Return an error after creating an empty receipt and before writing it.
     fail_receipt_commit: bool,
-    /// Return an error after the receipt and before the availability marker.
+    /// Return an error after the receipt file sync and before the ledger sync.
+    fail_receipt_ledger_sync: bool,
+    /// Return an error after creating an empty marker and before writing it.
     fail_marker_commit: bool,
+    /// Return an error after the marker file sync and before the ledger sync.
+    fail_marker_ledger_sync: bool,
+}
+
+/// Filesystem boundary used by publication and recovery. The production
+/// implementation performs host calls; the offline implementation records
+/// every boundary so crash tests can assert durable operation order.
+trait PublicationFs {
+    /// Record one logical publication event.
+    fn record(&self, event: PublicationRecoveryEvent);
+
+    /// Sync the parent directory that holds the final release name.
+    fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError>;
+
+    /// Create, write and sync one durable receipt file.
+    fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError>;
+
+    /// Sync the receipt ledger directory entry after a durable commit.
+    fn sync_receipt_ledger(&self, ledger: &Path) -> Result<(), ProducerError>;
+
+    /// Create, write and sync one availability marker file.
+    fn commit_availability_marker(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError>;
+}
+
+struct RealPublicationFs;
+
+impl PublicationFs for RealPublicationFs {
+    fn record(&self, _event: PublicationRecoveryEvent) {}
+
+    fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError> {
+        sync_directory(root)
+    }
+
+    fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
+        write_new_file(path, bytes)
+    }
+
+    fn sync_receipt_ledger(&self, ledger: &Path) -> Result<(), ProducerError> {
+        sync_directory(ledger)
+    }
+
+    fn commit_availability_marker(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
+        write_new_file(path, bytes)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -2426,7 +2743,7 @@ fn ensure_sibling_release_paths(staging: &Path, final_dir: &Path) -> Result<(), 
 
 #[expect(
     clippy::too_many_arguments,
-    reason = "the publication boundary carries its two paths, evidence, durability policy and injected faults"
+    reason = "the publication boundary carries two paths, operation evidence, a policy, injected faults and a filesystem boundary"
 )]
 fn finalize_publication(
     root: &Path,
@@ -2437,6 +2754,7 @@ fn finalize_publication(
     receipt: &PublicationReceipt,
     policy: &ResourcePolicy,
     faults: PublicationFaults,
+    fs: &dyn PublicationFs,
 ) -> Result<(), ProducerError> {
     ensure_sibling_release_paths(staging, final_dir)?;
     let start = next_stage_ordinal(ledger, &operation.operation_id)?;
@@ -2454,58 +2772,61 @@ fn finalize_publication(
             io_error("atomic no-replace directory rename", error)
         }
     })?;
+    if faults.fail_after_rename_before_stage {
+        return Err(io_error(
+            "injected failure after the rename syscall",
+            io::Error::other("injected failure after the rename syscall"),
+        ));
+    }
     // The rename has committed before this label is written. No stage record
     // claims a rename that did not run.
-    let mut renamed = operation.clone();
-    renamed.stage = PublicationState::AtomicNoReplaceRename;
-    write_stage(ledger, &renamed, start, policy)?;
+    write_stage(
+        ledger,
+        &stage_for_state(operation, PublicationState::AtomicNoReplaceRename),
+        start,
+        policy,
+    )?;
 
-    if faults.fail_parent_dir_sync {
+    if faults.fail_after_rename {
         return Err(io_error(
-            "injected parent directory sync failure",
-            io::Error::other("injected parent directory sync failure"),
+            "injected failure after the directory rename",
+            io::Error::other("injected failure after the directory rename"),
         ));
     }
-    sync_directory(root)?;
-    let mut synced = operation.clone();
-    synced.stage = PublicationState::ParentDirFsynced;
-    write_stage(ledger, &synced, start + 1, policy)?;
+    fs.sync_release_parent(root)?;
+    write_stage(
+        ledger,
+        &stage_for_state(operation, PublicationState::ParentDirFsynced),
+        start + 1,
+        policy,
+    )?;
 
-    if faults.fail_receipt_commit {
-        return Err(io_error(
-            "injected receipt commit failure",
-            io::Error::other("injected receipt commit failure"),
-        ));
-    }
-    let bytes = canonicalize_strict(&receipt.to_jcs()?, policy)?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
     let receipt_path = ledger.join(format!("{}.receipt.json", receipt.release_id));
-    write_new_file(&receipt_path, &bytes)?;
-    sync_directory(ledger)?;
-    let mut received = operation.clone();
-    received.stage = PublicationState::DurablePublicationReceipt;
-    write_stage(ledger, &received, start + 2, policy)?;
+    fs.commit_receipt(&receipt_path, &receipt_file_bytes(receipt, policy)?)?;
+    fs.sync_receipt_ledger(ledger)?;
+    write_stage(
+        ledger,
+        &stage_for_state(operation, PublicationState::DurablePublicationReceipt),
+        start + 2,
+        policy,
+    )?;
 
-    if faults.fail_marker_commit {
-        return Err(io_error(
-            "injected availability marker failure",
-            io::Error::other("injected availability marker failure"),
-        ));
-    }
     let marker = ledger.join(format!("{}.available", receipt.release_id));
-    write_new_file(&marker, operation.operation_id.as_bytes())?;
-    sync_directory(ledger)?;
-    let mut available = operation.clone();
-    available.stage = PublicationState::Available;
-    write_stage(ledger, &available, start + 3, policy)?;
+    fs.commit_availability_marker(&marker, operation.operation_id.as_bytes())?;
+    fs.sync_receipt_ledger(ledger)?;
+    write_stage(
+        ledger,
+        &stage_for_state(operation, PublicationState::Available),
+        start + 3,
+        policy,
+    )?;
     Ok(())
 }
 
 fn load_receipt(
     ledger: &Path,
     release_id: &str,
-) -> Result<Option<PublicationReceipt>, ProducerError> {
+) -> Result<Option<(Vec<u8>, PublicationReceipt)>, ProducerError> {
     let path = ledger.join(format!("{release_id}.receipt.json"));
     if !path.exists() {
         return Ok(None);
@@ -2513,31 +2834,149 @@ fn load_receipt(
     let bytes = fs::read(&path)
         .map_err(|error| io_error(&format!("read receipt {}", path.display()), error))?;
     let receipt: PublicationReceipt = serde_json::from_slice(&bytes).map_err(|error| {
-        ProducerError::PublicationEvidence(format!("invalid durable receipt: {error}"))
+        ProducerError::UncertainPublication(format!("durable receipt is unreadable: {error}"))
     })?;
-    Ok(Some(receipt))
+    Ok(Some((bytes, receipt)))
 }
 
-fn receipt_matches(receipt: &PublicationReceipt, evidence: &PublicationEvidence) -> bool {
-    receipt.release_id == evidence.release_id
+fn receipt_matches(
+    receipt: &PublicationReceipt,
+    bytes: &[u8],
+    evidence: &PublicationEvidence,
+) -> bool {
+    receipt.schema_version == evidence.expected_receipt.schema_version
+        && receipt.release_id == evidence.release_id
         && receipt.manifest_sha256 == evidence.manifest_sha256
         && receipt.data_sha256 == evidence.data_sha256
         && receipt.publication_operation_id == evidence.publication_operation_id
         && receipt.commit_position == evidence.commit_position
         && receipt.result == PublicationState::Available
+        && receipt.supersedes_release_id == evidence.expected_receipt.supersedes_release_id
+        && hex_encode(&sha256(bytes)) == evidence.receipt_sha256
 }
 
 fn recovery_receipt(evidence: &PublicationEvidence) -> PublicationReceipt {
-    PublicationReceipt {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        release_id: evidence.release_id.clone(),
-        manifest_sha256: evidence.manifest_sha256.clone(),
-        data_sha256: evidence.data_sha256.clone(),
-        publication_operation_id: evidence.publication_operation_id.clone(),
-        commit_position: evidence.commit_position.clone(),
-        result: PublicationState::Available,
-        supersedes_release_id: None,
+    evidence.expected_receipt.clone()
+}
+
+fn advance_recovery_stage(
+    ledger: &Path,
+    evidence: &PublicationEvidence,
+    operation: &PublicationOperation,
+    state: PublicationState,
+    policy: &ResourcePolicy,
+) -> Result<(), ProducerError> {
+    let ordinal = next_stage_ordinal(ledger, &operation.operation_id)?;
+    write_stage(ledger, &stage_for_state(operation, state), ordinal, policy)?;
+    verify_durable_stage(ledger, evidence, state)
+}
+
+fn recover_final_directory(
+    root: &Path,
+    ledger: &Path,
+    evidence: &PublicationEvidence,
+    policy: &ResourcePolicy,
+    operation: &PublicationOperation,
+    stages: &[(u32, PublicationOperation)],
+    fs: &dyn PublicationFs,
+) -> Result<RecoveryOutcome, ProducerError> {
+    let final_dir = root.join(&operation.final_directory);
+    fs.record(PublicationRecoveryEvent::FinalDirectoryFound);
+    fs.record(PublicationRecoveryEvent::VerifyFinalDirectory);
+    validate_artifact_set(&final_dir, evidence, policy)?;
+    fs.record(PublicationRecoveryEvent::VerifyOperationIdentity);
+    verify_operation_identity(&final_dir, evidence, operation, ledger)?;
+
+    let mut last = stages
+        .last()
+        .map(|(_, staged)| staged.stage)
+        .ok_or_else(|| {
+            ProducerError::UncertainPublication(
+                "no durable operation stage to reconcile".to_owned(),
+            )
+        })?;
+    let receipt_path = ledger.join(format!("{}.receipt.json", evidence.release_id));
+    let marker_path = ledger.join(format!("{}.available", evidence.release_id));
+    let receipt_present = receipt_path.exists();
+    if receipt_present {
+        let Some((bytes, receipt)) = load_receipt(ledger, &evidence.release_id)? else {
+            return Err(ProducerError::UncertainPublication(
+                "durable receipt disappeared during recovery".to_owned(),
+            ));
+        };
+        if !receipt_matches(&receipt, &bytes, evidence) {
+            return Err(ProducerError::UncertainPublication(
+                "durable receipt does not bind to the supplied evidence".to_owned(),
+            ));
+        }
     }
+    let marker_present = marker_path.exists();
+    if marker_present {
+        if !receipt_present {
+            return Err(ProducerError::UncertainPublication(
+                "availability marker without a durable receipt".to_owned(),
+            ));
+        }
+        let bytes = fs::read(&marker_path)
+            .map_err(|error| io_error(&format!("read marker {}", marker_path.display()), error))?;
+        if bytes != operation.operation_id.as_bytes() {
+            return Err(ProducerError::UncertainPublication(
+                "availability marker binds to a different operation".to_owned(),
+            ));
+        }
+        if last == PublicationState::Available {
+            fs.record(PublicationRecoveryEvent::Available);
+            return Ok(RecoveryOutcome::AlreadyAvailable);
+        }
+    }
+
+    if last.rank() < PublicationState::ParentDirFsynced.rank() {
+        fs.sync_release_parent(root)?;
+        advance_recovery_stage(
+            ledger,
+            evidence,
+            operation,
+            PublicationState::ParentDirFsynced,
+            policy,
+        )?;
+        last = PublicationState::ParentDirFsynced;
+    }
+    fs.record(PublicationRecoveryEvent::VerifyDurabilityTransition);
+    verify_durable_stage(ledger, evidence, PublicationState::ParentDirFsynced)?;
+
+    if !receipt_present {
+        fs.commit_receipt(
+            &receipt_path,
+            &receipt_file_bytes(&recovery_receipt(evidence), policy)?,
+        )?;
+    }
+    fs.sync_receipt_ledger(ledger)?;
+    if last.rank() < PublicationState::DurablePublicationReceipt.rank() {
+        advance_recovery_stage(
+            ledger,
+            evidence,
+            operation,
+            PublicationState::DurablePublicationReceipt,
+            policy,
+        )?;
+        last = PublicationState::DurablePublicationReceipt;
+    }
+
+    if !marker_present {
+        fs.commit_availability_marker(&marker_path, operation.operation_id.as_bytes())?;
+    }
+    fs.sync_receipt_ledger(ledger)?;
+    if last.rank() < PublicationState::Available.rank() {
+        advance_recovery_stage(
+            ledger,
+            evidence,
+            operation,
+            PublicationState::Available,
+            policy,
+        )?;
+    }
+    fs.record(PublicationRecoveryEvent::Available);
+    Ok(RecoveryOutcome::RecoveredPublished)
 }
 
 /// Reconcile an interrupted publication from durable operation evidence.
@@ -2547,62 +2986,37 @@ pub fn recover_interrupted(
     evidence: &PublicationEvidence,
     policy: &ResourcePolicy,
 ) -> Result<RecoveryOutcome, ProducerError> {
+    let fs = RealPublicationFs;
+    recover_interrupted_inner(root, ledger, evidence, policy, &fs)
+}
+
+fn recover_interrupted_inner(
+    root: &Path,
+    ledger: &Path,
+    evidence: &PublicationEvidence,
+    policy: &ResourcePolicy,
+    fs: &dyn PublicationFs,
+) -> Result<RecoveryOutcome, ProducerError> {
     let stages = read_stage_operations(ledger, &evidence.publication_operation_id)?;
-    let Some((_, operation)) = stages.last() else {
+    if stages.is_empty() {
         return Ok(RecoveryOutcome::NoEvidence);
-    };
-    if operation.release_id != evidence.release_id
-        || operation.manifest_sha256 != evidence.manifest_sha256
-        || operation.data_sha256 != evidence.data_sha256
-        || operation.commit_position != evidence.commit_position
-    {
-        return Err(ProducerError::UncertainPublication(
-            "operation evidence does not bind to the supplied release".to_owned(),
-        ));
     }
+    validate_stage_history(&stages, evidence)?;
+    let operation = stages
+        .last()
+        .map(|(_, staged)| staged.clone())
+        .ok_or_else(|| {
+            ProducerError::UncertainPublication(
+                "no durable operation stage to reconcile".to_owned(),
+            )
+        })?;
     let staging = root.join(&operation.staging_directory);
     let final_dir = root.join(&operation.final_directory);
-    if let Some(receipt) = load_receipt(ledger, &evidence.release_id)? {
-        if !receipt_matches(&receipt, evidence) {
-            return Err(ProducerError::UncertainPublication(
-                "durable receipt does not bind to the supplied evidence".to_owned(),
-            ));
-        }
-        if !final_dir.exists() {
-            return Err(ProducerError::UncertainPublication(
-                "durable receipt without a final release directory".to_owned(),
-            ));
-        }
-        validate_artifact_set(&final_dir, evidence, policy)?;
-        let marker = ledger.join(format!("{}.available", evidence.release_id));
-        if !marker.exists() {
-            write_new_file(&marker, operation.operation_id.as_bytes())?;
-            sync_directory(ledger)?;
-            return Ok(RecoveryOutcome::RecoveredPublished);
-        }
-        return Ok(RecoveryOutcome::AlreadyAvailable);
-    }
     if final_dir.exists() {
-        validate_artifact_set(&final_dir, evidence, policy)?;
-        let bytes = canonicalize_strict(&recovery_receipt(evidence).to_jcs()?, policy)?;
-        let mut bytes = bytes;
-        bytes.push(b'\n');
-        let receipt_path = ledger.join(format!("{}.receipt.json", evidence.release_id));
-        write_new_file(&receipt_path, &bytes)?;
-        let marker = ledger.join(format!("{}.available", evidence.release_id));
-        write_new_file(&marker, operation.operation_id.as_bytes())?;
-        sync_directory(ledger)?;
-        return Ok(RecoveryOutcome::RecoveredPublished);
+        return recover_final_directory(root, ledger, evidence, policy, &operation, &stages, fs);
     }
     if staging.exists() {
-        if !matches!(
-            operation.stage,
-            PublicationState::StagingDirFsynced
-                | PublicationState::AtomicNoReplaceRename
-                | PublicationState::ParentDirFsynced
-                | PublicationState::DurablePublicationReceipt
-                | PublicationState::Available
-        ) {
+        if operation.stage.rank() < PublicationState::StagingDirFsynced.rank() {
             return Err(ProducerError::UncertainPublication(
                 "incomplete staging evidence; publication is not acknowledged".to_owned(),
             ));
@@ -2613,14 +3027,23 @@ pub fn recover_interrupted(
         finalize_publication(
             root,
             ledger,
-            operation,
+            &operation,
             &staging,
             &final_dir,
             &receipt,
             policy,
             PublicationFaults::default(),
+            fs,
         )?;
         return Ok(RecoveryOutcome::RecoveredStaged);
+    }
+    if ledger
+        .join(format!("{}.receipt.json", evidence.release_id))
+        .exists()
+    {
+        return Err(ProducerError::UncertainPublication(
+            "durable receipt without staging or a final release directory".to_owned(),
+        ));
     }
     Err(ProducerError::UncertainPublication(
         "neither staging nor final release evidence is present".to_owned(),
@@ -2629,12 +3052,14 @@ pub fn recover_interrupted(
 
 /// Validate, sign and publish one NDC v2 release as a single boundary.
 pub fn build_release(request: &BuildRequest<'_>) -> Result<BuildOutcome, ProducerError> {
-    build_release_inner(request, PublicationFaults::default())
+    let fs = RealPublicationFs;
+    build_release_inner(request, PublicationFaults::default(), &fs)
 }
 
 fn build_release_inner(
     request: &BuildRequest<'_>,
     faults: PublicationFaults,
+    fs: &dyn PublicationFs,
 ) -> Result<BuildOutcome, ProducerError> {
     let prepared = prepare_release(request)?;
     fs::create_dir_all(request.ledger_dir)
@@ -2692,6 +3117,7 @@ fn build_release_inner(
         &prepared.receipt,
         request.policy,
         faults,
+        fs,
     )?;
     Ok(BuildOutcome {
         manifest_bytes: prepared.manifest_bytes,
@@ -2721,6 +3147,8 @@ impl CanonicalRecord {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::cell::RefCell;
     use std::error::Error as StdError;
     use std::fs;
 
@@ -2838,6 +3266,107 @@ mod tests {
         }
     }
 
+    fn injected(label: &str) -> ProducerError {
+        io_error(label, io::Error::other(label))
+    }
+
+    /// Filesystem boundary used by crash tests. It delegates every durable
+    /// operation to the host filesystem and records its ordered event log.
+    struct RecordingPublicationFs {
+        faults: PublicationFaults,
+        ledger_syncs: Cell<u32>,
+        events: RefCell<Vec<PublicationRecoveryEvent>>,
+    }
+
+    impl RecordingPublicationFs {
+        fn new(faults: PublicationFaults) -> Self {
+            Self {
+                faults,
+                ledger_syncs: Cell::new(0),
+                events: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<PublicationRecoveryEvent> {
+            self.events.borrow().clone()
+        }
+    }
+
+    impl PublicationFs for RecordingPublicationFs {
+        fn record(&self, event: PublicationRecoveryEvent) {
+            self.events.borrow_mut().push(event);
+        }
+
+        fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError> {
+            self.record(PublicationRecoveryEvent::SyncReleaseParent);
+            if self.faults.fail_parent_dir_sync {
+                return Err(injected("injected failure during parent directory sync"));
+            }
+            sync_directory(root)?;
+            if self.faults.fail_after_parent_sync {
+                return Err(injected("injected failure after parent directory sync"));
+            }
+            Ok(())
+        }
+
+        fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
+            self.record(PublicationRecoveryEvent::CommitReceipt);
+            if self.faults.fail_receipt_commit {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|error| io_error("create partial receipt", error))?;
+                file.flush()
+                    .map_err(|error| io_error("flush partial receipt", error))?;
+                return Err(injected("injected failure during receipt creation"));
+            }
+            write_new_file(path, bytes)
+        }
+
+        fn sync_receipt_ledger(&self, ledger: &Path) -> Result<(), ProducerError> {
+            self.record(PublicationRecoveryEvent::SyncReceiptLedger);
+            let ordinal = self.ledger_syncs.get().saturating_add(1);
+            self.ledger_syncs.set(ordinal);
+            if ordinal == 1 && self.faults.fail_receipt_ledger_sync {
+                return Err(injected("injected failure during receipt ledger sync"));
+            }
+            if ordinal == 2 && self.faults.fail_marker_ledger_sync {
+                return Err(injected("injected failure during marker ledger sync"));
+            }
+            sync_directory(ledger)
+        }
+
+        fn commit_availability_marker(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+        ) -> Result<(), ProducerError> {
+            self.record(PublicationRecoveryEvent::CommitAvailabilityMarker);
+            if self.faults.fail_marker_commit {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(|error| io_error("create partial marker", error))?;
+                file.flush()
+                    .map_err(|error| io_error("flush partial marker", error))?;
+                return Err(injected("injected failure during marker creation"));
+            }
+            write_new_file(path, bytes)
+        }
+    }
+
+    fn recover_with_fs(
+        root: &Path,
+        ledger: &Path,
+        evidence: &PublicationEvidence,
+        policy: &ResourcePolicy,
+        fs: &RecordingPublicationFs,
+    ) -> Result<RecoveryOutcome, ProducerError> {
+        recover_interrupted_inner(root, ledger, evidence, policy, fs)
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "the fixture passes the full build boundary plus one injected fault setting"
@@ -2852,6 +3381,37 @@ mod tests {
         ledger: &Path,
         operation_id: &str,
         faults: PublicationFaults,
+    ) -> Result<BuildOutcome, ProducerError> {
+        let fs = RecordingPublicationFs::new(faults);
+        build_with_faults_and_fs(
+            manifest,
+            artifacts,
+            signing,
+            verifying,
+            policy,
+            root,
+            ledger,
+            operation_id,
+            faults,
+            &fs,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the fixture passes the full build boundary, injected faults and a filesystem boundary"
+    )]
+    fn build_with_faults_and_fs(
+        manifest: &ReleaseManifest,
+        artifacts: &[ArtifactInput],
+        signing: &SigningKey,
+        verifying: &VerifyingKey,
+        policy: &ResourcePolicy,
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+        faults: PublicationFaults,
+        fs: &RecordingPublicationFs,
     ) -> Result<BuildOutcome, ProducerError> {
         let receipts: Vec<PublicationReceipt> = Vec::new();
         let lineage = LineageContext {
@@ -2879,7 +3439,7 @@ mod tests {
             policy,
             lineage,
         };
-        build_release_inner(&request, faults)
+        build_release_inner(&request, faults, fs)
     }
 
     fn build_fixture(
@@ -2938,6 +3498,29 @@ mod tests {
             lineage,
         };
         build_release(&request)
+    }
+
+    fn empty_evidence(release_id: &str, operation_id: &str) -> PublicationEvidence {
+        PublicationEvidence {
+            release_id: release_id.to_owned(),
+            manifest_sha256: "00".repeat(32),
+            data_sha256: "11".repeat(32),
+            publication_operation_id: operation_id.to_owned(),
+            commit_position: "position-1".to_owned(),
+            artifact_paths: Vec::new(),
+            artifact_stored_sha256: Vec::new(),
+            expected_receipt: PublicationReceipt {
+                schema_version: MANIFEST_SCHEMA_VERSION,
+                release_id: release_id.to_owned(),
+                manifest_sha256: "00".repeat(32),
+                data_sha256: "11".repeat(32),
+                publication_operation_id: operation_id.to_owned(),
+                commit_position: "position-1".to_owned(),
+                result: PublicationState::Available,
+                supersedes_release_id: None,
+            },
+            receipt_sha256: "22".repeat(32),
+        }
     }
 
     fn operation_from_evidence(
@@ -3495,15 +4078,9 @@ mod tests {
 
     #[test]
     fn missing_artifact_is_detected() -> TestResult {
-        let evidence = PublicationEvidence {
-            release_id: "release-missing".to_owned(),
-            manifest_sha256: "00".repeat(32),
-            data_sha256: "11".repeat(32),
-            publication_operation_id: "operation-1".to_owned(),
-            commit_position: "position-1".to_owned(),
-            artifact_paths: vec!["artifacts/a.jsonl".to_owned()],
-            artifact_stored_sha256: vec!["22".repeat(32)],
-        };
+        let mut evidence = empty_evidence("release-missing", "operation-1");
+        evidence.artifact_paths = vec!["artifacts/a.jsonl".to_owned()];
+        evidence.artifact_stored_sha256 = vec!["22".repeat(32)];
         let temp = TempDir::new()?;
         let result = validate_artifact_set(temp.path(), &evidence, &test_policy());
         assert!(
@@ -4097,7 +4674,7 @@ mod tests {
             RecoveryOutcome::RecoveredPublished,
             "reconciliation commits the receipt for the verified final directory"
         );
-        let receipt = load_receipt(&ledger, "release-parent-fault")?
+        let (_, receipt) = load_receipt(&ledger, "release-parent-fault")?
             .ok_or_else(|| io::Error::other("missing reconciled receipt"))?;
         assert_eq!(
             receipt.result,
@@ -4145,10 +4722,8 @@ mod tests {
             PublicationState::ParentDirFsynced,
             "the publication exists with the parent directory synced"
         );
-        assert!(
-            !ledger.join("release-receipt-fault.receipt.json").exists(),
-            "no receipt is committed on the receipt failure path"
-        );
+        let receipt_bytes = fs::read(ledger.join("release-receipt-fault.receipt.json"))?;
+        assert!(receipt_bytes.is_empty(), "receipt is empty after crash");
         assert!(
             !ledger.join("release-receipt-fault.available").exists(),
             "no availability marker is committed on the receipt failure path"
@@ -4162,12 +4737,9 @@ mod tests {
             "operation-receipt-fault",
         )?;
         evidence.publication_operation_id = "operation-receipt-fault".to_owned();
-        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
-        assert_eq!(
-            recovered,
-            RecoveryOutcome::RecoveredPublished,
-            "an unresolved receipt is reconciled from the verified release"
-        );
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy);
+        let is_uncertain = matches!(recovered, Err(ProducerError::UncertainPublication(_)));
+        assert!(is_uncertain, "a partial receipt is not acknowledged");
         Ok(())
     }
 
@@ -4209,10 +4781,8 @@ mod tests {
             load_receipt(&ledger, "release-marker-fault")?.is_some(),
             "the receipt survives the marker failure"
         );
-        assert!(
-            !ledger.join("release-marker-fault.available").exists(),
-            "the acknowledgement is absent until recovery writes it"
-        );
+        let marker_bytes = fs::read(ledger.join("release-marker-fault.available"))?;
+        assert!(marker_bytes.is_empty(), "marker is empty after crash");
         let mut evidence = evidence_for_operation(
             &manifest,
             &artifacts,
@@ -4222,21 +4792,10 @@ mod tests {
             "operation-marker-fault",
         )?;
         evidence.publication_operation_id = "operation-marker-fault".to_owned();
-        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
-        assert_eq!(
-            recovered,
-            RecoveryOutcome::RecoveredPublished,
-            "recovery completes a committed receipt that lacked a marker"
-        );
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
-            ledger.join("release-marker-fault.available").exists(),
-            "the availability marker is present after recovery"
-        );
-        let again = recover_interrupted(&root, &ledger, &evidence, &policy)?;
-        assert_eq!(
-            again,
-            RecoveryOutcome::AlreadyAvailable,
-            "a second recovery recognizes the durable acknowledgement"
+            matches!(recovered, Err(ProducerError::UncertainPublication(_))),
+            "an empty marker is never accepted as an acknowledgement"
         );
         Ok(())
     }
@@ -4354,15 +4913,7 @@ mod tests {
         let policy = test_policy();
         let ledger = temp.path().join("ledger");
         fs::create_dir_all(&ledger)?;
-        let evidence = PublicationEvidence {
-            release_id: "release-none".to_owned(),
-            manifest_sha256: "00".repeat(32),
-            data_sha256: "11".repeat(32),
-            publication_operation_id: "operation-none".to_owned(),
-            commit_position: "position-none".to_owned(),
-            artifact_paths: vec![],
-            artifact_stored_sha256: vec![],
-        };
+        let evidence = empty_evidence("release-none", "operation-none");
         let outcome = recover_interrupted(temp.path(), &ledger, &evidence, &policy)?;
         assert_eq!(
             outcome,
@@ -5098,6 +5649,757 @@ mod tests {
         assert!(
             matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
             "an artifact outside artifacts/ is refused by recovery"
+        );
+        Ok(())
+    }
+
+    fn boundary_manifest(release_id: &str) -> ReleaseManifest {
+        test_manifest(release_id)
+    }
+
+    fn boundary_artifacts(policy: &ResourcePolicy) -> Vec<ArtifactInput> {
+        let record =
+            sequenced(r#"{"kind":"boundary"}"#, 1, policy).expect("boundary record is canonical");
+        vec![sequenced_artifact(
+            "artifacts/a.jsonl",
+            "partition-a",
+            0,
+            vec![record],
+        )]
+    }
+
+    fn boundary_evidence(
+        manifest: &ReleaseManifest,
+        artifacts: &[ArtifactInput],
+        operation_id: &str,
+    ) -> Result<PublicationEvidence, Box<dyn StdError>> {
+        let policy = test_policy();
+        let (signing, verifying) = test_keys();
+        evidence_for_operation(
+            manifest,
+            artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            operation_id,
+        )
+    }
+
+    fn interrupt_boundary(
+        faults: PublicationFaults,
+        operation_id: &str,
+        release_id: &str,
+        root: &Path,
+        ledger: &Path,
+    ) -> Result<(PublicationEvidence, PublicationState), Box<dyn StdError>> {
+        let policy = test_policy();
+        let manifest = boundary_manifest(release_id);
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            root,
+            ledger,
+            operation_id,
+            faults,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "injected boundary failure is typed: {result:?}"
+        );
+        let evidence = boundary_evidence(&manifest, &artifacts, operation_id)?;
+        let stage = last_stage(ledger, operation_id)?;
+        Ok((evidence, stage))
+    }
+
+    const FULL_RECOVERY_ORDER: [PublicationRecoveryEvent; 10] = [
+        PublicationRecoveryEvent::FinalDirectoryFound,
+        PublicationRecoveryEvent::VerifyFinalDirectory,
+        PublicationRecoveryEvent::VerifyOperationIdentity,
+        PublicationRecoveryEvent::SyncReleaseParent,
+        PublicationRecoveryEvent::VerifyDurabilityTransition,
+        PublicationRecoveryEvent::CommitReceipt,
+        PublicationRecoveryEvent::SyncReceiptLedger,
+        PublicationRecoveryEvent::CommitAvailabilityMarker,
+        PublicationRecoveryEvent::SyncReceiptLedger,
+        PublicationRecoveryEvent::Available,
+    ];
+
+    fn assert_recovered_receipt(
+        ledger: &Path,
+        release_id: &str,
+        evidence: &PublicationEvidence,
+        outcome: RecoveryOutcome,
+    ) -> Result<(), Box<dyn StdError>> {
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::RecoveredPublished,
+            "recovery completes the interrupted publication"
+        );
+        let Some((bytes, receipt)) = load_receipt(ledger, release_id)? else {
+            return Err("recovery committed no receipt".into());
+        };
+        assert_eq!(
+            receipt, evidence.expected_receipt,
+            "recovery preserves the builder receipt field for field"
+        );
+        assert!(
+            receipt_matches(&receipt, &bytes, evidence),
+            "the committed receipt matches every normative field and its digest"
+        );
+        assert_eq!(
+            last_stage(ledger, &evidence.publication_operation_id)?,
+            PublicationState::Available,
+            "the final durable stage is available"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_after_rename_syncs_parent_before_the_receipt() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_after_rename: true,
+            ..PublicationFaults::default()
+        };
+        let (evidence, stage) = interrupt_boundary(
+            faults,
+            "operation-after-rename",
+            "release-after-rename",
+            &root,
+            &ledger,
+        )?;
+        assert_eq!(
+            stage,
+            PublicationState::AtomicNoReplaceRename,
+            "the rename stage is durable before the crash"
+        );
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
+        assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
+        assert_eq!(
+            fs.events(),
+            FULL_RECOVERY_ORDER.to_vec(),
+            "recovery syncs the release parent before committing the receipt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn final_directory_without_rename_evidence_is_not_adopted() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_after_rename_before_stage: true,
+            ..PublicationFaults::default()
+        };
+        let (evidence, stage) = interrupt_boundary(
+            faults,
+            "operation-unstaged-rename",
+            "release-unstaged-rename",
+            &root,
+            &ledger,
+        )?;
+        assert_eq!(
+            stage,
+            PublicationState::StagingDirFsynced,
+            "no stage claims a rename that has no durable record"
+        );
+        assert!(
+            root.join("release-unstaged-rename").exists(),
+            "the rename produced a final directory before the crash"
+        );
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs);
+        assert!(
+            matches!(outcome, Err(ProducerError::UncertainPublication(_))),
+            "mere final-directory existence never grants ownership or an acknowledgement"
+        );
+        assert_eq!(
+            fs.events(),
+            vec![
+                PublicationRecoveryEvent::FinalDirectoryFound,
+                PublicationRecoveryEvent::VerifyFinalDirectory,
+                PublicationRecoveryEvent::VerifyOperationIdentity,
+            ],
+            "ownership verification stops recovery before any sync or receipt"
+        );
+        assert!(
+            !ledger.join("release-unstaged-rename.receipt.json").exists(),
+            "no receipt is written for an unowned final directory"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_during_parent_sync_never_commits_an_unsynced_receipt() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_parent_dir_sync: true,
+            ..PublicationFaults::default()
+        };
+        let (evidence, stage) = interrupt_boundary(
+            faults,
+            "operation-parent-sync",
+            "release-parent-sync",
+            &root,
+            &ledger,
+        )?;
+        assert_eq!(
+            stage,
+            PublicationState::AtomicNoReplaceRename,
+            "a failed parent sync leaves the rename as the last stage"
+        );
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
+        assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
+        assert_eq!(
+            fs.events(),
+            FULL_RECOVERY_ORDER.to_vec(),
+            "recovery supplies the missing parent sync before any receipt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_after_parent_sync_preserves_the_receipt_order() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_after_parent_sync: true,
+            ..PublicationFaults::default()
+        };
+        let (evidence, stage) = interrupt_boundary(
+            faults,
+            "operation-after-parent",
+            "release-after-parent",
+            &root,
+            &ledger,
+        )?;
+        assert_eq!(
+            stage,
+            PublicationState::AtomicNoReplaceRename,
+            "the crash precedes the parent-synced stage record"
+        );
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
+        assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
+        assert_eq!(
+            fs.events(),
+            FULL_RECOVERY_ORDER.to_vec(),
+            "recovery repeats the parent sync before committing the receipt"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_during_receipt_ledger_sync_completes_both_ledger_syncs() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_receipt_ledger_sync: true,
+            ..PublicationFaults::default()
+        };
+        let (evidence, stage) = interrupt_boundary(
+            faults,
+            "operation-receipt-sync",
+            "release-receipt-sync",
+            &root,
+            &ledger,
+        )?;
+        assert_eq!(
+            stage,
+            PublicationState::ParentDirFsynced,
+            "the receipt ledger sync failure precedes the receipt stage"
+        );
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
+        assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
+        assert_eq!(
+            fs.events(),
+            vec![
+                PublicationRecoveryEvent::FinalDirectoryFound,
+                PublicationRecoveryEvent::VerifyFinalDirectory,
+                PublicationRecoveryEvent::VerifyOperationIdentity,
+                PublicationRecoveryEvent::VerifyDurabilityTransition,
+                PublicationRecoveryEvent::SyncReceiptLedger,
+                PublicationRecoveryEvent::CommitAvailabilityMarker,
+                PublicationRecoveryEvent::SyncReceiptLedger,
+                PublicationRecoveryEvent::Available,
+            ],
+            "an existing receipt is verified before the marker and both ledger syncs"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_during_marker_ledger_sync_makes_the_marker_durable() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_marker_ledger_sync: true,
+            ..PublicationFaults::default()
+        };
+        let (evidence, stage) = interrupt_boundary(
+            faults,
+            "operation-marker-sync",
+            "release-marker-sync",
+            &root,
+            &ledger,
+        )?;
+        assert_eq!(
+            stage,
+            PublicationState::DurablePublicationReceipt,
+            "the marker ledger sync failure precedes the available stage"
+        );
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
+        assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
+        assert_eq!(
+            fs.events(),
+            vec![
+                PublicationRecoveryEvent::FinalDirectoryFound,
+                PublicationRecoveryEvent::VerifyFinalDirectory,
+                PublicationRecoveryEvent::VerifyOperationIdentity,
+                PublicationRecoveryEvent::VerifyDurabilityTransition,
+                PublicationRecoveryEvent::SyncReceiptLedger,
+                PublicationRecoveryEvent::SyncReceiptLedger,
+                PublicationRecoveryEvent::Available,
+            ],
+            "the marker is already committed and only its ledger entry is completed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn partial_receipt_or_marker_is_never_acknowledged() -> TestResult {
+        for (faults, operation_id, release_id) in [
+            (
+                PublicationFaults {
+                    fail_receipt_commit: true,
+                    ..PublicationFaults::default()
+                },
+                "operation-partial-receipt",
+                "release-partial-receipt",
+            ),
+            (
+                PublicationFaults {
+                    fail_marker_commit: true,
+                    ..PublicationFaults::default()
+                },
+                "operation-partial-marker",
+                "release-partial-marker",
+            ),
+        ] {
+            let temp = TempDir::new()?;
+            let policy = test_policy();
+            let root = temp.path().join("releases");
+            let ledger = temp.path().join("ledger");
+            let (evidence, _) =
+                interrupt_boundary(faults, operation_id, release_id, &root, &ledger)?;
+            let fs = RecordingPublicationFs::new(PublicationFaults::default());
+            let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs);
+            assert!(
+                matches!(outcome, Err(ProducerError::UncertainPublication(_))),
+                "a partial durable file is never converted into an acknowledgement"
+            );
+            assert_eq!(
+                fs.events(),
+                vec![
+                    PublicationRecoveryEvent::FinalDirectoryFound,
+                    PublicationRecoveryEvent::VerifyFinalDirectory,
+                    PublicationRecoveryEvent::VerifyOperationIdentity,
+                ],
+                "recovery stops at verification when a partial file is present"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_does_not_adopt_a_release_from_another_operation() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = boundary_manifest("release-ownership");
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let winner = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-winner",
+            PublicationFaults::default(),
+        )?;
+        let loser = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-loser",
+            PublicationFaults::default(),
+        );
+        assert!(
+            matches!(loser, Err(ProducerError::PublicationCollision(_))),
+            "the second operation loses the no-replace rename"
+        );
+        let evidence = boundary_evidence(&manifest, &artifacts, "operation-loser")?;
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs);
+        assert!(
+            matches!(outcome, Err(ProducerError::UncertainPublication(_))),
+            "a losing operation never receives an acknowledgement"
+        );
+        assert_eq!(
+            fs.events(),
+            vec![
+                PublicationRecoveryEvent::FinalDirectoryFound,
+                PublicationRecoveryEvent::VerifyFinalDirectory,
+                PublicationRecoveryEvent::VerifyOperationIdentity,
+            ],
+            "ownership verification precedes any receipt or marker event"
+        );
+        assert!(
+            ledger.join("release-ownership.available").exists(),
+            "the winner retains its own availability marker"
+        );
+        assert_eq!(
+            load_receipt(&ledger, "release-ownership")?
+                .map(|(_, receipt)| receipt.publication_operation_id),
+            Some(winner.receipt.publication_operation_id),
+            "the durable receipt still belongs to the winning operation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forged_rename_stage_does_not_transfer_ownership() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = boundary_manifest("release-forged");
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-owner",
+            PublicationFaults::default(),
+        )?;
+        let loser = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-forger",
+            PublicationFaults::default(),
+        );
+        assert!(
+            matches!(loser, Err(ProducerError::PublicationCollision(_))),
+            "the forger loses the release identity"
+        );
+        let evidence = boundary_evidence(&manifest, &artifacts, "operation-forger")?;
+        let forged = stage_for_state(
+            &operation_from_evidence(&evidence, "operation-forger"),
+            PublicationState::AtomicNoReplaceRename,
+        );
+        write_stage(&ledger, &forged, 4, &policy)?;
+        let outcome = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(outcome, Err(ProducerError::UncertainPublication(_))),
+            "a foreign operation's rename evidence prevents adoption"
+        );
+        assert_eq!(
+            load_receipt(&ledger, "release-forged")?
+                .map(|(_, receipt)| receipt.publication_operation_id),
+            Some("operation-owner".to_owned()),
+            "the receipt identity is unchanged by the forged stage"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stage_journal_conflicts_and_regressions_fail_closed() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, _) = interrupt_boundary(
+            PublicationFaults {
+                fail_after_rename: true,
+                ..PublicationFaults::default()
+            },
+            "operation-journal",
+            "release-journal",
+            &root,
+            &ledger,
+        )?;
+        let original = stage_path(&ledger, "operation-journal", 4);
+        fs::remove_file(&original)?;
+        let mut regressed = operation_from_evidence(&evidence, "operation-journal");
+        regressed.stage = PublicationState::FilesWritten;
+        write_stage(&ledger, &regressed, 4, &policy)?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "a stage regression is rejected before any acknowledgement"
+        );
+        fs::remove_file(stage_path(&ledger, "operation-journal", 4))?;
+        let mut conflicting = operation_from_evidence(&evidence, "operation-journal");
+        conflicting.stage = PublicationState::AtomicNoReplaceRename;
+        conflicting.release_id = "release-other".to_owned();
+        write_stage(&ledger, &conflicting, 4, &policy)?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "a conflicting release identity in the journal is rejected"
+        );
+        fs::remove_file(stage_path(&ledger, "operation-journal", 4))?;
+        let mut wrong_digest = operation_from_evidence(&evidence, "operation-journal");
+        wrong_digest.stage = PublicationState::AtomicNoReplaceRename;
+        wrong_digest.manifest_sha256 = "ff".repeat(32);
+        write_stage(&ledger, &wrong_digest, 4, &policy)?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            result.is_err(),
+            "a digest mismatch in journal evidence is rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_and_out_of_range_stage_ordinals_fail_closed() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, _) = interrupt_boundary(
+            PublicationFaults {
+                fail_after_rename: true,
+                ..PublicationFaults::default()
+            },
+            "operation-ordinals",
+            "release-ordinals",
+            &root,
+            &ledger,
+        )?;
+        let extra = stage_for_state(
+            &operation_from_evidence(&evidence, "operation-ordinals"),
+            PublicationState::Available,
+        );
+        write_stage(&ledger, &extra, 8, &policy)?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "a stage beyond the ratified state machine is rejected"
+        );
+        fs::remove_file(stage_path(&ledger, "operation-ordinals", 8))?;
+        write_stage(&ledger, &extra, 9, &policy)?;
+        fs::rename(
+            stage_path(&ledger, "operation-ordinals", 9),
+            ledger.join("operation-ordinals.stage.4.json"),
+        )?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "a duplicate stage ordinal is rejected"
+        );
+        Ok(())
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the correction fixture carries the full build boundary plus its injected fault"
+    )]
+    fn build_correction_inner(
+        manifest: &ReleaseManifest,
+        artifacts: &[ArtifactInput],
+        signing: &SigningKey,
+        verifying: &VerifyingKey,
+        policy: &ResourcePolicy,
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+        commit_position: &str,
+        faults: PublicationFaults,
+        fs: &dyn PublicationFs,
+    ) -> Result<BuildOutcome, ProducerError> {
+        let descriptor = manifest.lineage.supersedes.as_ref().ok_or_else(|| {
+            ProducerError::InvalidLineage("correction fixture lacks lineage".to_owned())
+        })?;
+        let predecessor = PublicationReceipt {
+            schema_version: MANIFEST_SCHEMA_VERSION,
+            release_id: descriptor.supersedes_release_id.clone(),
+            manifest_sha256: descriptor.supersedes_manifest_sha256.clone(),
+            data_sha256: descriptor.supersedes_data_sha256.clone(),
+            publication_operation_id: "operation-predecessor".to_owned(),
+            commit_position: "position-predecessor".to_owned(),
+            result: PublicationState::Available,
+            supersedes_release_id: None,
+        };
+        let receipts = vec![predecessor.clone()];
+        let lineage = LineageContext {
+            predecessor: Some(&predecessor),
+            known_receipts: &receipts,
+            now_ns: 10_000,
+        };
+        let evidence = test_evidence();
+        let observed = BTreeSet::new();
+        let signature = SignatureConfig {
+            signing_key: signing,
+            verifying_key: verifying,
+            key_id: &manifest.publication_identity.signing_key_id,
+        };
+        let request = BuildRequest {
+            release_root: root,
+            ledger_dir: ledger,
+            operation_id,
+            commit_position,
+            manifest,
+            evidence: &evidence,
+            observed_event_types: &observed,
+            artifacts,
+            signature,
+            policy,
+            lineage,
+        };
+        build_release_inner(&request, faults, fs)
+    }
+
+    fn correction_manifest() -> ReleaseManifest {
+        let mut manifest = boundary_manifest("release-correction");
+        manifest.lineage.revision = 2;
+        manifest.lineage.supersedes = Some(LineageSupersedes {
+            supersedes_release_id: "release-predecessor".to_owned(),
+            supersedes_manifest_sha256: "a7".repeat(32),
+            supersedes_data_sha256: "b9".repeat(32),
+            revision: 1,
+            correction_reason: "abstract correction".to_owned(),
+            knowledge_time_ns: "2500".to_owned(),
+            invalidated_at_time: "2026-11-23T00:00:00.000000000Z".to_owned(),
+        });
+        manifest
+    }
+
+    fn correction_evidence(
+        manifest: &ReleaseManifest,
+        artifacts: &[ArtifactInput],
+    ) -> Result<PublicationEvidence, Box<dyn StdError>> {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let (signing, verifying) = test_keys();
+        let fs = RealPublicationFs;
+        let outcome = build_correction_inner(
+            manifest,
+            artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &temp.path().join("releases"),
+            &temp.path().join("ledger"),
+            "operation-correction",
+            "position-correction",
+            PublicationFaults::default(),
+            &fs,
+        )?;
+        Ok(outcome.evidence)
+    }
+
+    #[test]
+    fn correction_recovery_preserves_predecessor_lineage() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = correction_manifest();
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let evidence = correction_evidence(&manifest, &artifacts)?;
+        assert_eq!(
+            evidence.expected_receipt.supersedes_release_id.as_deref(),
+            Some("release-predecessor"),
+            "the builder receipt retains the predecessor identity"
+        );
+        let faults = PublicationFaults {
+            fail_after_parent_sync: true,
+            ..PublicationFaults::default()
+        };
+        let fs = RecordingPublicationFs::new(faults);
+        let result = build_correction_inner(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-correction",
+            "position-correction",
+            faults,
+            &fs,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the correction crash is typed"
+        );
+        let recovery_fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &recovery_fs)?;
+        assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
+        assert_eq!(
+            recovery_fs.events(),
+            FULL_RECOVERY_ORDER.to_vec(),
+            "correction recovery follows the ratified transition order"
+        );
+        let Some((bytes, receipt)) = load_receipt(&ledger, "release-correction")? else {
+            return Err("correction receipt is absent".into());
+        };
+        assert_eq!(
+            receipt.schema_version, MANIFEST_SCHEMA_VERSION,
+            "recovery preserves the receipt schema version"
+        );
+        assert_eq!(
+            receipt.supersedes_release_id.as_deref(),
+            Some("release-predecessor"),
+            "recovery preserves the correction lineage"
+        );
+        assert!(
+            receipt_matches(&receipt, &bytes, &evidence),
+            "the recovered correction receipt matches the complete intent"
         );
         Ok(())
     }
