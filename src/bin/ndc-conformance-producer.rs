@@ -64,6 +64,7 @@ fn conformance_policy() -> ResourcePolicy {
         max_object_members: 64,
         max_array_elements: 64,
         max_sidecar_bytes: 4_096,
+        max_intent_bytes: 1_000_000,
     }
 }
 
