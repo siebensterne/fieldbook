@@ -102,6 +102,9 @@ rather than a rewrite of history.
 - [Descriptor-relative artifact tree validation](docs/fb-pub-021-artifact-tree-validation-2026-11-24.md)
   — FB-PUB-021 no-follow descriptor access, exact entry sets, digest binding,
   hard-link policy and platform limits with gate record.
+- [Bounded Fieldbook recovery reads](docs/fb-rec-022-bounded-recovery-2026-11-24.md)
+  — FB-REC-022 bounded descriptor reads, intent size limit, streaming gzip
+  output bound, quarantine rule and recovery memory-budget evidence.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)

@@ -54,6 +54,9 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
+use std::io::BufRead as _;
+use std::io::BufReader;
+use std::io::Cursor;
 use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -70,7 +73,7 @@ use ed25519_dalek::SigningKey;
 use ed25519_dalek::Verifier as _;
 use ed25519_dalek::VerifyingKey;
 use flate2::Compression as GzipCompression;
-use flate2::read::GzDecoder;
+use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::Deserialize;
 use serde::Serialize;
@@ -648,6 +651,12 @@ pub struct ResourcePolicy {
     pub max_array_elements: u32,
     /// Maximum byte length of the detached sidecar.
     pub max_sidecar_bytes: u64,
+    /// Maximum byte length of one on-disk immutable intent file.
+    ///
+    /// The bound is caller-supplied. It is enforced against the opened
+    /// descriptor before any JSON parsing, so an oversized intent is refused
+    /// ahead of decoded-object materialization.
+    pub max_intent_bytes: u64,
 }
 
 /// Artifact compression declaration. The declared version string identifies
@@ -2751,11 +2760,18 @@ fn load_intent(
     policy: &ResourcePolicy,
 ) -> Result<Option<PublicationIntentV2>, ProducerError> {
     let path = intent_path(ledger, operation_id);
-    if !path.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io_error(&format!("stat intent {}", path.display()), error));
+        }
     }
-    let bytes = fs::read(&path)
-        .map_err(|error| io_error(&format!("read intent {}", path.display()), error))?;
+    let bytes = read_bounded_file(
+        &path,
+        &format!("intent {}", path.display()),
+        policy.max_intent_bytes,
+    )?;
     let intent: PublicationIntentV2 = serde_json::from_slice(&bytes).map_err(|error| {
         ProducerError::PublicationEvidence(format!("invalid intent evidence: {error}"))
     })?;
@@ -2808,6 +2824,7 @@ fn resource_profile_id(policy: &ResourcePolicy) -> String {
         material.extend_from_slice(&bound.to_be_bytes());
     }
     material.extend_from_slice(&policy.max_sidecar_bytes.to_be_bytes());
+    material.extend_from_slice(&policy.max_intent_bytes.to_be_bytes());
     format!("resource-policy-sha256:{}", hex_encode(&sha256(&material)))
 }
 
@@ -2972,8 +2989,11 @@ fn read_all_stage_operations(
         let Some((operation_id, ordinal)) = stage_file_parts(&name) else {
             continue;
         };
-        let bytes = fs::read(entry.path())
-            .map_err(|error| io_error(&format!("read stage {name}"), error))?;
+        let bytes = read_bounded_file(
+            &entry.path(),
+            &format!("stage {name}"),
+            policy.max_record_bytes,
+        )?;
         let operation: PublicationOperation = serde_json::from_slice(&bytes).map_err(|error| {
             ProducerError::PublicationEvidence(format!("invalid stage evidence: {error}"))
         })?;
@@ -3360,21 +3380,28 @@ fn descriptor_error(label: &str, error: io::Error) -> ProducerError {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[expect(
     unsafe_code,
-    reason = "fstat reads the object type of an already opened descriptor"
+    reason = "fstat classifies the object behind an already opened descriptor"
 )]
-fn require_regular(descriptor: &OwnedDescriptor, label: &str) -> Result<(), ProducerError> {
+fn descriptor_stat(descriptor: libc::c_int, label: &str) -> Result<libc::stat, ProducerError> {
     // SAFETY: `libc::stat` is a plain data struct whose zero bit pattern is
     // valid before the system call fills it.
     let mut info: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `info` is a writable stat buffer of the platform layout and
-    // `descriptor.raw` is live for this call.
-    let status = unsafe { libc::fstat(descriptor.raw, &mut info) };
+    // `descriptor` is live for this call.
+    let status = unsafe { libc::fstat(descriptor, &mut info) };
     if status != 0 {
         return Err(descriptor_error(
             &format!("fstat {label}"),
             io::Error::last_os_error(),
         ));
     }
+    Ok(info)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn require_regular(descriptor: &OwnedDescriptor, label: &str) -> Result<(), ProducerError> {
+    // Object-type and hard-link checks share the descriptor stat helper.
+    let info = descriptor_stat(descriptor.raw, label)?;
     if info.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(ProducerError::UncertainPublication(format!(
             "{label} is not a regular file"
@@ -3389,6 +3416,46 @@ fn require_regular(descriptor: &OwnedDescriptor, label: &str) -> Result<(), Prod
         )));
     }
     Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn descriptor_file_size(descriptor: &OwnedDescriptor, label: &str) -> Result<u64, ProducerError> {
+    let info = descriptor_stat(descriptor.raw, label)?;
+    if info.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(ProducerError::UncertainPublication(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    u64::try_from(info.st_size).map_err(|_| {
+        ProducerError::UncertainPublication(format!("{label} has a negative file size"))
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    unsafe_code,
+    reason = "ledger files are opened without following a symlink at the final component"
+)]
+fn open_no_follow_file(path: &Path, label: &str) -> Result<OwnedDescriptor, ProducerError> {
+    let name = CString::new(path.as_os_str().as_bytes()).map_err(|error| {
+        ProducerError::UncertainPublication(format!("{label} path is not NUL-free: {error}"))
+    })?;
+    // SAFETY: `name` owns a NUL-terminated buffer that outlives this call.
+    // `O_NOFOLLOW` rejects a symlink at the named path, `O_RDONLY` requests
+    // read access and `O_CLOEXEC` keeps the descriptor out of child processes.
+    let raw = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw < 0 {
+        return Err(descriptor_error(
+            &format!("open {label}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(OwnedDescriptor { raw })
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3611,31 +3678,147 @@ fn open_release_tree(
     })
 }
 
+/// Bounded reader over one already-open regular-file descriptor.
+///
+/// The same reader serves normal tree validation, intent-based recovery
+/// validation and bounded ledger-file reads. It sizes the opened descriptor
+/// before allocation, refuses a declared or observed size above its limit,
+/// counts every byte read and hashes those bytes incrementally. `read_to_end`
+/// checks the descriptor again after EOF so growth past the limit cannot slip
+/// through between the first `fstat` and the last read.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[expect(
-    unsafe_code,
-    reason = "bytes are read from an already opened descriptor with libc read"
-)]
-fn read_descriptor(descriptor: libc::c_int, label: &str) -> Result<Vec<u8>, ProducerError> {
-    let mut bytes = Vec::new();
-    let mut buffer = [0_u8; 16_384];
-    loop {
-        // SAFETY: `descriptor` is a live file descriptor held by `ReleaseTree`,
-        // and `buffer` is writable for its declared length.
-        let count = unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
-        if count == 0 {
-            break;
+struct BoundedDescriptorReader<'a> {
+    /// Descriptor borrowed from a live tree or ledger open.
+    descriptor: &'a OwnedDescriptor,
+    /// Label used in typed errors.
+    label: String,
+    /// Caller-supplied maximum byte count for this object.
+    limit: u64,
+    /// Bytes returned by reads so far.
+    bytes_read: u64,
+    /// Incremental digest over the bytes returned so far.
+    hasher: Sha256,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl<'a> BoundedDescriptorReader<'a> {
+    /// Bind one open descriptor to a byte limit after checking its size.
+    fn new(
+        descriptor: &'a OwnedDescriptor,
+        label: impl Into<String>,
+        limit: u64,
+    ) -> Result<Self, ProducerError> {
+        let label = label.into();
+        let size = descriptor_file_size(descriptor, &label)?;
+        if size > limit {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "{label} is {size} bytes above the {limit}-byte bound"
+            )));
         }
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(descriptor_error(&format!("read {label}"), error));
-        }
-        bytes.extend_from_slice(&buffer[..count as usize]);
+        Ok(Self {
+            descriptor,
+            label,
+            limit,
+            bytes_read: 0,
+            hasher: Sha256::new(),
+        })
     }
-    Ok(bytes)
+
+    /// Number of bytes returned so far.
+    fn bytes_read(&self) -> u64 {
+        self.bytes_read
+    }
+
+    /// Lowercase hex digest of the bytes returned so far.
+    fn hex_digest(&self) -> String {
+        hex_encode(&self.hasher.clone().finalize())
+    }
+
+    /// Read the whole object under the bound and hash it incrementally.
+    #[expect(
+        unsafe_code,
+        reason = "bytes are read from an already opened descriptor with libc read"
+    )]
+    fn read_to_end(&mut self) -> Result<Vec<u8>, ProducerError> {
+        let mut bytes = Vec::new();
+        let mut buffer = [0_u8; 16_384];
+        loop {
+            // SAFETY: `descriptor.raw` is a live file descriptor held by the
+            // tree or ledger open, and `buffer` is writable for its length.
+            let count = unsafe {
+                libc::read(
+                    self.descriptor.raw,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                )
+            };
+            if count == 0 {
+                break;
+            }
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(descriptor_error(&format!("read {}", self.label), error));
+            }
+            let added = count as usize;
+            let next = self
+                .bytes_read
+                .checked_add(u64::try_from(added).map_err(|_| {
+                    ProducerError::PolicyExceeded(format!(
+                        "{} exceeds the addressable byte count",
+                        self.label
+                    ))
+                })?)
+                .ok_or_else(|| {
+                    ProducerError::PolicyExceeded(format!(
+                        "{} byte count overflowed while reading",
+                        self.label
+                    ))
+                })?;
+            if next > self.limit {
+                return Err(ProducerError::PolicyExceeded(format!(
+                    "{} grew beyond the {}-byte bound while reading",
+                    self.label, self.limit
+                )));
+            }
+            let chunk = &buffer[..added];
+            self.hasher.update(chunk);
+            bytes.extend_from_slice(chunk);
+            self.bytes_read = next;
+        }
+        let final_size = descriptor_file_size(self.descriptor, &self.label)?;
+        if final_size > self.limit {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "{} grew to {final_size} bytes above the {}-byte bound",
+                self.label, self.limit
+            )));
+        }
+        Ok(bytes)
+    }
+
+    /// Extend the open file after its size check. Offline growth test hook.
+    #[cfg(test)]
+    fn grow_after_stat(&self, grow: &dyn Fn(libc::c_int)) {
+        grow(self.descriptor.raw);
+    }
+}
+
+/// Open one ledger path without following a symlink and read it under a bound.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn read_bounded_file(path: &Path, label: &str, limit: u64) -> Result<Vec<u8>, ProducerError> {
+    let descriptor = open_no_follow_file(path, label)?;
+    let mut reader = BoundedDescriptorReader::new(&descriptor, label, limit)?;
+    reader.read_to_end()
+}
+
+/// Bounded ledger reads require the qualified descriptor primitives.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn read_bounded_file(_path: &Path, _label: &str, _limit: u64) -> Result<Vec<u8>, ProducerError> {
+    Err(ProducerError::UncertainPublication(
+        "bounded ledger reads require Linux openat or macOS openat".to_owned(),
+    ))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3651,16 +3834,27 @@ fn validate_artifact_set_with(
             "declared artifact paths and stored digests have different lengths".to_owned(),
         ));
     }
+    check_artifact_count(evidence.artifact_paths.len(), policy)?;
     let mut tree = open_release_tree(directory, probe)?;
-    let manifest = read_descriptor(tree.manifest.raw, "manifest descriptor")?;
-    if hex_encode(&sha256(&manifest)) != evidence.manifest_sha256 {
+    let mut manifest_reader = BoundedDescriptorReader::new(
+        &tree.manifest,
+        "manifest descriptor",
+        policy.max_manifest_bytes,
+    )?;
+    manifest_reader.read_to_end()?;
+    if manifest_reader.hex_digest() != evidence.manifest_sha256 {
         return Err(ProducerError::PublicationEvidence(
             "manifest digest differs from operation evidence".to_owned(),
         ));
     }
     if let Some(expected) = sidecar_sha256 {
-        let sidecar = read_descriptor(tree.sidecar.raw, "signature sidecar descriptor")?;
-        if hex_encode(&sha256(&sidecar)) != expected {
+        let mut sidecar_reader = BoundedDescriptorReader::new(
+            &tree.sidecar,
+            "signature sidecar descriptor",
+            policy.max_sidecar_bytes,
+        )?;
+        sidecar_reader.read_to_end()?;
+        if sidecar_reader.hex_digest() != expected {
             return Err(ProducerError::PublicationEvidence(
                 "signature sidecar digest differs from the prepared sidecar".to_owned(),
             ));
@@ -3682,6 +3876,7 @@ fn validate_artifact_set_with(
             directory.display()
         )));
     }
+    let mut total_stored = 0_u64;
     for (path, digest) in evidence
         .artifact_paths
         .iter()
@@ -3691,8 +3886,21 @@ fn validate_artifact_set_with(
         probe.at(TreeProbePoint::ArtifactOpen, directory);
         let descriptor = tree.artifacts.open_child(relative, false)?;
         require_regular(&descriptor, &format!("artifact {relative}"))?;
-        let bytes = read_descriptor(descriptor.raw, &format!("artifact {relative}"))?;
-        if hex_encode(&sha256(&bytes)) != *digest {
+        let mut reader = BoundedDescriptorReader::new(
+            &descriptor,
+            format!("artifact {relative}"),
+            policy.max_stored_bytes_per_artifact,
+        )?;
+        reader.read_to_end()?;
+        total_stored =
+            accumulate_bound(total_stored, reader.bytes_read(), "artifact stored bytes")?;
+        if total_stored > policy.max_total_stored_bytes {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "artifact stored bytes exceed the {}-byte aggregate bound",
+                policy.max_total_stored_bytes
+            )));
+        }
+        if reader.hex_digest() != *digest {
             return Err(ProducerError::PublicationEvidence(format!(
                 "artifact digest differs for {relative}"
             )));
@@ -3714,22 +3922,148 @@ fn validate_artifact_set_with(
     ))
 }
 
-/// Recover the exact uncompressed stream declared by one artifact descriptor.
-fn decompress_stream(stored: &[u8], compression: &str) -> Result<Vec<u8>, ProducerError> {
-    match compression {
-        COMPRESSION_NONE => Ok(stored.to_vec()),
-        COMPRESSION_GZIP => {
-            let mut decoder = GzDecoder::new(stored);
-            let mut output = Vec::new();
-            decoder
-                .read_to_end(&mut output)
-                .map_err(|error| io_error("decode gzip artifact", error))?;
-            Ok(output)
-        }
-        other => Err(ProducerError::UncertainPublication(format!(
-            "unsupported compression literal {other}"
-        ))),
+/// Refuse an artifact inventory above the caller-supplied count bound.
+fn check_artifact_count(count: usize, policy: &ResourcePolicy) -> Result<(), ProducerError> {
+    let count = u64::try_from(count).map_err(|_| {
+        ProducerError::PolicyExceeded("artifact count exceeds the addressable range".to_owned())
+    })?;
+    if count > policy.max_artifact_count {
+        return Err(ProducerError::PolicyExceeded(format!(
+            "declared artifact count {count} exceeds the {}-artifact bound",
+            policy.max_artifact_count
+        )));
     }
+    Ok(())
+}
+
+/// Add one bounded contribution to a running total with explicit overflow.
+fn accumulate_bound(total: u64, next: u64, label: &str) -> Result<u64, ProducerError> {
+    total.checked_add(next).ok_or_else(|| {
+        ProducerError::PolicyExceeded(format!("{label} total overflowed the u64 range"))
+    })
+}
+
+/// Check every declared intent size before any artifact bytes are read.
+fn check_declared_artifact_limits(
+    intent: &PublicationIntentV2,
+    policy: &ResourcePolicy,
+) -> Result<(), ProducerError> {
+    check_artifact_count(intent.artifacts.len(), policy)?;
+    let mut total_stored = 0_u64;
+    let mut total_uncompressed = 0_u64;
+    for descriptor in &intent.artifacts {
+        if descriptor.stored_bytes > policy.max_stored_bytes_per_artifact {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "intent artifact {} declares {} stored bytes above the {}-byte bound",
+                descriptor.path, descriptor.stored_bytes, policy.max_stored_bytes_per_artifact
+            )));
+        }
+        if descriptor.uncompressed_bytes > policy.max_uncompressed_bytes_per_artifact {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "intent artifact {} declares {} uncompressed bytes above the {}-byte bound",
+                descriptor.path,
+                descriptor.uncompressed_bytes,
+                policy.max_uncompressed_bytes_per_artifact
+            )));
+        }
+        total_stored = accumulate_bound(
+            total_stored,
+            descriptor.stored_bytes,
+            "declared artifact stored bytes",
+        )?;
+        if total_stored > policy.max_total_stored_bytes {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "declared stored bytes exceed the {}-byte aggregate bound",
+                policy.max_total_stored_bytes
+            )));
+        }
+        total_uncompressed = accumulate_bound(
+            total_uncompressed,
+            descriptor.uncompressed_bytes,
+            "declared artifact uncompressed bytes",
+        )?;
+        if total_uncompressed > policy.max_total_uncompressed_bytes {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "declared uncompressed bytes exceed the {}-byte aggregate bound",
+                policy.max_total_uncompressed_bytes
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Count and digest recovered uncompressed bytes without buffering them.
+struct ExpandedStream {
+    /// Number of uncompressed bytes observed during decoding.
+    bytes: u64,
+    /// Incremental digest of the exact uncompressed byte sequence.
+    sha256: String,
+}
+
+/// Recover the exact uncompressed stream declared by one artifact descriptor.
+///
+/// The output limit is enforced on each decoded chunk before it is hashed, so
+/// an expansion attack cannot allocate past the caller-supplied bound. No
+/// `read_to_end` call and no output buffer are used. A clean end of stream and
+/// the absence of trailing bytes are both required.
+fn decompress_stream(
+    stored: &[u8],
+    compression: &str,
+    output_limit: u64,
+) -> Result<ExpandedStream, ProducerError> {
+    let mut hasher = Sha256::new();
+    let mut count = 0_u64;
+    let mut absorb = |chunk: &[u8]| -> Result<(), ProducerError> {
+        let added = u64::try_from(chunk.len()).map_err(|_| {
+            ProducerError::PolicyExceeded("expanded chunk exceeds the addressable range".to_owned())
+        })?;
+        let next = count.checked_add(added).ok_or_else(|| {
+            ProducerError::PolicyExceeded("expanded byte count overflowed the u64 range".to_owned())
+        })?;
+        if next > output_limit {
+            return Err(ProducerError::PolicyExceeded(format!(
+                "expanded artifact bytes exceed the {output_limit}-byte bound"
+            )));
+        }
+        hasher.update(chunk);
+        count = next;
+        Ok(())
+    };
+    match compression {
+        COMPRESSION_NONE => absorb(stored)?,
+        COMPRESSION_GZIP => {
+            let input = BufReader::with_capacity(16_384, Cursor::new(stored));
+            let mut decoder = GzDecoder::new(input);
+            let mut chunk = [0_u8; 16_384];
+            loop {
+                let observed = decoder
+                    .read(&mut chunk)
+                    .map_err(|error| io_error("decode gzip artifact", error))?;
+                if observed == 0 {
+                    break;
+                }
+                absorb(&chunk[..observed])?;
+            }
+            let mut input = decoder.into_inner();
+            let trailing = input
+                .fill_buf()
+                .map_err(|error| io_error("inspect gzip artifact end", error))?;
+            if !trailing.is_empty() {
+                return Err(ProducerError::UncertainPublication(
+                    "gzip artifact carries bytes after the end-of-stream marker".to_owned(),
+                ));
+            }
+        }
+        other => {
+            return Err(ProducerError::UncertainPublication(format!(
+                "unsupported compression literal {other}"
+            )));
+        }
+    }
+    Ok(ExpandedStream {
+        bytes: count,
+        sha256: hex_encode(&hasher.finalize()),
+    })
 }
 
 /// Resolve one declared artifact path relative to the artifact descriptor root.
@@ -3758,15 +4092,26 @@ fn validate_intent_tree_with(
     policy: &ResourcePolicy,
     probe: &dyn TreeValidationProbe,
 ) -> Result<(), ProducerError> {
+    check_declared_artifact_limits(intent, policy)?;
     let mut tree = open_release_tree(directory, probe)?;
-    let manifest = read_descriptor(tree.manifest.raw, "manifest descriptor")?;
-    if hex_encode(&sha256(&manifest)) != intent.manifest_sha256 {
+    let mut manifest_reader = BoundedDescriptorReader::new(
+        &tree.manifest,
+        "manifest descriptor",
+        policy.max_manifest_bytes,
+    )?;
+    manifest_reader.read_to_end()?;
+    if manifest_reader.hex_digest() != intent.manifest_sha256 {
         return Err(ProducerError::UncertainPublication(
             "manifest digest disagrees with the verified intent".to_owned(),
         ));
     }
-    let sidecar = read_descriptor(tree.sidecar.raw, "signature sidecar descriptor")?;
-    if hex_encode(&sha256(&sidecar)) != intent.sidecar_sha256 {
+    let mut sidecar_reader = BoundedDescriptorReader::new(
+        &tree.sidecar,
+        "signature sidecar descriptor",
+        policy.max_sidecar_bytes,
+    )?;
+    sidecar_reader.read_to_end()?;
+    if sidecar_reader.hex_digest() != intent.sidecar_sha256 {
         return Err(ProducerError::UncertainPublication(
             "signature sidecar digest disagrees with the verified intent".to_owned(),
         ));
@@ -3793,23 +4138,26 @@ fn validate_intent_tree_with(
         probe.at(TreeProbePoint::ArtifactOpen, directory);
         let artifact = tree.artifacts.open_child(relative, false)?;
         require_regular(&artifact, &format!("artifact {relative}"))?;
-        let bytes = read_descriptor(artifact.raw, &format!("artifact {relative}"))?;
-        let stored_length = u64::try_from(bytes.len()).map_err(|_| {
-            ProducerError::PolicyExceeded("artifact stream exceeds addressable length".to_owned())
-        })?;
-        if stored_length != descriptor.stored_bytes
-            || hex_encode(&sha256(&bytes)) != descriptor.stored_sha256
+        let mut reader = BoundedDescriptorReader::new(
+            &artifact,
+            format!("artifact {relative}"),
+            descriptor.stored_bytes,
+        )?;
+        let bytes = reader.read_to_end()?;
+        if reader.bytes_read() != descriptor.stored_bytes
+            || reader.hex_digest() != descriptor.stored_sha256
         {
             return Err(ProducerError::UncertainPublication(format!(
                 "stored artifact {relative} disagrees with the verified intent"
             )));
         }
-        let uncompressed = decompress_stream(&bytes, &descriptor.compression)?;
-        let plain_length = u64::try_from(uncompressed.len()).map_err(|_| {
-            ProducerError::PolicyExceeded("artifact stream exceeds addressable length".to_owned())
-        })?;
-        if plain_length != descriptor.uncompressed_bytes
-            || hex_encode(&sha256(&uncompressed)) != descriptor.uncompressed_sha256
+        let expanded = decompress_stream(
+            &bytes,
+            &descriptor.compression,
+            descriptor.uncompressed_bytes,
+        )?;
+        if expanded.bytes != descriptor.uncompressed_bytes
+            || expanded.sha256 != descriptor.uncompressed_sha256
         {
             return Err(ProducerError::UncertainPublication(format!(
                 "uncompressed artifact {relative} disagrees with the verified intent"
@@ -3949,6 +4297,7 @@ fn is_quarantine_condition(error: &ProducerError) -> bool {
             | ProducerError::PublicationJournal(_)
             | ProducerError::ArtifactSetMismatch(_)
             | ProducerError::InvalidArtifactPath(..)
+            | ProducerError::PolicyExceeded(_)
     )
 }
 
@@ -4417,13 +4766,21 @@ fn finalize_publication_v2(
 fn load_receipt(
     ledger: &Path,
     release_id: &str,
+    policy: &ResourcePolicy,
 ) -> Result<Option<(Vec<u8>, PublicationReceipt)>, ProducerError> {
     let path = ledger.join(format!("{release_id}.receipt.json"));
-    if !path.exists() {
-        return Ok(None);
+    match fs::symlink_metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(io_error(&format!("stat receipt {}", path.display()), error));
+        }
     }
-    let bytes = fs::read(&path)
-        .map_err(|error| io_error(&format!("read receipt {}", path.display()), error))?;
+    let bytes = read_bounded_file(
+        &path,
+        &format!("receipt {}", path.display()),
+        policy.max_record_bytes,
+    )?;
     let receipt: PublicationReceipt = serde_json::from_slice(&bytes).map_err(|error| {
         ProducerError::UncertainPublication(format!("durable receipt is unreadable: {error}"))
     })?;
@@ -4494,7 +4851,7 @@ fn recover_final_directory(
     let marker_path = ledger.join(format!("{}.available", evidence.release_id));
     let receipt_present = receipt_path.exists();
     if receipt_present {
-        let Some((bytes, receipt)) = load_receipt(ledger, &evidence.release_id)? else {
+        let Some((bytes, receipt)) = load_receipt(ledger, &evidence.release_id, policy)? else {
             return Err(ProducerError::UncertainPublication(
                 "durable receipt disappeared during recovery".to_owned(),
             ));
@@ -4512,8 +4869,11 @@ fn recover_final_directory(
                 "availability marker without a durable receipt".to_owned(),
             ));
         }
-        let bytes = fs::read(&marker_path)
-            .map_err(|error| io_error(&format!("read marker {}", marker_path.display()), error))?;
+        let bytes = read_bounded_file(
+            &marker_path,
+            &format!("marker {}", marker_path.display()),
+            policy.max_record_bytes,
+        )?;
         if bytes != operation.operation_id.as_bytes() {
             return Err(ProducerError::UncertainPublication(
                 "availability marker binds to a different operation".to_owned(),
@@ -4900,6 +5260,8 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::ffi::OsStrExt;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::os::unix::fs::symlink;
     use std::process;
     use std::process::Command;
@@ -4940,6 +5302,7 @@ mod tests {
             max_object_members: 64,
             max_array_elements: 64,
             max_sidecar_bytes: 4_096,
+            max_intent_bytes: 1_000_000,
         }
     }
 
@@ -5578,7 +5941,7 @@ mod tests {
             "every committed stage keeps the failed operation identity"
         );
         let receipt_acknowledged =
-            load_receipt(ledger, release_id)?.is_some_and(|(bytes, receipt)| {
+            load_receipt(ledger, release_id, &policy)?.is_some_and(|(bytes, receipt)| {
                 receipt_matches(&receipt, &bytes, evidence)
                     && stages
                         .last()
@@ -7053,7 +7416,7 @@ mod tests {
             "the rename is durable before the availability marker"
         );
         assert!(
-            load_receipt(&ledger, "release-marker-fault")?.is_some(),
+            load_receipt(&ledger, "release-marker-fault", &policy)?.is_some(),
             "the receipt survives the marker failure"
         );
         let marker_bytes = fs::read(ledger.join("release-marker-fault.available"))?;
@@ -8481,7 +8844,8 @@ mod tests {
             RecoveryOutcome::RecoveredPublished,
             "recovery completes the interrupted publication"
         );
-        let Some((bytes, receipt)) = load_receipt(ledger, release_id)? else {
+        let policy = test_policy();
+        let Some((bytes, receipt)) = load_receipt(ledger, release_id, &policy)? else {
             return Err("recovery committed no receipt".into());
         };
         assert_eq!(
@@ -8849,7 +9213,7 @@ mod tests {
             "the winner retains its own availability marker"
         );
         assert_eq!(
-            load_receipt(&ledger, "release-ownership")?
+            load_receipt(&ledger, "release-ownership", &policy)?
                 .map(|(_, receipt)| receipt.publication_operation_id),
             Some(winner.receipt.publication_operation_id),
             "the durable receipt still belongs to the winning operation"
@@ -8909,7 +9273,7 @@ mod tests {
             "a foreign operation's rename evidence prevents adoption"
         );
         assert_eq!(
-            load_receipt(&ledger, "release-forged")?
+            load_receipt(&ledger, "release-forged", &policy)?
                 .map(|(_, receipt)| receipt.publication_operation_id),
             Some("operation-owner".to_owned()),
             "the receipt identity is unchanged by the forged stage"
@@ -9157,7 +9521,7 @@ mod tests {
             FULL_RECOVERY_ORDER.to_vec(),
             "correction recovery follows the ratified transition order"
         );
-        let Some((bytes, receipt)) = load_receipt(&ledger, "release-correction")? else {
+        let Some((bytes, receipt)) = load_receipt(&ledger, "release-correction", &policy)? else {
             return Err("correction receipt is absent".into());
         };
         assert_eq!(
@@ -10328,7 +10692,7 @@ mod tests {
             RecoveryOutcome::AlreadyAvailable,
             "a repeated recovery observes the durable acknowledgement"
         );
-        let receipt = load_receipt(&ledger, "release-durable")?
+        let receipt = load_receipt(&ledger, "release-durable", &policy)?
             .map(|(_, value)| value)
             .ok_or_else(|| io::Error::other("the durable receipt is absent"))?;
         assert_eq!(
@@ -10830,6 +11194,490 @@ mod tests {
             durable_chain_bytes(&ledger, operation)?,
             first_chain,
             "the operation chain stays byte-identical across fresh recoveries"
+        );
+        Ok(())
+    }
+
+    // --- FB-REC-022 bounded recovery tests ---
+
+    /// Test-local peak RSS bound; not a production maximum. The test policy
+    /// bounds one stored artifact at `100_000` bytes, expanded bytes stream
+    /// without an output buffer and the harness baseline stays far below this
+    /// figure. A 256 MiB sparse artifact or a gzip expansion bomb would breach
+    /// the bound if either were materialized before validation.
+    const RECOVERY_RSS_BUDGET_BYTES: u64 = 128 * 1024 * 1024;
+    const FB_REC022_RSS_CHILD: &str = "FB_REC022_RSS_CHILD";
+    const FB_REC022_RSS_SCENARIO: &str = "FB_REC022_RSS_SCENARIO";
+    const RSS_CHILD_TEST: &str = "distribution::ndc_release::tests::recovery_rss_child";
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[expect(
+        unsafe_code,
+        reason = "getrusage reports process peak memory through the libc interface"
+    )]
+    fn peak_rss_bytes() -> Result<u64, Box<dyn StdError>> {
+        // SAFETY: `usage` is a plain data struct whose zero bit pattern is
+        // valid before the system call fills it.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `usage` is writable for the platform rusage layout and the
+        // process handle is valid for this call.
+        let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        if status != 0 {
+            return Err(Box::new(io::Error::last_os_error()));
+        }
+        let reported = u64::try_from(usage.ru_maxrss)?;
+        #[cfg(target_os = "linux")]
+        {
+            Ok(reported.saturating_mul(1024))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            Ok(reported)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn spawn_rss_child(
+        scenario: &str,
+        root: &Path,
+        ledger: &Path,
+        operation_id: &str,
+    ) -> Result<u64, Box<dyn StdError>> {
+        let output = Command::new(env::current_exe()?)
+            .arg("--exact")
+            .arg(RSS_CHILD_TEST)
+            .arg("--nocapture")
+            .env(FB_REC022_RSS_CHILD, "1")
+            .env(FB_REC022_RSS_SCENARIO, scenario)
+            .env(CHILD_ROOT_ENV, root)
+            .env(CHILD_LEDGER_ENV, ledger)
+            .env(CHILD_OPERATION_ENV, operation_id)
+            .output()?;
+        let status = output.status;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            status.success(),
+            "RSS child {scenario} exited with {status}: {stderr}"
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let reported = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("FB_REC022_RSS_BYTES="))
+            .ok_or_else(|| io::Error::other("RSS child reported no peak RSS"))?;
+        Ok(reported.parse::<u64>()?)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_rss_child() -> TestResult {
+        let Ok(scenario) = env::var(FB_REC022_RSS_SCENARIO) else {
+            return Ok(());
+        };
+        match scenario.as_str() {
+            "sparse" => {
+                let root = PathBuf::from(env::var(CHILD_ROOT_ENV)?);
+                let ledger = PathBuf::from(env::var(CHILD_LEDGER_ENV)?);
+                let operation_id = env::var(CHILD_OPERATION_ENV)?;
+                let outcome =
+                    super::recover_interrupted(&root, &ledger, &operation_id, &test_policy());
+                assert!(
+                    matches!(
+                        outcome,
+                        Ok(RecoveryOutcome::UncertainPublicationQuarantined)
+                    ),
+                    "a sparse oversized artifact is quarantined without acknowledgement"
+                );
+            }
+            "gzip" => {
+                let bomb =
+                    compress_stream(&vec![b'z'; 8 * 1024 * 1024], ArtifactCompression::Gzip)?;
+                let result = decompress_stream(&bomb, COMPRESSION_GZIP, 1_048_576);
+                assert!(
+                    matches!(result, Err(ProducerError::PolicyExceeded(_))),
+                    "gzip expansion above the output bound is refused"
+                );
+            }
+            other => return Err(format!("unknown RSS scenario {other}").into()),
+        }
+        println!("FB_REC022_RSS_BYTES={}", peak_rss_bytes()?);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_intent_is_refused_before_json_parsing() -> TestResult {
+        let temp = TempDir::new()?;
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&ledger)?;
+        let mut policy = test_policy();
+        policy.max_intent_bytes = 32;
+        let operation_id = "operation-oversized-intent";
+        fs::write(intent_path(&ledger, operation_id), vec![b'{'; 4_096])?;
+        let result = load_intent(&ledger, operation_id, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "an oversized intent is refused before JSON parsing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn too_many_intent_artifacts_are_refused() -> TestResult {
+        let fixture = staging_fixture("release-intent-count")?;
+        let mut intent = load_intent(&fixture.ledger, &fixture.operation_id, &fixture.policy)?
+            .expect("the fixture carries an immutable intent");
+        let extra = intent.artifacts[0].clone();
+        while u64::try_from(intent.artifacts.len())? <= fixture.policy.max_artifact_count {
+            intent.artifacts.push(extra.clone());
+        }
+        let result = validate_intent_tree(&fixture.staging, &intent, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "an artifact inventory above the count bound is refused before reading"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_manifest_is_refused_and_quarantined() -> TestResult {
+        let fixture = staging_fixture("release-large-manifest")?;
+        fs::write(
+            fixture.staging.join(MANIFEST_FILE_NAME),
+            vec![b'm'; 2_000_000],
+        )?;
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "a manifest above the bound is refused by the bounded reader"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn oversized_sidecar_is_refused_and_quarantined() -> TestResult {
+        let fixture = staging_fixture("release-large-sidecar")?;
+        let intent = load_intent(&fixture.ledger, &fixture.operation_id, &fixture.policy)?
+            .expect("the fixture carries an immutable intent");
+        fs::write(fixture.staging.join(SIDECAR_FILE_NAME), vec![b's'; 8_192])?;
+        let result = validate_intent_tree(&fixture.staging, &intent, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "a sidecar above the bound is refused by the bounded reader"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn sparse_oversized_artifact_is_refused_by_fstat_size() -> TestResult {
+        let fixture = staging_fixture("release-sparse-artifact")?;
+        let intent = load_intent(&fixture.ledger, &fixture.operation_id, &fixture.policy)?
+            .expect("the fixture carries an immutable intent");
+        let artifact = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&artifact)?;
+        file.set_len(256 * 1024 * 1024)?;
+        file.sync_all()?;
+        let result = validate_intent_tree(&fixture.staging, &intent, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "a sparse artifact above the declared size is refused by fstat"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn artifact_growth_after_stat_is_refused() -> TestResult {
+        let fixture = staging_fixture("release-growing-artifact")?;
+        let artifact = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        let initial = fs::metadata(&artifact)?.len();
+        let descriptor = open_no_follow_file(&artifact, "growing artifact")?;
+        let mut reader = BoundedDescriptorReader::new(&descriptor, "growing artifact", initial)?;
+        reader.grow_after_stat(&|_| {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&artifact)
+                .expect("the growth probe appends to the artifact");
+            file.write_all(&[b'g'; 512])
+                .expect("the growth probe writes appended bytes");
+        });
+        let result = reader.read_to_end();
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "growth past the bound after the size check is refused during reads"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn altered_stored_artifact_bytes_quarantine_recovery() -> TestResult {
+        let fixture = staging_fixture("release-altered-stored")?;
+        let path = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        let mut bytes = fs::read(&path)?;
+        bytes[0] ^= 0x01;
+        fs::write(&path, bytes)?;
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn decompress_stream_enforces_the_output_bound() -> TestResult {
+        let stored = compress_stream(b"abcdefgh", ArtifactCompression::Gzip)?;
+        let refused = decompress_stream(&stored, COMPRESSION_GZIP, 4);
+        assert!(
+            matches!(refused, Err(ProducerError::PolicyExceeded(_))),
+            "expansion above the output bound is typed"
+        );
+        let expanded = decompress_stream(&stored, COMPRESSION_GZIP, 8)?;
+        assert_eq!(expanded.bytes, 8, "the expanded byte count is exact");
+        assert_eq!(
+            expanded.sha256,
+            hex_encode(&sha256(b"abcdefgh")),
+            "the incremental expanded digest is exact"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_expansion_attack_is_refused_without_buffering() -> TestResult {
+        let bomb = compress_stream(&vec![b'q'; 4 * 1024 * 1024], ArtifactCompression::Gzip)?;
+        assert!(
+            bomb.len() < 100_000,
+            "the expansion attack stays small on disk"
+        );
+        let result = decompress_stream(&bomb, COMPRESSION_GZIP, 65_536);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "a gzip expansion attack is refused by the streaming output bound"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn gzip_stream_with_trailing_bytes_is_refused() -> TestResult {
+        let mut stored = compress_stream(b"abcdefgh", ArtifactCompression::Gzip)?;
+        stored.extend_from_slice(b"trailing");
+        let result = decompress_stream(&stored, COMPRESSION_GZIP, 64);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "bytes after the gzip end-of-stream marker are refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_size_overflow_is_refused() -> TestResult {
+        let fixture = staging_fixture("release-aggregate-overflow")?;
+        let mut policy = test_policy();
+        policy.max_stored_bytes_per_artifact = u64::MAX;
+        policy.max_total_stored_bytes = u64::MAX;
+        let mut intent = load_intent(&fixture.ledger, &fixture.operation_id, &fixture.policy)?
+            .expect("the fixture carries an immutable intent");
+        intent.artifacts[0].stored_bytes = u64::MAX;
+        let mut second = intent.artifacts[0].clone();
+        second.stored_bytes = 2;
+        intent.artifacts.push(second);
+        let result = check_declared_artifact_limits(&intent, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "aggregate stored bytes that overflow are refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn symlinked_intent_is_refused_and_quarantined() -> TestResult {
+        let fixture = staging_fixture("release-intent-symlink")?;
+        let intent = intent_path(&fixture.ledger, &fixture.operation_id);
+        let outside = fixture.temp.path().join("intent-outside.json");
+        fs::rename(&intent, &outside)?;
+        symlink(&outside, &intent)?;
+        let result = load_intent(&fixture.ledger, &fixture.operation_id, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a symlinked intent is refused by the no-follow open"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn symlinked_receipt_is_refused() -> TestResult {
+        let temp = TempDir::new()?;
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&ledger)?;
+        let receipt = ledger.join("release-receipt-symlink.receipt.json");
+        let outside = temp.path().join("receipt-outside.json");
+        fs::write(&outside, b"{}")?;
+        symlink(&outside, &receipt)?;
+        let result = load_receipt(&ledger, "release-receipt-symlink", &test_policy());
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a symlinked receipt is refused by the no-follow open"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_receipt_is_refused() -> TestResult {
+        let temp = TempDir::new()?;
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&ledger)?;
+        fs::write(
+            ledger.join("release-receipt-large.receipt.json"),
+            vec![b'r'; 2_000],
+        )?;
+        let result = load_receipt(&ledger, "release-receipt-large", &test_policy());
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "a receipt above the bound is refused by the bounded reader"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replaced_journal_record_is_refused() -> TestResult {
+        let fixture = staging_fixture("release-journal-replaced")?;
+        let first = stage_path(&fixture.ledger, &fixture.operation_id, 0);
+        let second = stage_path(&fixture.ledger, &fixture.operation_id, 1);
+        fs::write(&first, fs::read(&second)?)?;
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn changed_journal_record_is_refused() -> TestResult {
+        let fixture = staging_fixture("release-journal-changed")?;
+        let stage = stage_path(&fixture.ledger, &fixture.operation_id, 0);
+        let mut bytes = fs::read(&stage)?;
+        let last = bytes.len() - 1;
+        bytes[last] = if bytes[last] == b'0' { b'1' } else { b'0' };
+        fs::write(&stage, bytes)?;
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn oversized_journal_record_is_refused() -> TestResult {
+        let fixture = staging_fixture("release-journal-oversized")?;
+        let stage = stage_path(&fixture.ledger, &fixture.operation_id, 0);
+        fs::write(&stage, vec![b'j'; 2_000])?;
+        let result = read_stage_operations(&fixture.ledger, &fixture.operation_id, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::PolicyExceeded(_))),
+            "a journal record above the bound is refused by the bounded reader"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unreadable_artifact_withholds_acknowledgement() -> TestResult {
+        let fixture = staging_fixture("release-unreadable-artifact")?;
+        let path = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))?;
+        assert!(
+            fs::File::open(&path).is_err(),
+            "the test fixture makes the artifact unreadable"
+        );
+        let result = assert_quarantined_without_ack(&fixture);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))?;
+        result
+    }
+
+    #[test]
+    fn failed_recovery_sync_withholds_acknowledgement() -> TestResult {
+        let fixture = staging_fixture("release-recovery-sync-fault")?;
+        let fs = RecordingPublicationFs::new(PublicationFaults {
+            fail_parent_dir_sync: true,
+            ..PublicationFaults::default()
+        });
+        let result = super::recover_from_durable_state(
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.operation_id,
+            &fixture.policy,
+            &fs,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the injected recovery sync failure is typed"
+        );
+        let receipt = fixture
+            .ledger
+            .join(format!("{}.receipt.json", fixture.release_id));
+        let marker = fixture
+            .ledger
+            .join(format!("{}.available", fixture.release_id));
+        assert!(
+            !receipt.exists(),
+            "a failed recovery sync writes no receipt"
+        );
+        assert!(
+            !marker.exists(),
+            "a failed recovery sync writes no availability marker"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_peak_rss_is_bounded_for_sparse_artifact() -> TestResult {
+        let fixture = staging_fixture("release-rss-sparse")?;
+        let artifact = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        let file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&artifact)?;
+        file.set_len(256 * 1024 * 1024)?;
+        file.sync_all()?;
+        let peak = spawn_rss_child(
+            "sparse",
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.operation_id,
+        )?;
+        println!("FB_REC022_RECOVERY_RSS_BYTES={peak}");
+        assert!(
+            peak <= RECOVERY_RSS_BUDGET_BYTES,
+            "peak recovery RSS {peak} exceeded the declared test budget {RECOVERY_RSS_BUDGET_BYTES}"
+        );
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recovery_peak_rss_is_bounded_for_gzip_expansion() -> TestResult {
+        let fixture = staging_fixture("release-rss-gzip")?;
+        let peak = spawn_rss_child(
+            "gzip",
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.operation_id,
+        )?;
+        println!("FB_REC022_EXPANSION_RSS_BYTES={peak}");
+        assert!(
+            peak <= RECOVERY_RSS_BUDGET_BYTES,
+            "peak expansion RSS {peak} exceeded the declared test budget {RECOVERY_RSS_BUDGET_BYTES}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_reader_hashes_bytes_incrementally() -> TestResult {
+        let temp = TempDir::new()?;
+        let path = temp.path().join("bounded-bytes");
+        let payload = b"abstract bounded bytes\n";
+        fs::write(&path, payload)?;
+        let descriptor = open_no_follow_file(&path, "bounded bytes")?;
+        let mut reader = BoundedDescriptorReader::new(&descriptor, "bounded bytes", 1_024)?;
+        let bytes = reader.read_to_end()?;
+        assert_eq!(bytes, payload, "bounded reads return the exact bytes");
+        assert_eq!(
+            reader.bytes_read(),
+            u64::try_from(payload.len())?,
+            "bounded reads count every byte"
+        );
+        assert_eq!(
+            reader.hex_digest(),
+            hex_encode(&sha256(payload)),
+            "the incremental digest matches the whole-buffer digest"
         );
         Ok(())
     }
