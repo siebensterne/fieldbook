@@ -76,6 +76,8 @@ rather than a rewrite of history.
   — dated sweep and gate evidence for the adopted documentation standard.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
+- [Instrument classes and typed terms](docs/fb-ref-002-instrument-terms-2026-11-24.md)
+  — FB-REF-002 unit-bearing measures, family terms and revision record.
 
 Format contracts: [replay format](docs/replay-format.md),
 [raw-frame journal](docs/raw-frame-journal.md),
