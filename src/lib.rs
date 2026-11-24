@@ -27,6 +27,7 @@ pub use domain::fixed;
 pub use domain::identity;
 pub use domain::information;
 pub use domain::instrument_terms;
+pub use domain::market_registry;
 pub use domain::model;
 pub use domain::products;
 pub use domain::reference_core;

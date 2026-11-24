@@ -7,6 +7,7 @@ pub mod fixed;
 pub mod identity;
 pub mod information;
 pub mod instrument_terms;
+pub mod market_registry;
 pub mod model;
 pub mod products;
 pub mod reference_core;
