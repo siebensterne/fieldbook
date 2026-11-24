@@ -76,6 +76,9 @@ rather than a rewrite of history.
   — dated sweep and gate evidence for the adopted documentation standard.
 - [NDC v2 release producer](docs/fb-ndc-001-release-producer-2026-11-24.md)
   — FB-NDC-001 ratified decisions, typed surface, platform limit and gate record.
+- [Canonical NDC v2 wire mapping](docs/fb-ndc-009-wire-mapping-2026-11-24.md)
+  — FB-NDC-009 wire authority mapping, byte-derived ordering, conformance
+  producer, seed vector and gate record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)
