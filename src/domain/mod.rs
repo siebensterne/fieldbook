@@ -5,6 +5,7 @@ pub mod canonical;
 pub mod capability_registry;
 pub mod event_model;
 pub mod fixed;
+pub mod framed_identity;
 pub mod identity;
 pub mod information;
 pub mod instrument_terms;

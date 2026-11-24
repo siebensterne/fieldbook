@@ -17,6 +17,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::domain::framed_identity;
+use crate::domain::framed_identity::IdentityV2Error;
+
 /// Opaque, platform-assigned identity. The prefix identifies the entity class;
 /// the digest is derived from an explicit immutable assertion and never from a
 /// mutable display attribute.
@@ -48,6 +51,14 @@ impl OpaqueId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Accept previously declared identity text after checking its shape.
+    /// Legacy and version-2 text are both accepted; malformed text is rejected.
+    /// This constructor is additive and does not alter [`Self::derive`].
+    pub fn from_declared(text: String) -> Result<Self, IdentityV2Error> {
+        framed_identity::detect_format(&text)?;
+        Ok(Self(text))
     }
 }
 

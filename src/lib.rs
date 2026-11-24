@@ -25,6 +25,7 @@ pub use domain::canonical;
 pub use domain::capability_registry;
 pub use domain::event_model;
 pub use domain::fixed;
+pub use domain::framed_identity;
 pub use domain::identity;
 pub use domain::information;
 pub use domain::instrument_terms;
