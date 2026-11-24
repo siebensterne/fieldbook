@@ -28,6 +28,7 @@ pub use domain::identity;
 pub use domain::information;
 pub use domain::model;
 pub use domain::products;
+pub use domain::reference_core;
 pub use domain::reference_data;
 pub use domain::side;
 pub use domain::taxonomy;
