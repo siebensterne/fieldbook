@@ -108,6 +108,9 @@ rather than a rewrite of history.
 - [Bounded Fieldbook recovery reads](docs/fb-rec-022-bounded-recovery-2026-11-24.md)
   — FB-REC-022 bounded descriptor reads, intent size limit, streaming gzip
   output bound, quarantine rule and recovery memory-budget evidence.
+- [Bounded streaming producer lifecycle](docs/fb-b15-streaming-producer-2026-11-24.md)
+  — FB-B15 bounded one-record source, immutable versioned resource profile,
+  two-intent seal, replay proof, spool quarantine and deferred maxima.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)

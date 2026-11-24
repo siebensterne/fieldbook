@@ -390,7 +390,7 @@ fn stage_order(schema_version: u32) -> Result<&'static [PublicationState], Produ
         reason = "durable events are constructed by the offline recording filesystem"
     )
 )]
-enum PublicationRecoveryEvent {
+pub(crate) enum PublicationRecoveryEvent {
     /// The final directory name was observed.
     FinalDirectoryFound,
     /// Final directory bytes were verified against the validated intent.
@@ -707,7 +707,7 @@ pub enum RecordOrderProfile {
 /// One record order position derived from canonical record bytes. Gaps are
 /// preserved; no missing position is synthesized and no event time is used as
 /// a fallback. This type is internal to the producer and wire modules.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum RecordOrderKey {
     /// Position in one sequenced domain and epoch.
     Sequenced {
@@ -2039,7 +2039,10 @@ fn validate_identifier(value: &str, label: &str) -> Result<(), ProducerError> {
     Ok(())
 }
 
-fn validate_artifact_path(path: &str, policy: &ResourcePolicy) -> Result<(), ProducerError> {
+pub(crate) fn validate_artifact_path(
+    path: &str,
+    policy: &ResourcePolicy,
+) -> Result<(), ProducerError> {
     let prefix = format!("{ARTIFACT_DIRECTORY}/");
     if !path.starts_with(&prefix) {
         return Err(ProducerError::InvalidArtifactPath(
@@ -2227,7 +2230,7 @@ fn validate_lineage(
     Ok(())
 }
 
-fn validate_record(
+pub(crate) fn validate_record(
     bytes: &[u8],
     index: usize,
     policy: &ResourcePolicy,
@@ -2268,7 +2271,7 @@ fn validate_record(
     Ok(())
 }
 
-fn reference_key_tuple(key: &RecordOrderKey) -> Option<(&str, u64, u64, &str)> {
+pub(crate) fn reference_key_tuple(key: &RecordOrderKey) -> Option<(&str, u64, u64, &str)> {
     match key {
         RecordOrderKey::Reference {
             object_id,
@@ -2394,6 +2397,13 @@ fn validate_record_order(
     Ok(())
 }
 
+/// Byte-identical gzip output used by streaming equivalence tests. No
+/// classification of input bytes or file extensions takes place here.
+#[cfg(test)]
+pub(crate) fn compress_test_vector(uncompressed: &[u8]) -> Result<Vec<u8>, ProducerError> {
+    compress_stream(uncompressed, ArtifactCompression::Gzip)
+}
+
 fn compress_stream(
     uncompressed: &[u8],
     compression: ArtifactCompression,
@@ -2424,6 +2434,125 @@ struct PreparedRelease {
     artifacts: Vec<(String, Vec<u8>)>,
     evidence: PublicationEvidence,
     receipt: PublicationReceipt,
+}
+
+/// Canonical manifest and sidecar bytes produced from one validated inventory.
+pub(crate) struct SealedManifest {
+    /// Canonical manifest bytes.
+    pub(crate) manifest_bytes: Vec<u8>,
+    /// Detached sidecar bytes with one trailing LF.
+    pub(crate) sidecar_bytes: Vec<u8>,
+    /// Lowercase hex digest of the manifest bytes.
+    pub(crate) manifest_sha256: String,
+    /// Lowercase hex digest of the sidecar bytes.
+    pub(crate) sidecar_sha256: String,
+}
+
+/// Inputs to the shared manifest and sidecar sealing step.
+pub(crate) struct SealRequest<'a> {
+    /// Complete manifest with its final artifact inventory and dataset digest.
+    pub(crate) manifest: &'a ReleaseManifest,
+    /// Typed evidence supplement for the canonical wire mapping.
+    pub(crate) evidence: &'a crate::distribution::ndc_wire::EvidenceSpec,
+    /// Event types observed in the validated canonical record streams.
+    pub(crate) observed_event_types: &'a BTreeSet<String>,
+    /// Injected signing material.
+    pub(crate) signature: SignatureConfig<'a>,
+    /// Caller-supplied policy for canonical byte bounds.
+    pub(crate) policy: &'a ResourcePolicy,
+}
+
+/// Seal one manifest through the canonical wire mapping and inject key. The
+/// batch and streaming producers share this step so their manifest and
+/// sidecar bytes cannot diverge.
+pub(crate) fn seal_manifest(request: SealRequest<'_>) -> Result<SealedManifest, ProducerError> {
+    let wire_manifest = crate::distribution::ndc_wire::map_manifest(
+        request.manifest,
+        request.evidence,
+        &request.manifest.digests.data_sha256,
+        request.observed_event_types,
+    )
+    .map_err(|error| ProducerError::WireMapping(error.to_string()))?;
+    let manifest_bytes = canonicalize_strict(&wire_manifest, request.policy)?;
+    if manifest_bytes.len() > request.policy.max_manifest_bytes as usize {
+        return Err(ProducerError::PolicyExceeded(
+            "canonical manifest exceeds policy".to_owned(),
+        ));
+    }
+    let manifest_digest = sha256(&manifest_bytes);
+    let manifest_sha256 = hex_encode(&manifest_digest);
+
+    let mut message = Vec::with_capacity(SIGNING_DOMAIN.len() + manifest_digest.len());
+    message.extend_from_slice(SIGNING_DOMAIN);
+    message.extend_from_slice(&manifest_digest);
+    let signature = request.signature.signing_key.sign(&message);
+    request
+        .signature
+        .verifying_key
+        .verify(&message, &signature)
+        .map_err(|_| ProducerError::InvalidSignatureConfig("self-check failed".to_owned()))?;
+    let sidecar = SignatureSidecar {
+        schema_version: SIDECAR_SCHEMA_VERSION,
+        algorithm: SIGNATURE_ALGORITHM.to_owned(),
+        key_id: request.signature.key_id.to_owned(),
+        manifest_sha256: manifest_sha256.clone(),
+        signature_b64: BASE64.encode(signature.to_bytes()),
+    };
+    let mut sidecar_bytes = canonicalize_strict(&sidecar.to_jcs()?, request.policy)?;
+    sidecar_bytes.push(b'\n');
+    if sidecar_bytes.len() > request.policy.max_sidecar_bytes as usize {
+        return Err(ProducerError::PolicyExceeded(
+            "sidecar exceeds policy".to_owned(),
+        ));
+    }
+    let sidecar_sha256 = hex_encode(&sha256(&sidecar_bytes));
+    Ok(SealedManifest {
+        manifest_bytes,
+        sidecar_bytes,
+        manifest_sha256,
+        sidecar_sha256,
+    })
+}
+
+/// Build the durable receipt and its recovery evidence from one manifest.
+pub(crate) fn build_receipt_evidence(
+    manifest: &ReleaseManifest,
+    descriptors: &[ArtifactDescriptor],
+    operation_id: &str,
+    commit_position: &str,
+    sealed: &SealedManifest,
+    policy: &ResourcePolicy,
+) -> Result<(PublicationReceipt, PublicationEvidence), ProducerError> {
+    let receipt = PublicationReceipt {
+        schema_version: MANIFEST_SCHEMA_VERSION,
+        release_id: manifest.release_identity.release_id.clone(),
+        manifest_sha256: sealed.manifest_sha256.clone(),
+        data_sha256: manifest.digests.data_sha256.clone(),
+        publication_operation_id: operation_id.to_owned(),
+        commit_position: commit_position.to_owned(),
+        result: PublicationState::Available,
+        supersedes_release_id: manifest
+            .lineage
+            .supersedes
+            .as_ref()
+            .map(|value| value.supersedes_release_id.clone()),
+    };
+    let receipt_bytes = receipt_file_bytes(&receipt, policy)?;
+    let evidence = PublicationEvidence {
+        release_id: receipt.release_id.clone(),
+        manifest_sha256: sealed.manifest_sha256.clone(),
+        data_sha256: manifest.digests.data_sha256.clone(),
+        publication_operation_id: operation_id.to_owned(),
+        commit_position: commit_position.to_owned(),
+        artifact_paths: descriptors.iter().map(|item| item.path.clone()).collect(),
+        artifact_stored_sha256: descriptors
+            .iter()
+            .map(|item| item.stored_sha256.clone())
+            .collect(),
+        expected_receipt: receipt.clone(),
+        receipt_sha256: hex_encode(&sha256(&receipt_bytes)),
+    };
+    Ok((receipt, evidence))
 }
 
 fn prepare_release(request: &BuildRequest<'_>) -> Result<PreparedRelease, ProducerError> {
@@ -2551,84 +2680,29 @@ fn prepare_release(request: &BuildRequest<'_>) -> Result<PreparedRelease, Produc
 
     let mut manifest = request.manifest.clone();
     manifest.artifacts = descriptors.clone();
-    manifest.digests.data_sha256 = data_sha256.clone();
-    let wire_manifest = crate::distribution::ndc_wire::map_manifest(
+    manifest.digests.data_sha256 = data_sha256;
+    let sealed = seal_manifest(SealRequest {
+        manifest: &manifest,
+        evidence: request.evidence,
+        observed_event_types: request.observed_event_types,
+        signature: request.signature,
+        policy: request.policy,
+    })?;
+    let (receipt, evidence) = build_receipt_evidence(
         &manifest,
-        request.evidence,
-        &data_sha256,
-        request.observed_event_types,
-    )
-    .map_err(|error| ProducerError::WireMapping(error.to_string()))?;
-    let manifest_bytes = canonicalize_strict(&wire_manifest, request.policy)?;
-    if manifest_bytes.len() > request.policy.max_manifest_bytes as usize {
-        return Err(ProducerError::PolicyExceeded(
-            "canonical manifest exceeds policy".to_owned(),
-        ));
-    }
-    let manifest_digest = sha256(&manifest_bytes);
-    let manifest_sha256 = hex_encode(&manifest_digest);
-
-    let mut message = Vec::with_capacity(SIGNING_DOMAIN.len() + manifest_digest.len());
-    message.extend_from_slice(SIGNING_DOMAIN);
-    message.extend_from_slice(&manifest_digest);
-    let signature = request.signature.signing_key.sign(&message);
-    request
-        .signature
-        .verifying_key
-        .verify(&message, &signature)
-        .map_err(|_| ProducerError::InvalidSignatureConfig("self-check failed".to_owned()))?;
-    let sidecar = SignatureSidecar {
-        schema_version: SIDECAR_SCHEMA_VERSION,
-        algorithm: SIGNATURE_ALGORITHM.to_owned(),
-        key_id: request.signature.key_id.to_owned(),
-        manifest_sha256: manifest_sha256.clone(),
-        signature_b64: BASE64.encode(signature.to_bytes()),
-    };
-    let mut sidecar_bytes = canonicalize_strict(&sidecar.to_jcs()?, request.policy)?;
-    sidecar_bytes.push(b'\n');
-    if sidecar_bytes.len() > request.policy.max_sidecar_bytes as usize {
-        return Err(ProducerError::PolicyExceeded(
-            "sidecar exceeds policy".to_owned(),
-        ));
-    }
-
-    let mut stored_paths = Vec::new();
-    let mut stored_digests = Vec::new();
-    let mut artifacts = Vec::new();
-    for item in prepared {
-        stored_paths.push(item.descriptor.path.clone());
-        stored_digests.push(item.descriptor.stored_sha256.clone());
-        artifacts.push((item.descriptor.path, item.stored));
-    }
-    let receipt = PublicationReceipt {
-        schema_version: MANIFEST_SCHEMA_VERSION,
-        release_id: manifest.release_identity.release_id.clone(),
-        manifest_sha256: manifest_sha256.clone(),
-        data_sha256: data_sha256.clone(),
-        publication_operation_id: request.operation_id.to_owned(),
-        commit_position: request.commit_position.to_owned(),
-        result: PublicationState::Available,
-        supersedes_release_id: manifest
-            .lineage
-            .supersedes
-            .as_ref()
-            .map(|value| value.supersedes_release_id.clone()),
-    };
-    let receipt_bytes = receipt_file_bytes(&receipt, request.policy)?;
-    let evidence = PublicationEvidence {
-        release_id: receipt.release_id.clone(),
-        manifest_sha256: manifest_sha256.clone(),
-        data_sha256: data_sha256.clone(),
-        publication_operation_id: request.operation_id.to_owned(),
-        commit_position: request.commit_position.to_owned(),
-        artifact_paths: stored_paths,
-        artifact_stored_sha256: stored_digests,
-        expected_receipt: receipt.clone(),
-        receipt_sha256: hex_encode(&sha256(&receipt_bytes)),
-    };
+        &descriptors,
+        request.operation_id,
+        request.commit_position,
+        &sealed,
+        request.policy,
+    )?;
+    let artifacts = prepared
+        .into_iter()
+        .map(|item| (item.descriptor.path, item.stored))
+        .collect();
     Ok(PreparedRelease {
-        manifest_bytes,
-        sidecar_bytes,
+        manifest_bytes: sealed.manifest_bytes,
+        sidecar_bytes: sealed.sidecar_bytes,
         descriptors,
         artifacts,
         evidence,
@@ -2636,11 +2710,11 @@ fn prepare_release(request: &BuildRequest<'_>) -> Result<PreparedRelease, Produc
     })
 }
 
-fn io_error(operation: &str, error: std::io::Error) -> ProducerError {
+pub(crate) fn io_error(operation: &str, error: std::io::Error) -> ProducerError {
     ProducerError::Io(operation.to_owned(), error)
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
+pub(crate) fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2664,14 +2738,14 @@ fn write_release_file(path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
         .map_err(|error| io_error(&format!("write {}", path.display()), error))
 }
 
-fn sync_file(path: &Path) -> Result<(), ProducerError> {
+pub(crate) fn sync_file(path: &Path) -> Result<(), ProducerError> {
     let file = File::open(path)
         .map_err(|error| io_error(&format!("open file {}", path.display()), error))?;
     file.sync_all()
         .map_err(|error| io_error(&format!("sync file {}", path.display()), error))
 }
 
-fn sync_directory(path: &Path) -> Result<(), ProducerError> {
+pub(crate) fn sync_directory(path: &Path) -> Result<(), ProducerError> {
     let directory = File::open(path)
         .map_err(|error| io_error(&format!("open directory {}", path.display()), error))?;
     directory
@@ -2681,7 +2755,7 @@ fn sync_directory(path: &Path) -> Result<(), ProducerError> {
 
 /// Establish one directory boundary and sync the parent that carries its entry.
 /// The parent must already exist: its own entry cannot be made durable here.
-fn provision_directory(
+pub(crate) fn provision_directory(
     path: &Path,
     label: &str,
     fs: &dyn PublicationFs,
@@ -2708,7 +2782,7 @@ fn provision_directory(
     fs.sync_provisioned_parent(parent)
 }
 
-fn staging_name(operation_id: &str) -> String {
+pub(crate) fn staging_name(operation_id: &str) -> String {
     format!(".staging-{operation_id}")
 }
 
@@ -2717,12 +2791,12 @@ fn stage_path(ledger: &Path, operation_id: &str, ordinal: u32) -> PathBuf {
 }
 
 /// Immutable intent file for one operation.
-fn intent_path(ledger: &Path, operation_id: &str) -> PathBuf {
+pub(crate) fn intent_path(ledger: &Path, operation_id: &str) -> PathBuf {
     ledger.join(format!("{operation_id}.intent.json"))
 }
 
 /// Digest of the canonical intent bytes with the self-digest member excluded.
-fn intent_checksum(
+pub(crate) fn intent_checksum(
     intent: &PublicationIntentV2,
     policy: &ResourcePolicy,
 ) -> Result<String, ProducerError> {
@@ -2743,7 +2817,7 @@ fn intent_file_bytes(
 }
 
 /// Commit the immutable intent before any journal stage or release-root entry.
-fn write_intent(
+pub(crate) fn write_intent(
     ledger: &Path,
     intent: &PublicationIntentV2,
     policy: &ResourcePolicy,
@@ -2801,7 +2875,7 @@ fn load_intent(
 }
 
 /// Stable identifier derived from every caller-supplied policy bound.
-fn resource_profile_id(policy: &ResourcePolicy) -> String {
+pub(crate) fn resource_profile_id(policy: &ResourcePolicy) -> String {
     let mut material = Vec::new();
     for bound in [
         policy.max_manifest_bytes,
@@ -2873,7 +2947,7 @@ fn journal_record_bytes(
 }
 
 /// Commit one immutable journal record and stamp its own digest in memory.
-fn write_stage(
+pub(crate) fn write_stage(
     ledger: &Path,
     operation: &mut PublicationOperation,
     ordinal: u32,
@@ -2896,7 +2970,7 @@ fn write_stage(
 }
 
 /// Build the successor of one committed journal record.
-fn stage_for_state(
+pub(crate) fn stage_for_state(
     previous: &PublicationOperation,
     state: PublicationState,
 ) -> Result<PublicationOperation, ProducerError> {
@@ -2922,7 +2996,7 @@ fn next_stage_ordinal(
         .map_or(0, |(ordinal, _)| ordinal.saturating_add(1)))
 }
 
-fn receipt_file_bytes(
+pub(crate) fn receipt_file_bytes(
     receipt: &PublicationReceipt,
     policy: &ResourcePolicy,
 ) -> Result<Vec<u8>, ProducerError> {
@@ -3278,7 +3352,7 @@ impl TreeValidationProbe for NoTreeProbe {
 }
 
 /// Validate one release tree with the production probe.
-fn validate_artifact_set(
+pub(crate) fn validate_artifact_set(
     directory: &Path,
     evidence: &PublicationEvidence,
     sidecar_sha256: Option<&str>,
@@ -4311,7 +4385,7 @@ fn is_quarantine_condition(error: &ProducerError) -> bool {
         reason = "boundary faults are configured by the offline crash tests"
     )
 )]
-struct PublicationFaults {
+pub(crate) struct PublicationFaults {
     /// Return an error after staging sync and before the directory rename.
     fail_before_rename: bool,
     /// Return an error after the rename syscall and before its stage record.
@@ -4378,7 +4452,7 @@ struct PublicationFaults {
         reason = "offline crash tests consume every declared filesystem boundary"
     )
 )]
-enum PublicationBoundary {
+pub(crate) enum PublicationBoundary {
     /// The staging directory entry was created in the release root.
     StagingDirectoryCreated,
     /// The release root was synced after the staging entry was created.
@@ -4414,7 +4488,7 @@ enum PublicationBoundary {
 /// Filesystem boundary used by publication and recovery. The production
 /// implementation performs host calls; the offline implementation records
 /// every boundary so crash tests can assert durable operation order.
-trait PublicationFs {
+pub(crate) trait PublicationFs {
     /// Record one logical publication event.
     fn record(&self, event: PublicationRecoveryEvent);
 
@@ -4457,7 +4531,7 @@ trait PublicationFs {
     fn after_staging_validation(&self) {}
 }
 
-struct RealPublicationFs;
+pub(crate) struct RealPublicationFs;
 
 impl PublicationFs for RealPublicationFs {
     fn record(&self, _event: PublicationRecoveryEvent) {}
@@ -4517,7 +4591,7 @@ impl PublicationFs for RealPublicationFs {
     unsafe_code,
     reason = "the kernel exposes renameat2 only through an unsafe libc syscall"
 )]
-fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let from = CString::new(from.as_os_str().as_bytes())
@@ -4551,7 +4625,7 @@ fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
     unsafe_code,
     reason = "the Darwin no-replace primitive is an unsafe libc function"
 )]
-fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
 
     let from = CString::new(from.as_os_str().as_bytes())
@@ -4571,14 +4645,17 @@ fn atomic_no_replace_rename(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn atomic_no_replace_rename(_from: &Path, _to: &Path) -> io::Result<()> {
+pub(crate) fn atomic_no_replace_rename(_from: &Path, _to: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic no-replace directory rename requires Linux renameat2 or macOS renamex_np",
     ))
 }
 
-fn ensure_sibling_release_paths(staging: &Path, final_dir: &Path) -> Result<(), ProducerError> {
+pub(crate) fn ensure_sibling_release_paths(
+    staging: &Path,
+    final_dir: &Path,
+) -> Result<(), ProducerError> {
     let staging_parent = staging.parent().ok_or_else(|| {
         ProducerError::PublicationTopology("staging path has no parent directory".to_owned())
     })?;
@@ -4705,7 +4782,7 @@ fn finalize_publication_v1(
     clippy::too_many_arguments,
     reason = "the publication boundary carries two paths, operation evidence, a policy, injected faults and a filesystem boundary"
 )]
-fn finalize_publication_v2(
+pub(crate) fn finalize_publication_v2(
     root: &Path,
     ledger: &Path,
     operation: &PublicationOperation,
