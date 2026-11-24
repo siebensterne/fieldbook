@@ -15,7 +15,8 @@
 //! The critical correctness boundary is byte-derived record ordering.
 //! [`sort_byte_derived`] parses the canonical record bytes, extracts the
 //! ordering member, validates it against the artifact profile, derives the key
-//! and sorts. A caller-supplied key on [`CanonicalRecord`] is never read. The
+//! and sorts. [`CanonicalRecord`] carries bytes only, so no caller can express
+//! a second position on the public producer input. The
 //! same validated input bytes are returned in sorted order; no record is
 //! re-serialized to obtain an ordering position.
 //!
@@ -708,8 +709,9 @@ impl SpecProfile {
     }
 }
 
-/// One canonical record line plus an untrusted caller-supplied key. The key is
-/// retained only to prove that the byte-derived path ignores it.
+/// One abstract canonical record line plus an untrusted ordering claim. The
+/// claim is fixture input for adversarial conformance tests; the producer
+/// mapping ignores it and builds [`CanonicalRecord`] from bytes alone.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpecRecord {
@@ -744,36 +746,6 @@ pub enum ClaimedKey {
         /// Claimed assertion identity.
         assertion_id: String,
     },
-}
-
-impl ClaimedKey {
-    /// Convert the untrusted hint into the internal order-key type. The result
-    /// is never used for ordering; it exists only to exercise adversarial
-    /// disagreement in the byte-derived path.
-    pub fn to_untrusted_internal(&self) -> Result<RecordOrderKey, WireError> {
-        match self {
-            Self::Sequenced {
-                sequence_domain_id,
-                sequence_epoch,
-                sequence_number,
-            } => Ok(RecordOrderKey::Sequenced {
-                sequence_domain: sequence_domain_id.clone(),
-                sequence_epoch: sequence_epoch.clone(),
-                sequence_number: parse_decimal(sequence_number, "claimed sequence_number")?,
-            }),
-            Self::Reference {
-                object_id,
-                revision,
-                knowledge_time_ns,
-                assertion_id,
-            } => Ok(RecordOrderKey::Reference {
-                object_id: object_id.clone(),
-                revision: parse_decimal(revision, "claimed revision")?,
-                knowledge_time_ns: knowledge_time_ns.clone(),
-                assertion_id: assertion_id.clone(),
-            }),
-        }
-    }
 }
 
 /// Enforce a closed object member set with no defaults and no coercions.
@@ -1335,10 +1307,9 @@ pub fn derive_order_key(
 
 /// Parse, validate and sort records by keys derived from their own bytes.
 ///
-/// The `order_key` member of each [`CanonicalRecord`] is not read. A
-/// caller-supplied key that disagrees with the record bytes cannot
-/// change the emitted order, and duplicate keys with differing payloads fail
-/// closed. The returned byte vectors are the validated input bytes unchanged.
+/// [`CanonicalRecord`] carries no order-key member. Duplicate keys with
+/// differing payloads fail closed. The returned byte vectors are the
+/// validated input bytes unchanged.
 pub fn sort_byte_derived(
     records: &[CanonicalRecord],
     profile: &WireArtifactProfile,
@@ -2598,7 +2569,6 @@ pub fn prepare_artifact(
     for record in &artifact.records {
         records.push(CanonicalRecord {
             bytes: record.bytes.as_bytes().to_vec(),
-            order_key: record.claimed_order_key.to_untrusted_internal()?,
         });
     }
     let ordered_records = sort_byte_derived(&records, &profile, policy)?;
@@ -3047,6 +3017,19 @@ mod tests {
     }
 
     #[test]
+    fn unknown_ordering_profile_kind_rejected() -> TestResult {
+        let error = mutated(|value| {
+            value["artifacts"][0]["record_order_profile"]["kind"] = JsonValue::from("unregistered");
+        })
+        .expect_err("unregistered profile kind fails");
+        assert!(
+            error.to_string().contains("unknown kind"),
+            "asserted condition: error.to_string().contains(\"unknown kind\")"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn reference_profile_rejects_domain_member() {
         let error = mutated(|value| {
             value["artifacts"][1]["record_order_profile"]["sequence_domain_id"] =
@@ -3137,19 +3120,12 @@ mod tests {
             .replace("\"7\"", "\"3\"")
             .replace("abstract-value-7", "abstract-value-3");
         assert_eq!(same_key, second, "expected same_key to equal second");
-        let claimed = |number: u64| RecordOrderKey::Sequenced {
-            sequence_domain: "domain-abstract".to_owned(),
-            sequence_epoch: "epoch-abstract".to_owned(),
-            sequence_number: number,
-        };
         let mut records = vec![
             CanonicalRecord {
                 bytes: second.into_bytes(),
-                order_key: claimed(1),
             },
             CanonicalRecord {
                 bytes: same_key.clone().into_bytes(),
-                order_key: claimed(2),
             },
         ];
         let profile = WireArtifactProfile::Sequenced {
@@ -3466,7 +3442,8 @@ pub struct ReleaseBytes {
     pub data_sha256: String,
 }
 
-fn wire_order_key_to_internal(key: &WireOrderKey) -> Result<RecordOrderKey, WireError> {
+/// Convert a byte-derived wire key into the internal producer key type.
+pub(crate) fn wire_order_key_to_internal(key: &WireOrderKey) -> Result<RecordOrderKey, WireError> {
     match key {
         WireOrderKey::Sequenced {
             sequence_domain_id,
@@ -3492,9 +3469,9 @@ fn wire_order_key_to_internal(key: &WireOrderKey) -> Result<RecordOrderKey, Wire
 }
 
 /// Convert abstract spec artifacts into production builder inputs and collect
-/// the event types observed in the validated record lines. Record order keys
-/// are derived from the canonical bytes, not from the untrusted spec hints.
-/// This is the single bridge from the abstract spec to
+/// the event types observed in the validated record lines. The builder
+/// derives order keys from the canonical bytes; the untrusted spec hints are
+/// not copied. This is the single bridge from the abstract spec to
 /// [`crate::distribution::ndc_release::build_release`].
 pub fn spec_to_build_inputs(
     spec: &ConformanceSpec,
@@ -3505,14 +3482,11 @@ pub fn spec_to_build_inputs(
     for artifact in &spec.artifacts {
         let prepared = prepare_artifact(artifact, policy)?;
         let profile = artifact.record_order_profile.to_internal()?;
-        let wire_profile = map_artifact_profile(&profile)?;
         let mut records = Vec::with_capacity(prepared.ordered_records.len());
         for bytes in &prepared.ordered_records {
             let parsed = parse_canonical_record(bytes, policy)?;
-            let key = derive_order_key(&parsed, &wire_profile)?;
             records.push(CanonicalRecord {
                 bytes: bytes.clone(),
-                order_key: wire_order_key_to_internal(&key)?,
             });
             observed_event_types.insert(parsed.event_type);
         }

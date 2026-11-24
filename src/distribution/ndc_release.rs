@@ -82,6 +82,12 @@ use sha2::Digest as _;
 use sha2::Sha256;
 use thiserror::Error;
 
+use crate::distribution::ndc_wire::WireArtifactProfile;
+use crate::distribution::ndc_wire::derive_order_key;
+use crate::distribution::ndc_wire::map_artifact_profile;
+use crate::distribution::ndc_wire::parse_canonical_record;
+use crate::distribution::ndc_wire::wire_order_key_to_internal;
+
 /// Domain prefix bound to the manifest digest before signing.
 pub const SIGNING_DOMAIN: &[u8] = b"NDC-V2-RELEASE-MANIFEST-SHA256-V1\x00";
 
@@ -689,10 +695,11 @@ pub enum RecordOrderProfile {
     Reference,
 }
 
-/// One record order position. Gaps are preserved; no missing position is
-/// synthesized and no event time is used as a fallback.
+/// One record order position derived from canonical record bytes. Gaps are
+/// preserved; no missing position is synthesized and no event time is used as
+/// a fallback. This type is internal to the producer and wire modules.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecordOrderKey {
+pub(crate) enum RecordOrderKey {
     /// Position in one sequenced domain and epoch.
     Sequenced {
         /// Sequence domain identity.
@@ -715,13 +722,25 @@ pub enum RecordOrderKey {
     },
 }
 
-/// One canonical JSON record line supplied by the caller, with its order key.
+/// One canonical JSON record line supplied by the caller.
+///
+/// `bytes` is the sole representation of the record. The producer derives the
+/// order position from the canonical `ordering` member inside those bytes and
+/// exposes no field or constructor for a second, caller-supplied position.
+///
+/// An external ordering key is not expressible on this input:
+///
+/// ```compile_fail
+/// use fieldbook::distribution::ndc_release::CanonicalRecord;
+/// let _ = CanonicalRecord {
+///     bytes: Vec::new(),
+///     order_key: None,
+/// };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalRecord {
     /// Canonical record bytes without a line-feed terminator.
     pub bytes: Vec<u8>,
-    /// Declared order position for this record.
-    pub order_key: RecordOrderKey,
 }
 
 /// Caller-supplied artifact content and declaration inputs.
@@ -2255,6 +2274,11 @@ fn reference_key_tuple(key: &RecordOrderKey) -> Option<(&str, u64, u64, &str)> {
     }
 }
 
+/// Validate record order from keys derived from the canonical bytes.
+///
+/// The profile is declared by the caller. Each key is parsed from the record
+/// bytes by the canonical wire mapping and converted to the internal key type;
+/// no caller-supplied key reaches this function.
 fn validate_record_order(
     path: &str,
     profile: &RecordOrderProfile,
@@ -2267,14 +2291,31 @@ fn validate_record_order(
             policy.max_records_per_artifact
         )));
     }
+    let wire_profile = map_artifact_profile(profile).map_err(|error| {
+        ProducerError::InvalidRecordOrder(
+            path.to_owned(),
+            format!("unsupported ordering profile: {error}"),
+        )
+    })?;
     let mut previous_sequence: Option<u64> = None;
     let mut previous_reference: Option<(String, u64, u64, String)> = None;
-    for record in records {
-        match (profile, &record.order_key) {
+    for (index, record) in records.iter().enumerate() {
+        let parsed = parse_canonical_record(&record.bytes, policy)
+            .map_err(|error| ProducerError::InvalidRecord(index, format!("{path}: {error}")))?;
+        let derived = derive_order_key(&parsed, &wire_profile).map_err(|error| {
+            ProducerError::InvalidRecordOrder(path.to_owned(), error.to_string())
+        })?;
+        let key = wire_order_key_to_internal(&derived).map_err(|error| {
+            ProducerError::InvalidRecordOrder(
+                path.to_owned(),
+                format!("derived ordering key cannot be represented: {error}"),
+            )
+        })?;
+        match (&wire_profile, &key) {
             (
-                RecordOrderProfile::Sequenced {
-                    sequence_domain,
-                    sequence_epoch,
+                WireArtifactProfile::Sequenced {
+                    sequence_domain_id: expected_domain,
+                    sequence_epoch: expected_epoch,
                 },
                 RecordOrderKey::Sequenced {
                     sequence_domain: domain,
@@ -2282,7 +2323,7 @@ fn validate_record_order(
                     sequence_number,
                 },
             ) => {
-                if domain != sequence_domain || epoch != sequence_epoch {
+                if domain != expected_domain || epoch != expected_epoch {
                     return Err(ProducerError::InvalidRecordOrder(
                         path.to_owned(),
                         "sequence domain or epoch mismatch".to_owned(),
@@ -2302,9 +2343,9 @@ fn validate_record_order(
                 }
                 previous_sequence = Some(*sequence_number);
             }
-            (RecordOrderProfile::Reference, RecordOrderKey::Reference { .. }) => {
-                let (object_id, revision, time, assertion_id) =
-                    reference_key_tuple(&record.order_key).ok_or_else(|| {
+            (WireArtifactProfile::Reference, RecordOrderKey::Reference { .. }) => {
+                let (object_id, revision, time, assertion_id) = reference_key_tuple(&key)
+                    .ok_or_else(|| {
                         ProducerError::InvalidRecordOrder(
                             path.to_owned(),
                             "invalid reference key".to_owned(),
@@ -2336,7 +2377,7 @@ fn validate_record_order(
             _ => {
                 return Err(ProducerError::InvalidRecordOrder(
                     path.to_owned(),
-                    "order key does not match declared profile".to_owned(),
+                    "derived order key does not match the declared profile".to_owned(),
                 ));
             }
         }
@@ -4850,23 +4891,6 @@ fn build_release_inner(
 }
 
 #[cfg(test)]
-impl CanonicalRecord {
-    fn order_key_profile(&self) -> RecordOrderProfile {
-        match &self.order_key {
-            RecordOrderKey::Sequenced {
-                sequence_domain,
-                sequence_epoch,
-                ..
-            } => RecordOrderProfile::Sequenced {
-                sequence_domain: sequence_domain.clone(),
-                sequence_epoch: sequence_epoch.clone(),
-            },
-            RecordOrderKey::Reference { .. } => RecordOrderProfile::Reference,
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::cell::RefCell;
@@ -4882,6 +4906,7 @@ mod tests {
 
     use super::*;
     use crate::distribution::ndc_wire;
+    use serde_json::json;
     use tempfile::TempDir;
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -4939,17 +4964,29 @@ mod tests {
         test_spec().evidence
     }
 
-    fn record(text: &str, policy: &ResourcePolicy) -> Result<CanonicalRecord, ProducerError> {
-        let value = parse_jcs_value(text)?;
-        let bytes = canonicalize_strict(&value, policy)?;
-        Ok(CanonicalRecord {
-            bytes,
-            order_key: RecordOrderKey::Sequenced {
-                sequence_domain: "domain-a".to_owned(),
-                sequence_epoch: "epoch-1".to_owned(),
-                sequence_number: 0,
-            },
-        })
+    /// Build an abstract canonical envelope with the supplied ordering member.
+    fn envelope_record(
+        text: &str,
+        ordering: serde_json::Value,
+        policy: &ResourcePolicy,
+    ) -> Result<CanonicalRecord, ProducerError> {
+        let value = json!({
+            "envelope_schema_version": "envelope-abstract-1",
+            "event_type": "event-type-abstract",
+            "ordering": ordering,
+            "payload": {
+                "fields": [
+                    {
+                        "field_name": "abstract-field",
+                        "kind": "string",
+                        "value": text
+                    }
+                ]
+            }
+        });
+        let parsed = parse_jcs_value(&value.to_string())?;
+        let bytes = canonicalize_strict(&parsed, policy)?;
+        Ok(CanonicalRecord { bytes })
     }
 
     fn sequenced(
@@ -4957,13 +4994,13 @@ mod tests {
         number: u64,
         policy: &ResourcePolicy,
     ) -> Result<CanonicalRecord, ProducerError> {
-        let mut item = record(text, policy)?;
-        item.order_key = RecordOrderKey::Sequenced {
-            sequence_domain: "domain-a".to_owned(),
-            sequence_epoch: "epoch-1".to_owned(),
-            sequence_number: number,
-        };
-        Ok(item)
+        let ordering = json!({
+            "kind": "sequenced",
+            "sequence_domain_id": "domain-a",
+            "sequence_epoch": "epoch-1",
+            "sequence_number": number.to_string()
+        });
+        envelope_record(text, ordering, policy)
     }
 
     fn referenced(
@@ -4974,14 +5011,21 @@ mod tests {
         assertion_id: &str,
         policy: &ResourcePolicy,
     ) -> Result<CanonicalRecord, ProducerError> {
-        let mut item = record(text, policy)?;
-        item.order_key = RecordOrderKey::Reference {
-            object_id: object_id.to_owned(),
-            revision,
-            knowledge_time_ns: knowledge_time_ns.to_owned(),
-            assertion_id: assertion_id.to_owned(),
-        };
-        Ok(item)
+        let ordering = json!({
+            "kind": "reference",
+            "object_id": object_id,
+            "revision": revision.to_string(),
+            "knowledge_time_ns": knowledge_time_ns,
+            "assertion_id": assertion_id
+        });
+        envelope_record(text, ordering, policy)
+    }
+
+    fn sequenced_profile() -> RecordOrderProfile {
+        RecordOrderProfile::Sequenced {
+            sequence_domain: "domain-a".to_owned(),
+            sequence_epoch: "epoch-1".to_owned(),
+        }
     }
 
     fn sequenced_artifact(
@@ -6100,7 +6144,7 @@ mod tests {
         let policy = test_policy();
         let first = sequenced("{\"alpha\":\"aa\"}", 4, &policy)?;
         let second = sequenced("{\"alpha\":\"bb\"}", 9, &policy)?;
-        let profile = first.order_key_profile();
+        let profile = sequenced_profile();
         validate_record_order(
             "artifacts/a.jsonl",
             &profile,
@@ -6149,7 +6193,7 @@ mod tests {
         let duplicate = sequenced("{\"alpha\":\"bb\"}", 7, &policy)?;
         let result = validate_record_order(
             "artifacts/a.jsonl",
-            &first.order_key_profile(),
+            &sequenced_profile(),
             &[first, duplicate],
             &policy,
         );
@@ -6167,20 +6211,264 @@ mod tests {
             sequenced("{\"alpha\":\"aa\"}", 1, &policy)?,
             sequenced("{\"alpha\":\"bb\"}", 3, &policy)?,
         ];
+        validate_record_order("artifacts/a.jsonl", &sequenced_profile(), &gap, &policy)?;
+        let second = std::str::from_utf8(&gap[1].bytes)?;
+        assert!(
+            second.contains("bb"),
+            "retained gap record is the supplied byte line"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sequenced_key_comes_from_record_bytes() -> TestResult {
+        let policy = test_policy();
+        let records = vec![
+            sequenced("{\"alpha\":\"aa\"}", 1, &policy)?,
+            sequenced("{\"alpha\":\"bb\"}", 2, &policy)?,
+        ];
+        validate_record_order("artifacts/a.jsonl", &sequenced_profile(), &records, &policy)?;
+        Ok(())
+    }
+
+    #[test]
+    fn reference_key_comes_from_record_bytes() -> TestResult {
+        let policy = test_policy();
+        let records = vec![
+            referenced("{\"alpha\":\"aa\"}", "obj-1", 1, "100", "assert-1", &policy)?,
+            referenced("{\"alpha\":\"bb\"}", "obj-2", 1, "100", "assert-1", &policy)?,
+        ];
         validate_record_order(
-            "artifacts/a.jsonl",
-            &RecordOrderProfile::Sequenced {
-                sequence_domain: "domain-a".to_owned(),
-                sequence_epoch: "epoch-1".to_owned(),
-            },
-            &gap,
+            "artifacts/r.jsonl",
+            &RecordOrderProfile::Reference,
+            &records,
             &policy,
         )?;
-        assert_eq!(
-            gap[1].bytes.as_slice(),
-            b"{\"alpha\":\"bb\"}".as_slice(),
-            "no fabricated record"
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_reference_position_is_rejected() -> TestResult {
+        let policy = test_policy();
+        let first = referenced("{\"alpha\":\"aa\"}", "obj-1", 1, "100", "assert-1", &policy)?;
+        let duplicate = referenced("{\"alpha\":\"bb\"}", "obj-1", 1, "100", "assert-1", &policy)?;
+        let result = validate_record_order(
+            "artifacts/r.jsonl",
+            &RecordOrderProfile::Reference,
+            &[first, duplicate],
+            &policy,
         );
+        assert!(
+            matches!(result, Err(ProducerError::InvalidRecordOrder(_, _))),
+            "duplicate reference position derived from bytes fails closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_domain_from_bytes_must_match_profile() -> TestResult {
+        let policy = test_policy();
+        let ordering = json!({
+            "kind": "sequenced",
+            "sequence_domain_id": "domain-b",
+            "sequence_epoch": "epoch-1",
+            "sequence_number": "1"
+        });
+        let record = envelope_record("{\"alpha\":\"aa\"}", ordering, &policy)?;
+        let result = validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[record],
+            &policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::InvalidRecordOrder(_, _))),
+            "declared domain must match the domain in the record bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sequence_epoch_from_bytes_must_match_profile() -> TestResult {
+        let policy = test_policy();
+        let ordering = json!({
+            "kind": "sequenced",
+            "sequence_domain_id": "domain-a",
+            "sequence_epoch": "epoch-2",
+            "sequence_number": "1"
+        });
+        let record = envelope_record("{\"alpha\":\"aa\"}", ordering, &policy)?;
+        let result = validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[record],
+            &policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::InvalidRecordOrder(_, _))),
+            "declared epoch must match the epoch in the record bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn derived_key_mode_must_match_declared_profile() -> TestResult {
+        let policy = test_policy();
+        let sequenced_record = sequenced("{\"alpha\":\"aa\"}", 1, &policy)?;
+        let reference_record =
+            referenced("{\"alpha\":\"bb\"}", "obj-1", 1, "100", "assert-1", &policy)?;
+        let reference_result = validate_record_order(
+            "artifacts/r.jsonl",
+            &RecordOrderProfile::Reference,
+            &[sequenced_record],
+            &policy,
+        );
+        assert!(
+            matches!(
+                reference_result,
+                Err(ProducerError::InvalidRecordOrder(_, _))
+            ),
+            "sequenced bytes fail the reference profile"
+        );
+        let sequenced_result = validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[reference_record],
+            &policy,
+        );
+        assert!(
+            matches!(
+                sequenced_result,
+                Err(ProducerError::InvalidRecordOrder(_, _))
+            ),
+            "reference bytes fail the sequenced profile"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_revision_and_time_representations_are_rejected() -> TestResult {
+        let policy = test_policy();
+        let bad_revision = json!({
+            "kind": "reference",
+            "object_id": "obj-1",
+            "revision": "01",
+            "knowledge_time_ns": "100",
+            "assertion_id": "assert-1"
+        });
+        let bad_time = json!({
+            "kind": "reference",
+            "object_id": "obj-1",
+            "revision": "1",
+            "knowledge_time_ns": "1.5",
+            "assertion_id": "assert-1"
+        });
+        for ordering in [bad_revision, bad_time] {
+            let record = envelope_record("{\"alpha\":\"aa\"}", ordering, &policy)?;
+            let result = validate_record_order(
+                "artifacts/r.jsonl",
+                &RecordOrderProfile::Reference,
+                &[record],
+                &policy,
+            );
+            assert!(
+                matches!(result, Err(ProducerError::InvalidRecord(_, _))),
+                "non-canonical decimal strings fail key derivation"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_and_non_canonical_bytes_fail_order_validation() -> TestResult {
+        let policy = test_policy();
+        let malformed = CanonicalRecord {
+            bytes: b"{\"envelope_schema_version\":".to_vec(),
+        };
+        let result = validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[malformed],
+            &policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::InvalidRecord(_, _))),
+            "malformed record bytes fail before key derivation"
+        );
+        let record = sequenced("{\"alpha\":\"aa\"}", 1, &policy)?;
+        let text = String::from_utf8(record.bytes)?;
+        let noncanonical = CanonicalRecord {
+            bytes: text.replace(',', ", ").into_bytes(),
+        };
+        let result = validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[noncanonical],
+            &policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::InvalidRecord(_, _))),
+            "non-canonical record bytes fail before key derivation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_ordering_kind_is_rejected() -> TestResult {
+        let policy = test_policy();
+        let ordering = json!({ "kind": "unregistered-mode" });
+        let record = envelope_record("{\"alpha\":\"aa\"}", ordering, &policy)?;
+        let result = validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[record],
+            &policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::InvalidRecord(_, _))),
+            "unregistered ordering kind fails canonical record parsing"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unregistered_profile_identity_is_rejected() -> TestResult {
+        let policy = test_policy();
+        let profile = RecordOrderProfile::Sequenced {
+            sequence_domain: String::new(),
+            sequence_epoch: "epoch-1".to_owned(),
+        };
+        let record = sequenced("{\"alpha\":\"aa\"}", 1, &policy)?;
+        let result = validate_record_order("artifacts/a.jsonl", &profile, &[record], &policy);
+        assert!(
+            matches!(result, Err(ProducerError::InvalidRecordOrder(_, _))),
+            "empty profile domain fails before record key derivation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn bytes_changed_after_validation_are_rechecked() -> TestResult {
+        let policy = test_policy();
+        let first = sequenced("{\"alpha\":\"aa\"}", 1, &policy)?;
+        let second = sequenced("{\"alpha\":\"bb\"}", 2, &policy)?;
+        validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[first.clone(), second.clone()],
+            &policy,
+        )?;
+        let rewritten = sequenced("{\"alpha\":\"bb\"}", 0, &policy)?;
+        let mut edited = second;
+        edited.bytes = rewritten.bytes;
+        let result = validate_record_order(
+            "artifacts/a.jsonl",
+            &sequenced_profile(),
+            &[first, edited],
+            &policy,
+        );
+        let rejected = matches!(result, Err(ProducerError::InvalidRecordOrder(_, _)));
+        assert!(rejected, "edited bytes are rechecked after a valid check");
         Ok(())
     }
 
