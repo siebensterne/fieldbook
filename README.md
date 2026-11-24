@@ -79,6 +79,9 @@ rather than a rewrite of history.
 - [Canonical NDC v2 wire mapping](docs/fb-ndc-009-wire-mapping-2026-11-24.md)
   — FB-NDC-009 wire authority mapping, byte-derived ordering, conformance
   producer, seed vector and gate record.
+- [Derived record ordering at the producer API](docs/fb-api-001-derived-record-ordering-2026-11-24.md)
+  — FB-API-001 bytes-only `CanonicalRecord`, derived order keys, typed refusal
+  and closure of `issue/I-07` at the public producer API.
 - [Atomic no-replace publication](docs/fb-ndc-012-atomic-publication-2026-11-24.md)
   — FB-NDC-012 platform primitive, transition states, recovery and gate record.
 - [Production builder parity](docs/fb-ndc-013-production-builder-parity-2026-11-24.md)
