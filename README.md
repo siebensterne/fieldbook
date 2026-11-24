@@ -81,6 +81,9 @@ rather than a rewrite of history.
   producer, seed vector and gate record.
 - [Atomic no-replace publication](docs/fb-ndc-012-atomic-publication-2026-11-24.md)
   — FB-NDC-012 platform primitive, transition states, recovery and gate record.
+- [Production builder parity](docs/fb-ndc-013-production-builder-parity-2026-11-24.md)
+  — FB-NDC-013 canonical wire path, artifact layout, conformance core and gate
+  record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)

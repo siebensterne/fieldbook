@@ -45,6 +45,7 @@ use thiserror::Error;
 
 use crate::distribution::ndc_release::ArtifactCompression;
 use crate::distribution::ndc_release::ArtifactDescriptor;
+use crate::distribution::ndc_release::ArtifactInput;
 use crate::distribution::ndc_release::CanonicalRecord;
 use crate::distribution::ndc_release::DIGEST_ALGORITHM;
 use crate::distribution::ndc_release::ENCODING_NDJSON;
@@ -3463,6 +3464,74 @@ pub struct ReleaseBytes {
     pub signature_bytes: Vec<u8>,
     /// Dataset digest over ordered uncompressed artifact streams.
     pub data_sha256: String,
+}
+
+fn wire_order_key_to_internal(key: &WireOrderKey) -> Result<RecordOrderKey, WireError> {
+    match key {
+        WireOrderKey::Sequenced {
+            sequence_domain_id,
+            sequence_epoch,
+            sequence_number,
+        } => Ok(RecordOrderKey::Sequenced {
+            sequence_domain: sequence_domain_id.clone(),
+            sequence_epoch: sequence_epoch.clone(),
+            sequence_number: *sequence_number,
+        }),
+        WireOrderKey::Reference {
+            object_id,
+            revision,
+            knowledge_time_ns,
+            assertion_id,
+        } => Ok(RecordOrderKey::Reference {
+            object_id: object_id.clone(),
+            revision: *revision,
+            knowledge_time_ns: knowledge_time_ns.to_string(),
+            assertion_id: assertion_id.clone(),
+        }),
+    }
+}
+
+/// Convert abstract spec artifacts into production builder inputs and collect
+/// the event types observed in the validated record lines. Record order keys
+/// are derived from the canonical bytes, not from the untrusted spec hints.
+/// This is the single bridge from the abstract spec to
+/// [`crate::distribution::ndc_release::build_release`].
+pub fn spec_to_build_inputs(
+    spec: &ConformanceSpec,
+    policy: &ResourcePolicy,
+) -> Result<(Vec<ArtifactInput>, BTreeSet<String>), WireError> {
+    let mut inputs = Vec::with_capacity(spec.artifacts.len());
+    let mut observed_event_types = BTreeSet::new();
+    for artifact in &spec.artifacts {
+        let prepared = prepare_artifact(artifact, policy)?;
+        let profile = artifact.record_order_profile.to_internal()?;
+        let wire_profile = map_artifact_profile(&profile)?;
+        let mut records = Vec::with_capacity(prepared.ordered_records.len());
+        for bytes in &prepared.ordered_records {
+            let parsed = parse_canonical_record(bytes, policy)?;
+            let key = derive_order_key(&parsed, &wire_profile)?;
+            records.push(CanonicalRecord {
+                bytes: bytes.clone(),
+                order_key: wire_order_key_to_internal(&key)?,
+            });
+            observed_event_types.insert(parsed.event_type);
+        }
+        let compression = match artifact.compression.as_str() {
+            "none" => ArtifactCompression::None,
+            "gzip" => ArtifactCompression::Gzip,
+            other => return Err(WireError::Compression(other.to_owned())),
+        };
+        inputs.push(ArtifactInput {
+            logical_partition_id: artifact.logical_partition_id.clone(),
+            shard_ordinal: artifact.shard_ordinal,
+            path: artifact.path.clone(),
+            record_order_profile: profile,
+            encoding: artifact.encoding.clone(),
+            compression,
+            records,
+        });
+    }
+    Ok((inputs, observed_event_types))
 }
 
 /// Map one abstract spec to complete canonical release bytes. Artifacts are
