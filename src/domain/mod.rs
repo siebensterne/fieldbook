@@ -8,6 +8,7 @@ pub mod identity;
 pub mod information;
 pub mod model;
 pub mod products;
+pub mod reference_core;
 pub mod reference_data;
 pub mod side;
 pub mod taxonomy;

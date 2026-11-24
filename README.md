@@ -74,6 +74,8 @@ rather than a rewrite of history.
   — RRP-005 change and authority record.
 - [Documentation standard adoption](docs/documentation-standard-adoption-2026-11-24.md)
   — dated sweep and gate evidence for the adopted documentation standard.
+- [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
+  — FB-REF-001 object classes, identity, assertions and coverage record.
 
 Format contracts: [replay format](docs/replay-format.md),
 [raw-frame journal](docs/raw-frame-journal.md),
