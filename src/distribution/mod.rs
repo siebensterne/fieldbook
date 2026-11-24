@@ -6,4 +6,5 @@ pub mod coordinator;
 pub mod inspect;
 pub mod metrics;
 pub mod ndc_release;
+pub mod ndc_wire;
 pub mod probe;

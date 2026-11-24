@@ -145,6 +145,8 @@ SOURCE_RESPONSIBILITIES = {
     "src/main.rs": "process entry point and collect/discover/replay/inspect/verify/completeness/coverage/latency dispatch",
     "src/distribution/metrics.rs": "metrics registry, Prometheus text encoding, HTTP health/metrics endpoint",
     "src/distribution/ndc_release.rs": "NDC v2 release producer: strict typed manifest and sidecar, RFC 8785 JCS, canonical record streams, dataset digests, injected-key signing, interruption recovery and no-replace durable publication",
+    "src/distribution/ndc_wire.rs": "canonical NDC v2 Profile 1 wire mapping: strict typed wire values, byte-derived record ordering, full rights and PROV evidence, registration checks, conformance release assembly and exclusive release writing",
+    "src/bin/ndc-conformance-producer.rs": "conformance producer executable: abstract spec parsing, fixed test-only Ed25519 seed, canonical release writing and typed nonzero failure",
     "src/domain/model.rs": "normalized market, source, event, control, and output domain types",
     "src/market_state/orderbook.rs": "normalized order-book representation and mutation invariants",
     "src/distribution/probe.rs": "network-probe command: stage-timed egress transport diagnostic and JSON report",
@@ -403,6 +405,7 @@ def collect_module_reachability(root: Path = ROOT) -> set[str]:
         root / "src/lib.rs",
         root / "src/main.rs",
         root / "src/util/build.rs",
+        root / "src/bin/ndc-conformance-producer.rs",
     ]
     # The checked-in codec is pulled in through a macro-generated `include!`,
     # which this conservative module scanner cannot resolve. It is verified

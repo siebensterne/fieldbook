@@ -52,6 +52,12 @@ url = "2"
 [dev-dependencies]
 tempfile = "3"
 
+# Conformance producer executable. It is a test-vector tool with a fixed
+# published Ed25519 seed; no production key or live route is involved.
+[[bin]]
+name = "ndc-conformance-producer"
+path = "src/bin/ndc-conformance-producer.rs"
+
 # Permitted test targets: scalar, abstract-timestamp, arbitrary-byte and
 # generic durable-delivery evidence. These are registered with no extra feature.
 [[test]]
