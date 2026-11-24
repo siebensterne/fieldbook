@@ -144,6 +144,7 @@ SOURCE_RESPONSIBILITIES = {
     "src/lib.rs": "library module exports and public entry points",
     "src/main.rs": "process entry point and collect/discover/replay/inspect/verify/completeness/coverage/latency dispatch",
     "src/distribution/metrics.rs": "metrics registry, Prometheus text encoding, HTTP health/metrics endpoint",
+    "src/distribution/ndc_release.rs": "NDC v2 release producer: strict typed manifest and sidecar, RFC 8785 JCS, canonical record streams, dataset digests, injected-key signing, interruption recovery and no-replace durable publication",
     "src/domain/model.rs": "normalized market, source, event, control, and output domain types",
     "src/market_state/orderbook.rs": "normalized order-book representation and mutation invariants",
     "src/distribution/probe.rs": "network-probe command: stage-timed egress transport diagnostic and JSON report",
