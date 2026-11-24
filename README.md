@@ -87,6 +87,9 @@ rather than a rewrite of history.
 - [Publication recovery correctness](docs/fb-pub-014-recovery-correctness-2026-11-24.md)
   — FB-PUB-014/015/016 transition order, receipt fidelity, operation ownership
   and gate record.
+- [Publication journal durability](docs/fb-pub-017-journal-durability-2026-11-24.md)
+  — FB-PUB-017 stage-record digest chain, ledger directory barriers,
+  provisioning requirement and gate record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)

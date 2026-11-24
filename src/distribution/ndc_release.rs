@@ -27,6 +27,12 @@
 //! other targets fail closed. A durable receipt, not directory presence, is
 //! the local acknowledgement. The dated record states the platform bounds.
 //!
+//! Each committed transition is one immutable stage record in the ledger. A
+//! record binds its sequence number, predecessor digest and canonical bytes;
+//! the ledger directory is synced after the record file. That barrier orders
+//! process-crash evidence on the declared filesystem. It is not an OS-crash or
+//! power-loss qualification (P-D1) until the filesystem is qualified.
+//!
 //! Non-claim: a signature proves publisher-key control over exact signed
 //! bytes. It proves no source authenticity, coverage, right, dataset
 //! entitlement or observation truth.
@@ -69,6 +75,13 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 /// Sidecar layout version implemented here.
 pub const SIDECAR_SCHEMA_VERSION: u32 = 1;
+
+/// Publication journal layout version carried by each stage record.
+pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+
+/// Predecessor digest bound to the first record of a journal chain.
+pub const JOURNAL_GENESIS_DIGEST: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Sidecar signature algorithm literal.
 pub const SIGNATURE_ALGORITHM: &str = "Ed25519";
@@ -177,6 +190,10 @@ pub enum ProducerError {
     /// Publication evidence was absent or inconsistent with the request.
     #[error("publication evidence error: {0}")]
     PublicationEvidence(String),
+
+    /// A journal record violated the append-only chain contract.
+    #[error("publication journal error: {0}")]
+    PublicationJournal(String),
 
     /// The interrupted publication could not be reconciled from evidence.
     #[error("uncertain publication; operator reconciliation required: {0}")]
@@ -325,12 +342,21 @@ pub struct PublicationReceipt {
     pub supersedes_release_id: Option<String>,
 }
 
-/// Durable record of one publication attempt and its observed stage.
+/// Durable record of one committed transition in a publication attempt.
+///
+/// The record is a self-contained member of an append-only chain. Its digest
+/// covers every member except `record_sha256`; `previous_record_sha256` binds
+/// it to the canonical bytes of the preceding record, or to
+/// [`JOURNAL_GENESIS_DIGEST`] for the first record.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicationOperation {
-    /// Operation evidence version.
+    /// Publication journal layout version.
     pub schema_version: u32,
+    /// Monotonic sequence of this transition within the operation chain.
+    pub sequence_number: u64,
+    /// Digest of the canonical bytes of the preceding journal record.
+    pub previous_record_sha256: String,
     /// Unique operation identifier.
     pub operation_id: String,
     /// Release identity being published.
@@ -345,8 +371,14 @@ pub struct PublicationOperation {
     pub staging_directory: String,
     /// Final release directory path relative to the publication root.
     pub final_directory: String,
+    /// Immediate predecessor release identity, when this is a correction.
+    pub supersedes_release_id: Option<String>,
+    /// Digest of the expected receipt bytes bound into this journal chain.
+    pub expected_receipt_sha256: String,
     /// Stage recorded by this evidence file.
     pub stage: PublicationState,
+    /// Digest of this record's canonical bytes, excluding this member.
+    pub record_sha256: String,
 }
 
 /// Caller-retained evidence used to reconcile an interrupted publication.
@@ -992,12 +1024,35 @@ impl ToJcs for PublicationReceipt {
     }
 }
 
+impl PublicationOperation {
+    /// Canonical JSON for the on-disk record, including its own checksum.
+    fn to_jcs_record(&self) -> Result<JcsValue, ProducerError> {
+        let JcsValue::Object(mut entries) = self.to_jcs()? else {
+            return Err(ProducerError::PublicationJournal(
+                "publication operation does not canonicalize to an object".to_owned(),
+            ));
+        };
+        entries.push((
+            "record_sha256".to_owned(),
+            jcs_string(self.record_sha256.clone()),
+        ));
+        Ok(JcsValue::Object(entries))
+    }
+}
+
 impl ToJcs for PublicationOperation {
+    /// Canonical digest input for this record. The checksum member is excluded
+    /// so the digest remains self-consistency free.
     fn to_jcs(&self) -> Result<JcsValue, ProducerError> {
         Ok(jcs_object(vec![
             (
                 "schema_version",
                 jcs_integer(u64::from(self.schema_version))?,
+            ),
+            ("sequence_number", jcs_integer(self.sequence_number)?),
+            (
+                "previous_record_sha256",
+                jcs_string(self.previous_record_sha256.clone()),
             ),
             ("operation_id", jcs_string(self.operation_id.clone())),
             ("release_id", jcs_string(self.release_id.clone())),
@@ -1009,6 +1064,14 @@ impl ToJcs for PublicationOperation {
                 jcs_string(self.staging_directory.clone()),
             ),
             ("final_directory", jcs_string(self.final_directory.clone())),
+            (
+                "supersedes_release_id",
+                jcs_option(&self.supersedes_release_id),
+            ),
+            (
+                "expected_receipt_sha256",
+                jcs_string(self.expected_receipt_sha256.clone()),
+            ),
             ("stage", self.stage.to_jcs()?),
         ]))
     }
@@ -2225,6 +2288,35 @@ fn sync_directory(path: &Path) -> Result<(), ProducerError> {
         .map_err(|error| io_error(&format!("sync directory {}", path.display()), error))
 }
 
+/// Establish one directory boundary and sync the parent that carries its entry.
+/// The parent must already exist: its own entry cannot be made durable here.
+fn provision_directory(
+    path: &Path,
+    label: &str,
+    fs: &dyn PublicationFs,
+) -> Result<(), ProducerError> {
+    let parent = path.parent().ok_or_else(|| {
+        ProducerError::PublicationEvidence(format!("{label} path has no parent directory"))
+    })?;
+    if !parent.is_dir() {
+        return Err(ProducerError::PublicationEvidence(format!(
+            "{label} parent {} is not an existing directory",
+            parent.display()
+        )));
+    }
+    if let Ok(metadata) = path.symlink_metadata()
+        && !metadata.file_type().is_dir()
+    {
+        return Err(ProducerError::PublicationEvidence(format!(
+            "{label} path {} is not a directory",
+            path.display()
+        )));
+    }
+    fs::create_dir_all(path)
+        .map_err(|error| io_error(&format!("create {label} directory"), error))?;
+    fs.sync_provisioned_parent(parent)
+}
+
 fn staging_name(operation_id: &str) -> String {
     format!(".staging-{operation_id}")
 }
@@ -2233,23 +2325,72 @@ fn stage_path(ledger: &Path, operation_id: &str, ordinal: u32) -> PathBuf {
     ledger.join(format!("{operation_id}.stage.{ordinal:04}.json"))
 }
 
+/// Digest of the canonical record bytes with the checksum member excluded.
+fn journal_checksum(
+    operation: &PublicationOperation,
+    policy: &ResourcePolicy,
+) -> Result<String, ProducerError> {
+    Ok(hex_encode(&sha256(&canonicalize_strict(
+        &operation.to_jcs()?,
+        policy,
+    )?)))
+}
+
+/// Canonical on-disk bytes of one journal record, with one trailing LF.
+fn journal_record_bytes(
+    operation: &PublicationOperation,
+    policy: &ResourcePolicy,
+) -> Result<Vec<u8>, ProducerError> {
+    let mut bytes = canonicalize_strict(&operation.to_jcs_record()?, policy)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+/// Commit one immutable journal record and stamp its own digest in memory.
 fn write_stage(
     ledger: &Path,
-    operation: &PublicationOperation,
+    operation: &mut PublicationOperation,
     ordinal: u32,
     policy: &ResourcePolicy,
+    fs: &dyn PublicationFs,
 ) -> Result<(), ProducerError> {
-    let bytes = canonicalize_strict(&operation.to_jcs()?, policy)?;
-    let mut bytes = bytes;
-    bytes.push(b'\n');
-    write_new_file(
+    if u64::from(ordinal) != operation.sequence_number {
+        return Err(ProducerError::PublicationJournal(format!(
+            "ordinal {ordinal} disagrees with journal sequence {}",
+            operation.sequence_number
+        )));
+    }
+    operation.record_sha256 = journal_checksum(operation, policy)?;
+    let bytes = journal_record_bytes(operation, policy)?;
+    fs.commit_journal_record(
         &stage_path(ledger, &operation.operation_id, ordinal),
         &bytes,
+        ledger,
     )
 }
 
-fn next_stage_ordinal(ledger: &Path, operation_id: &str) -> Result<u32, ProducerError> {
-    let stages = read_stage_operations(ledger, operation_id)?;
+/// Build the successor of one committed journal record.
+fn stage_for_state(
+    previous: &PublicationOperation,
+    state: PublicationState,
+) -> Result<PublicationOperation, ProducerError> {
+    let sequence_number = previous.sequence_number.checked_add(1).ok_or_else(|| {
+        ProducerError::PublicationJournal("journal sequence number overflow".to_owned())
+    })?;
+    let mut next = previous.clone();
+    next.sequence_number = sequence_number;
+    next.previous_record_sha256 = previous.record_sha256.clone();
+    next.stage = state;
+    next.record_sha256 = String::new();
+    Ok(next)
+}
+
+fn next_stage_ordinal(
+    ledger: &Path,
+    operation_id: &str,
+    policy: &ResourcePolicy,
+) -> Result<u32, ProducerError> {
+    let stages = read_stage_operations(ledger, operation_id, policy)?;
     Ok(stages
         .last()
         .map_or(0, |(ordinal, _)| ordinal.saturating_add(1)))
@@ -2264,15 +2405,6 @@ fn receipt_file_bytes(
     Ok(bytes)
 }
 
-fn stage_for_state(
-    operation: &PublicationOperation,
-    state: PublicationState,
-) -> PublicationOperation {
-    let mut staged = operation.clone();
-    staged.stage = state;
-    staged
-}
-
 fn stage_file_parts(name: &str) -> Option<(String, u32)> {
     let stem = name.strip_suffix(".json")?;
     let (operation_id, ordinal_text) = stem.rsplit_once(".stage.")?;
@@ -2283,8 +2415,36 @@ fn stage_file_parts(name: &str) -> Option<(String, u32)> {
     Some((operation_id.to_owned(), ordinal))
 }
 
+/// Verify the canonical bytes and the self-consistency digest of one record.
+fn validate_stage_record(
+    operation: &PublicationOperation,
+    bytes: &[u8],
+    policy: &ResourcePolicy,
+) -> Result<(), ProducerError> {
+    if operation.schema_version != JOURNAL_SCHEMA_VERSION {
+        return Err(ProducerError::PublicationJournal(format!(
+            "stage {} carries journal schema version {}",
+            operation.sequence_number, operation.schema_version
+        )));
+    }
+    if operation.record_sha256 != journal_checksum(operation, policy)? {
+        return Err(ProducerError::PublicationJournal(format!(
+            "stage {} checksum differs from its canonical bytes",
+            operation.sequence_number
+        )));
+    }
+    if bytes != journal_record_bytes(operation, policy)? {
+        return Err(ProducerError::PublicationJournal(format!(
+            "stage {} is not in canonical journal representation",
+            operation.sequence_number
+        )));
+    }
+    Ok(())
+}
+
 fn read_all_stage_operations(
     ledger: &Path,
+    policy: &ResourcePolicy,
 ) -> Result<Vec<(String, u32, PublicationOperation)>, ProducerError> {
     let entries = fs::read_dir(ledger)
         .map_err(|error| io_error(&format!("read ledger {}", ledger.display()), error))?;
@@ -2300,6 +2460,19 @@ fn read_all_stage_operations(
         let operation: PublicationOperation = serde_json::from_slice(&bytes).map_err(|error| {
             ProducerError::PublicationEvidence(format!("invalid stage evidence: {error}"))
         })?;
+        validate_stage_record(&operation, &bytes, policy)?;
+        if operation.operation_id != operation_id {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage file {name} declares operation {}",
+                operation.operation_id
+            )));
+        }
+        if operation.sequence_number != u64::from(ordinal) {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage file {name} declares sequence {} instead of {ordinal}",
+                operation.sequence_number
+            )));
+        }
         found.push((operation_id, ordinal, operation));
     }
     found.sort_by_key(|(operation_id, ordinal, _)| (operation_id.clone(), *ordinal));
@@ -2310,9 +2483,21 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
     let Some((first_ordinal, first)) = stages.first() else {
         return Ok(());
     };
-    if *first_ordinal != 0 {
+    if *first_ordinal != 0 || first.sequence_number != 0 {
         return Err(ProducerError::PublicationEvidence(format!(
-            "stage history starts at ordinal {first_ordinal} instead of 0"
+            "stage history starts at ordinal {first_ordinal} and sequence {} instead of 0",
+            first.sequence_number
+        )));
+    }
+    if first.previous_record_sha256 != JOURNAL_GENESIS_DIGEST {
+        return Err(ProducerError::PublicationJournal(
+            "first journal record lacks the genesis predecessor digest".to_owned(),
+        ));
+    }
+    if first.stage != PublicationState::StagingCreated {
+        return Err(ProducerError::PublicationJournal(format!(
+            "first journal record declares {} instead of STAGING_CREATED",
+            first.stage.as_str()
         )));
     }
     let mut previous: Option<&PublicationOperation> = None;
@@ -2325,6 +2510,24 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
                 "stage ordinal {ordinal} repeats or skips position {expected_ordinal}"
             )));
         }
+        if operation.sequence_number != u64::from(*ordinal) {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage {ordinal} carries sequence {} instead of {ordinal}",
+                operation.sequence_number
+            )));
+        }
+        if operation.supersedes_release_id.as_deref() == Some(operation.release_id.as_str()) {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage {ordinal} declares its release as its own predecessor"
+            )));
+        }
+        if operation.supersedes_release_id != first.supersedes_release_id
+            || operation.expected_receipt_sha256 != first.expected_receipt_sha256
+        {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage {ordinal} conflicts with the lineage at ordinal 0"
+            )));
+        }
         let expected_state = STAGE_ORDER.get(index).ok_or_else(|| {
             ProducerError::PublicationEvidence("stage history exceeds the state machine".to_owned())
         })?;
@@ -2333,12 +2536,6 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
                 "stage {ordinal} records {} instead of {}",
                 operation.stage.as_str(),
                 expected_state.as_str()
-            )));
-        }
-        if operation.schema_version != MANIFEST_SCHEMA_VERSION {
-            return Err(ProducerError::PublicationEvidence(format!(
-                "stage {ordinal} carries schema version {}",
-                operation.schema_version
             )));
         }
         if operation.operation_id != first.operation_id
@@ -2353,14 +2550,21 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
                 "stage {ordinal} conflicts with the operation identity at ordinal 0"
             )));
         }
-        if let Some(prior) = previous
-            && operation.stage.rank() < prior.stage.rank()
-        {
-            return Err(ProducerError::PublicationEvidence(format!(
-                "stage {ordinal} regresses from {} to {}",
-                prior.stage.as_str(),
-                operation.stage.as_str()
-            )));
+        match previous {
+            Some(prior) if operation.previous_record_sha256 != prior.record_sha256 => {
+                return Err(ProducerError::PublicationJournal(format!(
+                    "stage {ordinal} does not reference the digest of stage {}",
+                    prior.sequence_number
+                )));
+            }
+            Some(prior) if operation.stage.rank() < prior.stage.rank() => {
+                return Err(ProducerError::PublicationEvidence(format!(
+                    "stage {ordinal} regresses from {} to {}",
+                    prior.stage.as_str(),
+                    operation.stage.as_str()
+                )));
+            }
+            _ => {}
         }
         previous = Some(operation);
     }
@@ -2390,6 +2594,16 @@ fn validate_stage_history(
                 "stage {ordinal} does not bind to the declared staging and final paths"
             )));
         }
+        if operation.expected_receipt_sha256 != evidence.receipt_sha256 {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage {ordinal} binds a different expected receipt digest"
+            )));
+        }
+        if operation.supersedes_release_id != evidence.expected_receipt.supersedes_release_id {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage {ordinal} binds a different predecessor release identity"
+            )));
+        }
     }
     Ok(())
 }
@@ -2397,8 +2611,9 @@ fn validate_stage_history(
 fn read_stage_operations(
     ledger: &Path,
     operation_id: &str,
+    policy: &ResourcePolicy,
 ) -> Result<Vec<(u32, PublicationOperation)>, ProducerError> {
-    let all = read_all_stage_operations(ledger)?;
+    let all = read_all_stage_operations(ledger, policy)?;
     let mut found: Vec<(u32, PublicationOperation)> = all
         .into_iter()
         .filter(|(name, _ordinal, operation)| {
@@ -2415,8 +2630,9 @@ fn verify_durable_stage(
     ledger: &Path,
     evidence: &PublicationEvidence,
     minimum: PublicationState,
+    policy: &ResourcePolicy,
 ) -> Result<(), ProducerError> {
-    let stages = read_stage_operations(ledger, &evidence.publication_operation_id)?;
+    let stages = read_stage_operations(ledger, &evidence.publication_operation_id, policy)?;
     validate_stage_history(&stages, evidence)?;
     let (_, operation) = stages.last().ok_or_else(|| {
         ProducerError::UncertainPublication("no durable stage evidence to verify".to_owned())
@@ -2434,8 +2650,9 @@ fn verify_durable_stage(
 fn find_foreign_rename_evidence(
     ledger: &Path,
     evidence: &PublicationEvidence,
+    policy: &ResourcePolicy,
 ) -> Result<(), ProducerError> {
-    let all = read_all_stage_operations(ledger)?;
+    let all = read_all_stage_operations(ledger, policy)?;
     for (operation_id, ordinal, operation) in all {
         if operation_id == evidence.publication_operation_id
             || operation.release_id != evidence.release_id
@@ -2456,6 +2673,7 @@ fn verify_operation_identity(
     evidence: &PublicationEvidence,
     operation: &PublicationOperation,
     ledger: &Path,
+    policy: &ResourcePolicy,
 ) -> Result<(), ProducerError> {
     if operation.stage.rank() < PublicationState::AtomicNoReplaceRename.rank() {
         return Err(ProducerError::UncertainPublication(format!(
@@ -2474,7 +2692,7 @@ fn verify_operation_identity(
             operation.operation_id
         )));
     }
-    find_foreign_rename_evidence(ledger, evidence)
+    find_foreign_rename_evidence(ledger, evidence, policy)
 }
 
 fn validate_artifact_set(
@@ -2591,6 +2809,12 @@ struct PublicationFaults {
     fail_marker_commit: bool,
     /// Return an error after the marker file sync and before the ledger sync.
     fail_marker_ledger_sync: bool,
+    /// Fail the numbered provisioning parent sync, counted from one.
+    fail_provisioning_sync_at: Option<u32>,
+    /// Fail before the numbered journal ledger directory sync, counted from one.
+    fail_before_journal_dir_sync_at: Option<u32>,
+    /// Fail after the numbered journal ledger directory sync, counted from one.
+    fail_after_journal_dir_sync_at: Option<u32>,
 }
 
 /// Filesystem boundary used by publication and recovery. The production
@@ -2599,6 +2823,17 @@ struct PublicationFaults {
 trait PublicationFs {
     /// Record one logical publication event.
     fn record(&self, event: PublicationRecoveryEvent);
+
+    /// Sync the parent that carries a provisioned directory entry.
+    fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError>;
+
+    /// Commit one journal file and sync the ledger entry that carries it.
+    fn commit_journal_record(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        ledger: &Path,
+    ) -> Result<(), ProducerError>;
 
     /// Sync the parent directory that holds the final release name.
     fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError>;
@@ -2617,6 +2852,20 @@ struct RealPublicationFs;
 
 impl PublicationFs for RealPublicationFs {
     fn record(&self, _event: PublicationRecoveryEvent) {}
+
+    fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError> {
+        sync_directory(parent)
+    }
+
+    fn commit_journal_record(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        ledger: &Path,
+    ) -> Result<(), ProducerError> {
+        write_new_file(path, bytes)?;
+        sync_directory(ledger)
+    }
 
     fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError> {
         sync_directory(root)
@@ -2757,7 +3006,8 @@ fn finalize_publication(
     fs: &dyn PublicationFs,
 ) -> Result<(), ProducerError> {
     ensure_sibling_release_paths(staging, final_dir)?;
-    let start = next_stage_ordinal(ledger, &operation.operation_id)?;
+    let start = next_stage_ordinal(ledger, &operation.operation_id, policy)?;
+    let mut cursor = operation.clone();
 
     if faults.fail_before_rename {
         return Err(io_error(
@@ -2780,12 +3030,9 @@ fn finalize_publication(
     }
     // The rename has committed before this label is written. No stage record
     // claims a rename that did not run.
-    write_stage(
-        ledger,
-        &stage_for_state(operation, PublicationState::AtomicNoReplaceRename),
-        start,
-        policy,
-    )?;
+    let mut renamed = stage_for_state(&cursor, PublicationState::AtomicNoReplaceRename)?;
+    write_stage(ledger, &mut renamed, start, policy, fs)?;
+    cursor = renamed;
 
     if faults.fail_after_rename {
         return Err(io_error(
@@ -2794,32 +3041,23 @@ fn finalize_publication(
         ));
     }
     fs.sync_release_parent(root)?;
-    write_stage(
-        ledger,
-        &stage_for_state(operation, PublicationState::ParentDirFsynced),
-        start + 1,
-        policy,
-    )?;
+    let mut parent_synced = stage_for_state(&cursor, PublicationState::ParentDirFsynced)?;
+    write_stage(ledger, &mut parent_synced, start + 1, policy, fs)?;
+    cursor = parent_synced;
 
     let receipt_path = ledger.join(format!("{}.receipt.json", receipt.release_id));
     fs.commit_receipt(&receipt_path, &receipt_file_bytes(receipt, policy)?)?;
     fs.sync_receipt_ledger(ledger)?;
-    write_stage(
-        ledger,
-        &stage_for_state(operation, PublicationState::DurablePublicationReceipt),
-        start + 2,
-        policy,
-    )?;
+    let mut receipt_committed =
+        stage_for_state(&cursor, PublicationState::DurablePublicationReceipt)?;
+    write_stage(ledger, &mut receipt_committed, start + 2, policy, fs)?;
+    cursor = receipt_committed;
 
     let marker = ledger.join(format!("{}.available", receipt.release_id));
     fs.commit_availability_marker(&marker, operation.operation_id.as_bytes())?;
     fs.sync_receipt_ledger(ledger)?;
-    write_stage(
-        ledger,
-        &stage_for_state(operation, PublicationState::Available),
-        start + 3,
-        policy,
-    )?;
+    let mut available = stage_for_state(&cursor, PublicationState::Available)?;
+    write_stage(ledger, &mut available, start + 3, policy, fs)?;
     Ok(())
 }
 
@@ -2862,13 +3100,17 @@ fn recovery_receipt(evidence: &PublicationEvidence) -> PublicationReceipt {
 fn advance_recovery_stage(
     ledger: &Path,
     evidence: &PublicationEvidence,
-    operation: &PublicationOperation,
+    cursor: &mut PublicationOperation,
     state: PublicationState,
     policy: &ResourcePolicy,
+    fs: &dyn PublicationFs,
 ) -> Result<(), ProducerError> {
-    let ordinal = next_stage_ordinal(ledger, &operation.operation_id)?;
-    write_stage(ledger, &stage_for_state(operation, state), ordinal, policy)?;
-    verify_durable_stage(ledger, evidence, state)
+    let ordinal = next_stage_ordinal(ledger, &cursor.operation_id, policy)?;
+    let mut next = stage_for_state(cursor, state)?;
+    write_stage(ledger, &mut next, ordinal, policy, fs)?;
+    verify_durable_stage(ledger, evidence, state, policy)?;
+    *cursor = next;
+    Ok(())
 }
 
 fn recover_final_directory(
@@ -2876,7 +3118,7 @@ fn recover_final_directory(
     ledger: &Path,
     evidence: &PublicationEvidence,
     policy: &ResourcePolicy,
-    operation: &PublicationOperation,
+    operation: &mut PublicationOperation,
     stages: &[(u32, PublicationOperation)],
     fs: &dyn PublicationFs,
 ) -> Result<RecoveryOutcome, ProducerError> {
@@ -2885,7 +3127,7 @@ fn recover_final_directory(
     fs.record(PublicationRecoveryEvent::VerifyFinalDirectory);
     validate_artifact_set(&final_dir, evidence, policy)?;
     fs.record(PublicationRecoveryEvent::VerifyOperationIdentity);
-    verify_operation_identity(&final_dir, evidence, operation, ledger)?;
+    verify_operation_identity(&final_dir, evidence, operation, ledger, policy)?;
 
     let mut last = stages
         .last()
@@ -2938,11 +3180,12 @@ fn recover_final_directory(
             operation,
             PublicationState::ParentDirFsynced,
             policy,
+            fs,
         )?;
         last = PublicationState::ParentDirFsynced;
     }
     fs.record(PublicationRecoveryEvent::VerifyDurabilityTransition);
-    verify_durable_stage(ledger, evidence, PublicationState::ParentDirFsynced)?;
+    verify_durable_stage(ledger, evidence, PublicationState::ParentDirFsynced, policy)?;
 
     if !receipt_present {
         fs.commit_receipt(
@@ -2958,6 +3201,7 @@ fn recover_final_directory(
             operation,
             PublicationState::DurablePublicationReceipt,
             policy,
+            fs,
         )?;
         last = PublicationState::DurablePublicationReceipt;
     }
@@ -2973,6 +3217,7 @@ fn recover_final_directory(
             operation,
             PublicationState::Available,
             policy,
+            fs,
         )?;
     }
     fs.record(PublicationRecoveryEvent::Available);
@@ -2997,12 +3242,12 @@ fn recover_interrupted_inner(
     policy: &ResourcePolicy,
     fs: &dyn PublicationFs,
 ) -> Result<RecoveryOutcome, ProducerError> {
-    let stages = read_stage_operations(ledger, &evidence.publication_operation_id)?;
+    let stages = read_stage_operations(ledger, &evidence.publication_operation_id, policy)?;
     if stages.is_empty() {
         return Ok(RecoveryOutcome::NoEvidence);
     }
     validate_stage_history(&stages, evidence)?;
-    let operation = stages
+    let mut operation = stages
         .last()
         .map(|(_, staged)| staged.clone())
         .ok_or_else(|| {
@@ -3013,7 +3258,15 @@ fn recover_interrupted_inner(
     let staging = root.join(&operation.staging_directory);
     let final_dir = root.join(&operation.final_directory);
     if final_dir.exists() {
-        return recover_final_directory(root, ledger, evidence, policy, &operation, &stages, fs);
+        return recover_final_directory(
+            root,
+            ledger,
+            evidence,
+            policy,
+            &mut operation,
+            &stages,
+            fs,
+        );
     }
     if staging.exists() {
         if operation.stage.rank() < PublicationState::StagingDirFsynced.rank() {
@@ -3062,10 +3315,12 @@ fn build_release_inner(
     fs: &dyn PublicationFs,
 ) -> Result<BuildOutcome, ProducerError> {
     let prepared = prepare_release(request)?;
-    fs::create_dir_all(request.ledger_dir)
-        .map_err(|error| io_error("create ledger directory", error))?;
-    let operation = PublicationOperation {
-        schema_version: MANIFEST_SCHEMA_VERSION,
+    provision_directory(request.ledger_dir, "ledger", fs)?;
+    provision_directory(request.release_root, "release root", fs)?;
+    let mut operation = PublicationOperation {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        sequence_number: 0,
+        previous_record_sha256: JOURNAL_GENESIS_DIGEST.to_owned(),
         operation_id: request.operation_id.to_owned(),
         release_id: prepared.evidence.release_id.clone(),
         manifest_sha256: prepared.evidence.manifest_sha256.clone(),
@@ -3073,10 +3328,15 @@ fn build_release_inner(
         commit_position: request.commit_position.to_owned(),
         staging_directory: staging_name(request.operation_id),
         final_directory: prepared.evidence.release_id.clone(),
+        supersedes_release_id: prepared
+            .evidence
+            .expected_receipt
+            .supersedes_release_id
+            .clone(),
+        expected_receipt_sha256: prepared.evidence.receipt_sha256.clone(),
         stage: PublicationState::StagingCreated,
+        record_sha256: String::new(),
     };
-    fs::create_dir_all(request.release_root)
-        .map_err(|error| io_error("create release root", error))?;
     let staging = request.release_root.join(&operation.staging_directory);
     fs::create_dir(&staging).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -3085,7 +3345,7 @@ fn build_release_inner(
             io_error("create staging directory", error)
         }
     })?;
-    write_stage(request.ledger_dir, &operation, 0, request.policy)?;
+    write_stage(request.ledger_dir, &mut operation, 0, request.policy, fs)?;
 
     write_new_file(&staging.join(MANIFEST_FILE_NAME), &prepared.manifest_bytes)?;
     write_new_file(&staging.join(SIDECAR_FILE_NAME), &prepared.sidecar_bytes)?;
@@ -3096,22 +3356,25 @@ fn build_release_inner(
         validate_artifact_path(path, request.policy)?;
         write_new_file(&staging.join(path), bytes)?;
     }
-    let mut written = operation.clone();
-    written.stage = PublicationState::FilesWritten;
-    write_stage(request.ledger_dir, &written, 1, request.policy)?;
-    let mut synced_files = operation.clone();
-    synced_files.stage = PublicationState::FilesSynced;
-    write_stage(request.ledger_dir, &synced_files, 2, request.policy)?;
+    let mut written = stage_for_state(&operation, PublicationState::FilesWritten)?;
+    write_stage(request.ledger_dir, &mut written, 1, request.policy, fs)?;
+    let mut synced_files = stage_for_state(&written, PublicationState::FilesSynced)?;
+    write_stage(request.ledger_dir, &mut synced_files, 2, request.policy, fs)?;
     sync_directory(&staging)?;
-    let mut synced_staging = operation.clone();
-    synced_staging.stage = PublicationState::StagingDirFsynced;
-    write_stage(request.ledger_dir, &synced_staging, 3, request.policy)?;
+    let mut synced_staging = stage_for_state(&synced_files, PublicationState::StagingDirFsynced)?;
+    write_stage(
+        request.ledger_dir,
+        &mut synced_staging,
+        3,
+        request.policy,
+        fs,
+    )?;
     validate_artifact_set(&staging, &prepared.evidence, request.policy)?;
     let final_dir = request.release_root.join(&prepared.evidence.release_id);
     finalize_publication(
         request.release_root,
         request.ledger_dir,
-        &operation,
+        &synced_staging,
         &staging,
         &final_dir,
         &prepared.receipt,
@@ -3275,6 +3538,8 @@ mod tests {
     struct RecordingPublicationFs {
         faults: PublicationFaults,
         ledger_syncs: Cell<u32>,
+        provisioning_syncs: Cell<u32>,
+        journal_syncs: Cell<u32>,
         events: RefCell<Vec<PublicationRecoveryEvent>>,
     }
 
@@ -3283,6 +3548,8 @@ mod tests {
             Self {
                 faults,
                 ledger_syncs: Cell::new(0),
+                provisioning_syncs: Cell::new(0),
+                journal_syncs: Cell::new(0),
                 events: RefCell::new(Vec::new()),
             }
         }
@@ -3290,11 +3557,51 @@ mod tests {
         fn events(&self) -> Vec<PublicationRecoveryEvent> {
             self.events.borrow().clone()
         }
+
+        fn journal_sync_count(&self) -> u32 {
+            self.journal_syncs.get()
+        }
     }
 
     impl PublicationFs for RecordingPublicationFs {
         fn record(&self, event: PublicationRecoveryEvent) {
             self.events.borrow_mut().push(event);
+        }
+
+        fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError> {
+            let ordinal = self.provisioning_syncs.get().saturating_add(1);
+            self.provisioning_syncs.set(ordinal);
+            if self.faults.fail_provisioning_sync_at == Some(ordinal) {
+                return Err(injected(&format!(
+                    "injected failure during provisioning parent sync {ordinal}"
+                )));
+            }
+            sync_directory(parent)
+        }
+
+        fn commit_journal_record(
+            &self,
+            path: &Path,
+            bytes: &[u8],
+            ledger: &Path,
+        ) -> Result<(), ProducerError> {
+            write_new_file(path, bytes)?;
+            let ordinal = self.journal_syncs.get().saturating_add(1);
+            self.journal_syncs.set(ordinal);
+            if self.faults.fail_before_journal_dir_sync_at == Some(ordinal) {
+                fs::remove_file(path)
+                    .map_err(|error| io_error("remove uncommitted journal record", error))?;
+                return Err(injected(&format!(
+                    "injected failure before journal directory sync {ordinal}"
+                )));
+            }
+            sync_directory(ledger)?;
+            if self.faults.fail_after_journal_dir_sync_at == Some(ordinal) {
+                return Err(injected(&format!(
+                    "injected failure after journal directory sync {ordinal}"
+                )));
+            }
+            Ok(())
         }
 
         fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError> {
@@ -3528,7 +3835,9 @@ mod tests {
         operation_id: &str,
     ) -> PublicationOperation {
         PublicationOperation {
-            schema_version: MANIFEST_SCHEMA_VERSION,
+            schema_version: JOURNAL_SCHEMA_VERSION,
+            sequence_number: 0,
+            previous_record_sha256: JOURNAL_GENESIS_DIGEST.to_owned(),
             operation_id: operation_id.to_owned(),
             release_id: evidence.release_id.clone(),
             manifest_sha256: evidence.manifest_sha256.clone(),
@@ -3536,8 +3845,48 @@ mod tests {
             commit_position: evidence.commit_position.clone(),
             staging_directory: staging_name(operation_id),
             final_directory: evidence.release_id.clone(),
+            supersedes_release_id: evidence.expected_receipt.supersedes_release_id.clone(),
+            expected_receipt_sha256: evidence.receipt_sha256.clone(),
             stage: PublicationState::StagingCreated,
+            record_sha256: String::new(),
         }
+    }
+
+    /// Write one supplied operation as a journal record with a valid link.
+    fn stage_record_at(
+        ledger: &Path,
+        operation: &PublicationOperation,
+        ordinal: u32,
+        policy: &ResourcePolicy,
+        fs: &RecordingPublicationFs,
+    ) -> Result<(), Box<dyn StdError>> {
+        let mut staged = operation.clone();
+        staged.sequence_number = u64::from(ordinal);
+        staged.record_sha256 = String::new();
+        if ordinal > 0 {
+            let stages = read_stage_operations(ledger, &operation.operation_id, policy)?;
+            staged.previous_record_sha256 = stages
+                .last()
+                .map(|(_, item)| item.record_sha256.clone())
+                .ok_or_else(|| io::Error::other("predecessor stage is absent"))?;
+        }
+        write_stage(ledger, &mut staged, ordinal, policy, fs)?;
+        Ok(())
+    }
+
+    /// Write a journal record at a chosen ordinal with a valid predecessor link.
+    fn stage_at(
+        ledger: &Path,
+        evidence: &PublicationEvidence,
+        operation_id: &str,
+        ordinal: u32,
+        state: PublicationState,
+        policy: &ResourcePolicy,
+        fs: &RecordingPublicationFs,
+    ) -> Result<(), Box<dyn StdError>> {
+        let mut staged = operation_from_evidence(evidence, operation_id);
+        staged.stage = state;
+        stage_record_at(ledger, &staged, ordinal, policy, fs)
     }
 
     fn write_stage_sequence(
@@ -3545,11 +3894,16 @@ mod tests {
         operation: &PublicationOperation,
         states: &[PublicationState],
         policy: &ResourcePolicy,
+        fs: &RecordingPublicationFs,
     ) -> Result<(), Box<dyn StdError>> {
-        for (ordinal, state) in states.iter().enumerate() {
-            let mut staged = operation.clone();
-            staged.stage = *state;
-            write_stage(ledger, &staged, u32::try_from(ordinal)?, policy)?;
+        let mut cursor = operation.clone();
+        for (index, state) in states.iter().enumerate() {
+            if index > 0 {
+                cursor = stage_for_state(&cursor, *state)?;
+            } else {
+                cursor.stage = *state;
+            }
+            write_stage(ledger, &mut cursor, u32::try_from(index)?, policy, fs)?;
         }
         Ok(())
     }
@@ -3570,7 +3924,8 @@ mod tests {
         ledger: &Path,
         operation_id: &str,
     ) -> Result<PublicationState, Box<dyn StdError>> {
-        let stages = read_stage_operations(ledger, operation_id)?;
+        let policy = test_policy();
+        let stages = read_stage_operations(ledger, operation_id, &policy)?;
         let (_, operation) = stages
             .last()
             .ok_or_else(|| io::Error::other("no stage evidence"))?;
@@ -4386,7 +4741,7 @@ mod tests {
         build_fixture(
             &manifest, &artifacts, &signing, &verifying, &policy, &root, &ledger,
         )?;
-        let stages = read_stage_operations(&ledger, "operation-1")?;
+        let stages = read_stage_operations(&ledger, "operation-1", &policy)?;
         let observed: Vec<PublicationState> = stages.iter().map(|(_, item)| item.stage).collect();
         assert_eq!(
             observed,
@@ -4843,6 +5198,7 @@ mod tests {
                 .join("a.jsonl"),
         )?;
         clear_stages(&ledger, "operation-incomplete")?;
+        let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
         write_stage_sequence(
             &ledger,
             &operation_from_evidence(&evidence, "operation-incomplete"),
@@ -4851,6 +5207,7 @@ mod tests {
                 PublicationState::FilesWritten,
             ],
             &policy,
+            &journal_fs,
         )?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
@@ -6134,11 +6491,16 @@ mod tests {
             "the forger loses the release identity"
         );
         let evidence = boundary_evidence(&manifest, &artifacts, "operation-forger")?;
-        let forged = stage_for_state(
-            &operation_from_evidence(&evidence, "operation-forger"),
+        let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
+        stage_at(
+            &ledger,
+            &evidence,
+            "operation-forger",
+            4,
             PublicationState::AtomicNoReplaceRename,
-        );
-        write_stage(&ledger, &forged, 4, &policy)?;
+            &policy,
+            &journal_fs,
+        )?;
         let outcome = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(outcome, Err(ProducerError::UncertainPublication(_))),
@@ -6170,10 +6532,11 @@ mod tests {
             &ledger,
         )?;
         let original = stage_path(&ledger, "operation-journal", 4);
+        let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
         fs::remove_file(&original)?;
         let mut regressed = operation_from_evidence(&evidence, "operation-journal");
         regressed.stage = PublicationState::FilesWritten;
-        write_stage(&ledger, &regressed, 4, &policy)?;
+        stage_record_at(&ledger, &regressed, 4, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
@@ -6183,7 +6546,7 @@ mod tests {
         let mut conflicting = operation_from_evidence(&evidence, "operation-journal");
         conflicting.stage = PublicationState::AtomicNoReplaceRename;
         conflicting.release_id = "release-other".to_owned();
-        write_stage(&ledger, &conflicting, 4, &policy)?;
+        stage_record_at(&ledger, &conflicting, 4, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
@@ -6193,10 +6556,10 @@ mod tests {
         let mut wrong_digest = operation_from_evidence(&evidence, "operation-journal");
         wrong_digest.stage = PublicationState::AtomicNoReplaceRename;
         wrong_digest.manifest_sha256 = "ff".repeat(32);
-        write_stage(&ledger, &wrong_digest, 4, &policy)?;
+        stage_record_at(&ledger, &wrong_digest, 4, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
-            result.is_err(),
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
             "a digest mismatch in journal evidence is rejected"
         );
         Ok(())
@@ -6221,23 +6584,24 @@ mod tests {
         let extra = stage_for_state(
             &operation_from_evidence(&evidence, "operation-ordinals"),
             PublicationState::Available,
-        );
-        write_stage(&ledger, &extra, 8, &policy)?;
+        )?;
+        let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
+        stage_record_at(&ledger, &extra, 8, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
             "a stage beyond the ratified state machine is rejected"
         );
         fs::remove_file(stage_path(&ledger, "operation-ordinals", 8))?;
-        write_stage(&ledger, &extra, 9, &policy)?;
+        stage_record_at(&ledger, &extra, 9, &policy, &journal_fs)?;
         fs::rename(
             stage_path(&ledger, "operation-ordinals", 9),
             ledger.join("operation-ordinals.stage.4.json"),
         )?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
-            matches!(result, Err(ProducerError::PublicationEvidence(_))),
-            "a duplicate stage ordinal is rejected"
+            matches!(result, Err(ProducerError::PublicationJournal(_))),
+            "a duplicate sequence number at one stage ordinal is rejected"
         );
         Ok(())
     }
@@ -6417,5 +6781,408 @@ mod tests {
             .and_then(serde_json::Value::as_array)
             .ok_or("rights.permission_grants is absent")?;
         Ok(grants.len())
+    }
+
+    #[test]
+    fn every_committed_journal_stage_survives_a_process_restart() -> TestResult {
+        let policy = test_policy();
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        for ordinal in 1..=8_u32 {
+            let temp = TempDir::new()?;
+            let root = temp.path().join("releases");
+            let ledger = temp.path().join("ledger");
+            let operation_id = format!("operation-restart-{ordinal}");
+            let release_id = format!("release-restart-{ordinal}");
+            let manifest = boundary_manifest(&release_id);
+            let faults = PublicationFaults {
+                fail_after_journal_dir_sync_at: Some(ordinal),
+                ..PublicationFaults::default()
+            };
+            let fs = RecordingPublicationFs::new(faults);
+            let result = build_with_faults_and_fs(
+                &manifest,
+                &artifacts,
+                &signing,
+                &verifying,
+                &policy,
+                &root,
+                &ledger,
+                &operation_id,
+                faults,
+                &fs,
+            );
+            assert!(
+                matches!(result, Err(ProducerError::Io(..))),
+                "journal restart fixture {ordinal} stops after the ledger directory sync"
+            );
+            assert_eq!(
+                fs.journal_sync_count(),
+                ordinal,
+                "one journal directory sync precedes each interrupted stage"
+            );
+            let evidence = boundary_evidence(&manifest, &artifacts, &operation_id)?;
+            let stages = read_stage_operations(&ledger, &operation_id, &policy)?;
+            assert_eq!(
+                stages.len(),
+                ordinal as usize,
+                "all committed stage records remain readable after a restart"
+            );
+            validate_stage_history(&stages, &evidence)?;
+            let expected_stage = STAGE_ORDER[(ordinal - 1) as usize];
+            assert_eq!(
+                last_stage(&ledger, &operation_id)?,
+                expected_stage,
+                "the last durable stage matches the committed transition"
+            );
+            let recovery_fs = RecordingPublicationFs::new(PublicationFaults::default());
+            let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &recovery_fs);
+            if ordinal <= 3 {
+                assert!(
+                    matches!(outcome, Err(ProducerError::UncertainPublication(_))),
+                    "an incomplete staged chain withholds the acknowledgement"
+                );
+            } else {
+                let expected = if ordinal == 4 {
+                    RecoveryOutcome::RecoveredStaged
+                } else if ordinal == 8 {
+                    RecoveryOutcome::AlreadyAvailable
+                } else {
+                    RecoveryOutcome::RecoveredPublished
+                };
+                assert_eq!(
+                    outcome?, expected,
+                    "recovery reconciles the verified stage after a restart"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn journal_directory_sync_failure_withholds_the_acknowledgement() -> TestResult {
+        let policy = test_policy();
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        for ordinal in 1..=8_u32 {
+            let temp = TempDir::new()?;
+            let root = temp.path().join("releases");
+            let ledger = temp.path().join("ledger");
+            let operation_id = format!("operation-crash-{ordinal}");
+            let release_id = format!("release-crash-{ordinal}");
+            let manifest = boundary_manifest(&release_id);
+            let faults = PublicationFaults {
+                fail_before_journal_dir_sync_at: Some(ordinal),
+                ..PublicationFaults::default()
+            };
+            let result = build_with_faults(
+                &manifest,
+                &artifacts,
+                &signing,
+                &verifying,
+                &policy,
+                &root,
+                &ledger,
+                &operation_id,
+                faults,
+            );
+            assert!(
+                matches!(result, Err(ProducerError::Io(..))),
+                "a failed ledger directory sync reports no successful build"
+            );
+            assert!(
+                !stage_path(&ledger, &operation_id, ordinal).exists(),
+                "the record without a directory sync has no durable entry after restart"
+            );
+            let stages = read_stage_operations(&ledger, &operation_id, &policy)?;
+            assert_eq!(
+                stages.len(),
+                (ordinal - 1) as usize,
+                "the crashed chain ends before the unsynced record"
+            );
+            if ordinal > 1 {
+                assert_ne!(
+                    last_stage(&ledger, &operation_id)?,
+                    PublicationState::Available,
+                    "the crashed chain carries no available stage"
+                );
+            }
+            let evidence = boundary_evidence(&manifest, &artifacts, &operation_id)?;
+            let outcome = recover_with_fs(
+                &root,
+                &ledger,
+                &evidence,
+                &policy,
+                &RecordingPublicationFs::new(PublicationFaults::default()),
+            );
+            if ordinal == 1 {
+                assert!(
+                    matches!(outcome, Ok(RecoveryOutcome::NoEvidence)),
+                    "a lost first record leaves no operation evidence"
+                );
+            } else if ordinal <= 5 {
+                assert!(
+                    matches!(outcome, Err(ProducerError::UncertainPublication(_))),
+                    "a lost pre-receipt record leaves an uncertain publication"
+                );
+            } else {
+                assert!(
+                    matches!(outcome, Ok(RecoveryOutcome::RecoveredPublished)),
+                    "later recovery acknowledges only a verified final directory"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn journal_records_bind_every_declared_field() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = boundary_manifest("release-journal-fields");
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let outcome = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &temp.path().join("releases"),
+            &temp.path().join("ledger"),
+        )?;
+        let ledger = temp.path().join("ledger");
+        let evidence = outcome.evidence;
+        let stages = read_stage_operations(&ledger, "operation-1", &policy)?;
+        assert_eq!(stages.len(), 8, "one record is committed per transition");
+        let (ordinal, first) = &stages[0];
+        assert_eq!(*ordinal, 0, "the first record occupies ordinal zero");
+        assert_eq!(
+            first.schema_version, JOURNAL_SCHEMA_VERSION,
+            "the journal schema version is bound"
+        );
+        assert_eq!(
+            first.sequence_number, 0,
+            "the first sequence number is zero"
+        );
+        assert_eq!(
+            first.previous_record_sha256, JOURNAL_GENESIS_DIGEST,
+            "the first record references the genesis digest"
+        );
+        assert_eq!(
+            first.operation_id, "operation-1",
+            "operation identity is bound"
+        );
+        assert_eq!(
+            first.release_id, evidence.release_id,
+            "release identity is bound"
+        );
+        assert_eq!(
+            first.manifest_sha256, evidence.manifest_sha256,
+            "canonical manifest digest is bound"
+        );
+        assert_eq!(
+            first.data_sha256, evidence.data_sha256,
+            "dataset digest is bound"
+        );
+        assert_eq!(
+            first.commit_position, evidence.commit_position,
+            "commit position is bound"
+        );
+        assert_eq!(
+            first.staging_directory,
+            staging_name("operation-1"),
+            "staging path identity is bound"
+        );
+        assert_eq!(
+            first.final_directory, evidence.release_id,
+            "final path identity is bound"
+        );
+        assert_eq!(
+            first.supersedes_release_id, None,
+            "no predecessor is declared for this release"
+        );
+        assert_eq!(
+            first.expected_receipt_sha256, evidence.receipt_sha256,
+            "expected receipt digest is bound"
+        );
+        assert_eq!(
+            first.stage,
+            PublicationState::StagingCreated,
+            "the first state is staging created"
+        );
+        let bytes = fs::read(stage_path(&ledger, "operation-1", 0))?;
+        assert_eq!(
+            bytes,
+            journal_record_bytes(first, &policy)?,
+            "the stored record uses the canonical representation"
+        );
+        assert_eq!(
+            first.record_sha256,
+            journal_checksum(first, &policy)?,
+            "the checksum covers all members except itself"
+        );
+        for pair in stages.windows(2) {
+            assert_eq!(
+                pair[1].1.previous_record_sha256, pair[0].1.record_sha256,
+                "each transition references the preceding record digest"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn journal_rejects_operation_conflicts_and_checksum_tampering() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = boundary_manifest("release-journal-tamper");
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let outcome = build_fixture(
+            &manifest, &artifacts, &signing, &verifying, &policy, &root, &ledger,
+        )?;
+        let foreign = ledger.join("operation-foreign.stage.2.json");
+        fs::write(&foreign, fs::read(stage_path(&ledger, "operation-1", 2))?)?;
+        let result = recover_interrupted(&root, &ledger, &outcome.evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationJournal(_))),
+            "a stage file with a conflicting operation id is rejected"
+        );
+        fs::remove_file(&foreign)?;
+        let original = stage_path(&ledger, "operation-1", 0);
+        let mut tampered: PublicationOperation = serde_json::from_slice(&fs::read(&original)?)?;
+        tampered.record_sha256 = "ff".repeat(32);
+        let mut bytes = canonicalize_strict(&tampered.to_jcs_record()?, &policy)?;
+        bytes.push(b'\n');
+        fs::write(&original, bytes)?;
+        let result = recover_interrupted(&root, &ledger, &outcome.evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationJournal(_))),
+            "a record whose digest disagrees with its bytes is rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn journal_rejects_missing_transitions_and_invalid_predecessors() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, _) = interrupt_boundary(
+            PublicationFaults {
+                fail_after_rename: true,
+                ..PublicationFaults::default()
+            },
+            "operation-journal-rules",
+            "release-journal-rules",
+            &root,
+            &ledger,
+        )?;
+        let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 2))?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "a missing transition breaks the ordinal sequence"
+        );
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 3))?;
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 4))?;
+        stage_at(
+            &ledger,
+            &evidence,
+            "operation-journal-rules",
+            2,
+            PublicationState::FilesSynced,
+            &policy,
+            &journal_fs,
+        )?;
+        let mut unrecognized = operation_from_evidence(&evidence, "operation-journal-rules");
+        unrecognized.stage = PublicationState::Available;
+        stage_record_at(&ledger, &unrecognized, 3, &policy, &journal_fs)?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "an unrecognized state at a committed position is rejected"
+        );
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 3))?;
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 2))?;
+        let mut self_predecessor = operation_from_evidence(&evidence, "operation-journal-rules");
+        self_predecessor.stage = PublicationState::FilesSynced;
+        self_predecessor.supersedes_release_id = Some(evidence.release_id.clone());
+        stage_record_at(&ledger, &self_predecessor, 2, &policy, &journal_fs)?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationJournal(_))),
+            "a release that declares itself as predecessor is rejected"
+        );
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 2))?;
+        let mut foreign_predecessor = operation_from_evidence(&evidence, "operation-journal-rules");
+        foreign_predecessor.stage = PublicationState::FilesSynced;
+        foreign_predecessor.supersedes_release_id = Some("release-other".to_owned());
+        stage_record_at(&ledger, &foreign_predecessor, 2, &policy, &journal_fs)?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationJournal(_))),
+            "a predecessor that disagrees with the receipt is rejected"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provisioning_requires_synced_parents() -> TestResult {
+        let policy = test_policy();
+        let manifest = boundary_manifest("release-provisioning");
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        for ordinal in 1..=2_u32 {
+            let temp = TempDir::new()?;
+            let root = temp.path().join("releases");
+            let ledger = temp.path().join("ledger");
+            let faults = PublicationFaults {
+                fail_provisioning_sync_at: Some(ordinal),
+                ..PublicationFaults::default()
+            };
+            let result = build_with_faults(
+                &manifest,
+                &artifacts,
+                &signing,
+                &verifying,
+                &policy,
+                &root,
+                &ledger,
+                "operation-provisioning",
+                faults,
+            );
+            assert!(
+                matches!(result, Err(ProducerError::Io(..))),
+                "a failed provisioning parent sync stops the build"
+            );
+            let evidence = boundary_evidence(&manifest, &artifacts, "operation-provisioning")?;
+            let outcome = recover_interrupted(&root, &ledger, &evidence, &policy);
+            assert!(
+                matches!(outcome, Ok(RecoveryOutcome::NoEvidence)),
+                "no journal record exists before provisioning completes"
+            );
+        }
+        let temp = TempDir::new()?;
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &temp.path().join("absent").join("releases"),
+            &temp.path().join("ledger"),
+            "operation-missing-parent",
+            PublicationFaults::default(),
+        );
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "a release root without an established parent fails closed"
+        );
+        Ok(())
     }
 }
