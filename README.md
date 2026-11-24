@@ -99,6 +99,9 @@ rather than a rewrite of history.
 - [Restart-independent publication recovery](docs/fb-pub-020-restart-independent-recovery-2026-11-24.md)
   — FB-PUB-020 immutable intent, v2 intent binding, fresh-process recovery and
   quarantine rule with gate record.
+- [Fresh-process crash boundary matrix](docs/fb-dur-002-subprocess-matrix-2026-11-24.md)
+  — FB-DUR-002 durable-boundary to expected-outcome table, child protocol,
+  two-pass recovery checks and D0-only scope with gate record.
 - [Descriptor-relative artifact tree validation](docs/fb-pub-021-artifact-tree-validation-2026-11-24.md)
   — FB-PUB-021 no-follow descriptor access, exact entry sets, digest binding,
   hard-link policy and platform limits with gate record.
