@@ -46,6 +46,8 @@
 
 use std::collections::BTreeSet;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CStr;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::fmt::Write as FmtWrite;
 use std::fs;
@@ -54,6 +56,10 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::mem::ManuallyDrop;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -3186,18 +3192,351 @@ fn verify_operation_identity(
     find_foreign_rename_evidence(ledger, evidence, policy)
 }
 
+/// Point where an offline test may change a release tree under validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TreeProbePoint {
+    /// The top-level entry set has been read from the root descriptor.
+    RootEnumerated,
+    /// The artifact entry set has been read from the artifact descriptor.
+    ArtifactsEnumerated,
+    /// An artifact is about to be opened from the artifact descriptor.
+    ArtifactOpen,
+}
+
+/// Hook used by offline tests to change a tree at one descriptor point.
+trait TreeValidationProbe {
+    /// Apply one mutation at `point` using the test-owned release path.
+    fn at(&self, point: TreeProbePoint, directory: &Path);
+}
+
+/// Production probe that leaves the release tree untouched.
+struct NoTreeProbe;
+
+impl TreeValidationProbe for NoTreeProbe {
+    fn at(&self, _point: TreeProbePoint, _directory: &Path) {}
+}
+
+/// Validate one release tree with the production probe.
 fn validate_artifact_set(
     directory: &Path,
     evidence: &PublicationEvidence,
+    sidecar_sha256: Option<&str>,
     policy: &ResourcePolicy,
 ) -> Result<(), ProducerError> {
-    let entries = fs::read_dir(directory)
-        .map_err(|error| io_error(&format!("read release {}", directory.display()), error))?;
-    let mut names = BTreeSet::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| io_error("read release entry", error))?;
-        names.insert(entry.file_name().to_string_lossy().into_owned());
+    validate_artifact_set_with(directory, evidence, sidecar_sha256, policy, &NoTreeProbe)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct OwnedDescriptor {
+    /// Raw descriptor owned until this value is dropped or transferred.
+    raw: libc::c_int,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl OwnedDescriptor {
+    /// Open a release root without following a symlink at its own path.
+    #[expect(
+        unsafe_code,
+        reason = "the release root boundary uses the libc open system call"
+    )]
+    fn open_root(path: &Path) -> Result<Self, ProducerError> {
+        let name = CString::new(path.as_os_str().as_bytes()).map_err(|error| {
+            ProducerError::UncertainPublication(format!("release path is not NUL-free: {error}"))
+        })?;
+        // SAFETY: `name` owns a NUL-terminated buffer that outlives this call.
+        // `O_NOFOLLOW` rejects a symlink at the final component, `O_DIRECTORY`
+        // requires a directory, and `O_CLOEXEC` keeps the fd out of children.
+        let raw = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(descriptor_error(
+                "open release root",
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(Self { raw })
     }
+
+    /// Transfer descriptor ownership to a directory stream wrapper.
+    fn into_raw(self) -> libc::c_int {
+        ManuallyDrop::new(self).raw
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    unsafe_code,
+    reason = "children are opened relative to a descriptor with the libc openat system call"
+)]
+fn open_child_at(
+    directory: libc::c_int,
+    name: &str,
+    is_directory: bool,
+) -> Result<OwnedDescriptor, ProducerError> {
+    let child = CString::new(name).map_err(|error| {
+        ProducerError::UncertainPublication(format!("entry name is not NUL-free: {error}"))
+    })?;
+    let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if is_directory {
+        flags |= libc::O_DIRECTORY;
+    }
+    // SAFETY: `directory` is a live directory descriptor held for the whole
+    // validation, and `child` is a NUL-terminated buffer that outlives the
+    // call. `O_NOFOLLOW` rejects a symlink at the named child.
+    let raw = unsafe { libc::openat(directory, child.as_ptr(), flags) };
+    if raw < 0 {
+        return Err(descriptor_error(
+            &format!("open entry {name}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    Ok(OwnedDescriptor { raw })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for OwnedDescriptor {
+    #[expect(
+        unsafe_code,
+        reason = "closing an owned raw descriptor uses the libc close system call"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: `raw` is an owned descriptor that is not used after close.
+        unsafe {
+            libc::close(self.raw);
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn descriptor_error(label: &str, error: io::Error) -> ProducerError {
+    ProducerError::UncertainPublication(format!("{label}: {error}"))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    unsafe_code,
+    reason = "fstat reads the object type of an already opened descriptor"
+)]
+fn require_regular(descriptor: &OwnedDescriptor, label: &str) -> Result<(), ProducerError> {
+    // SAFETY: `libc::stat` is a plain data struct whose zero bit pattern is
+    // valid before the system call fills it.
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a writable stat buffer of the platform layout and
+    // `descriptor.raw` is live for this call.
+    let status = unsafe { libc::fstat(descriptor.raw, &mut info) };
+    if status != 0 {
+        return Err(descriptor_error(
+            &format!("fstat {label}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    if info.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(ProducerError::UncertainPublication(format!(
+            "{label} is not a regular file"
+        )));
+    }
+    // Hard links are forbidden: release bytes must have one owner inside the
+    // tree. An external alias could replace those bytes after this validation.
+    if info.st_nlink != 1 {
+        return Err(ProducerError::UncertainPublication(format!(
+            "{label} has {} hard links",
+            info.st_nlink
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    unsafe_code,
+    reason = "fstatat classifies directory entries without following symlinks"
+)]
+fn require_entry_type(
+    directory: libc::c_int,
+    name: &CStr,
+    allow_directory: bool,
+    label: &str,
+) -> Result<(), ProducerError> {
+    // SAFETY: `libc::stat` is a plain data struct whose zero bit pattern is
+    // valid before the system call fills it.
+    let mut info: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `directory` is a live directory descriptor, `name` is a
+    // NUL-terminated buffer, and `info` has the platform stat layout.
+    // `AT_SYMLINK_NOFOLLOW` makes the call describe the link itself.
+    let status = unsafe {
+        libc::fstatat(
+            directory,
+            name.as_ptr(),
+            &mut info,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if status != 0 {
+        return Err(descriptor_error(
+            &format!("classify {label}"),
+            io::Error::last_os_error(),
+        ));
+    }
+    let kind = info.st_mode & libc::S_IFMT;
+    let accepted = if allow_directory {
+        kind == libc::S_IFREG || kind == libc::S_IFDIR
+    } else {
+        kind == libc::S_IFREG
+    };
+    if !accepted {
+        return Err(ProducerError::UncertainPublication(format!(
+            "{label} is not an accepted object type"
+        )));
+    }
+    if kind == libc::S_IFREG && info.st_nlink != 1 {
+        return Err(ProducerError::UncertainPublication(format!(
+            "{label} has {} hard links",
+            info.st_nlink
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct DescriptorDirectory {
+    /// Stream created from the owned directory descriptor.
+    stream: *mut libc::DIR,
+    /// Same descriptor as the stream; the stream closes it on drop.
+    raw: libc::c_int,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl DescriptorDirectory {
+    #[expect(
+        unsafe_code,
+        reason = "fdopendir binds an owned directory descriptor to a stream"
+    )]
+    fn from_descriptor(descriptor: OwnedDescriptor, label: &str) -> Result<Self, ProducerError> {
+        // SAFETY: `descriptor.raw` is a live directory descriptor. On success
+        // `fdopendir` takes ownership of that descriptor and the stream closes
+        // it once; `into_raw` prevents a second close by `OwnedDescriptor`.
+        let stream = unsafe { libc::fdopendir(descriptor.raw) };
+        if stream.is_null() {
+            return Err(descriptor_error(label, io::Error::last_os_error()));
+        }
+        Ok(Self {
+            stream,
+            raw: descriptor.into_raw(),
+        })
+    }
+
+    /// Open one child relative to this directory stream's descriptor.
+    fn open_child(&self, name: &str, directory: bool) -> Result<OwnedDescriptor, ProducerError> {
+        open_child_at(self.raw, name, directory)
+    }
+
+    /// Read and classify the current entry set through the held descriptor.
+    #[expect(
+        unsafe_code,
+        reason = "directory enumeration uses libc rewinddir and readdir"
+    )]
+    fn entries(
+        &mut self,
+        allow_artifacts_directory: bool,
+        label: &str,
+    ) -> Result<BTreeSet<String>, ProducerError> {
+        // SAFETY: `stream` is a live directory stream created by `fdopendir`.
+        unsafe { libc::rewinddir(self.stream) };
+        let mut names = BTreeSet::new();
+        loop {
+            // SAFETY: `stream` stays live until `Drop`; the returned dirent is
+            // readable until the next `readdir` or `closedir` call. Its name
+            // bytes are copied before either call can invalidate the entry.
+            let entry = unsafe { libc::readdir(self.stream) };
+            if entry.is_null() {
+                break;
+            }
+            // SAFETY: `entry` is non-null here and points to a live dirent.
+            let bytes = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+            if bytes == b"." || bytes == b".." {
+                continue;
+            }
+            let name = String::from_utf8_lossy(bytes).into_owned();
+            let child = CString::new(bytes).map_err(|error| {
+                ProducerError::UncertainPublication(format!("entry name is not NUL-free: {error}"))
+            })?;
+            let allow_directory = allow_artifacts_directory && name == ARTIFACT_DIRECTORY;
+            require_entry_type(
+                self.raw,
+                &child,
+                allow_directory,
+                &format!("{label}/{name}"),
+            )?;
+            if !names.insert(name.clone()) {
+                return Err(ProducerError::UncertainPublication(format!(
+                    "{label} repeats the entry {name}"
+                )));
+            }
+        }
+        Ok(names)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for DescriptorDirectory {
+    #[expect(unsafe_code, reason = "closedir releases an owned directory stream")]
+    fn drop(&mut self) {
+        // SAFETY: `stream` came from `fdopendir` and is not used after close.
+        unsafe {
+            libc::closedir(self.stream);
+        }
+    }
+}
+
+/// Open descriptors that stay live for one complete release-tree validation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct ReleaseTree {
+    /// Root directory stream pinned by its descriptor.
+    root: DescriptorDirectory,
+    /// Artifact directory stream pinned by its descriptor.
+    artifacts: DescriptorDirectory,
+    /// Opened manifest descriptor.
+    manifest: OwnedDescriptor,
+    /// Opened signature sidecar descriptor.
+    sidecar: OwnedDescriptor,
+    /// Top-level names observed before any file was opened.
+    top_names: BTreeSet<String>,
+    /// Artifact names observed before any artifact was opened.
+    artifact_names: BTreeSet<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl ReleaseTree {
+    /// Confirm both held directories still expose their enumerated entry sets.
+    fn finish(&mut self) -> Result<(), ProducerError> {
+        let top = self.root.entries(true, "release root")?;
+        if top != self.top_names {
+            return Err(ProducerError::ArtifactSetMismatch(
+                "release root entries changed during validation".to_owned(),
+            ));
+        }
+        let artifacts = self.artifacts.entries(false, "artifacts")?;
+        if artifacts != self.artifact_names {
+            return Err(ProducerError::ArtifactSetMismatch(
+                "artifact entries changed during validation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_release_tree(
+    directory: &Path,
+    probe: &dyn TreeValidationProbe,
+) -> Result<ReleaseTree, ProducerError> {
+    let root_fd = OwnedDescriptor::open_root(directory)?;
+    let mut root = DescriptorDirectory::from_descriptor(root_fd, "open release root stream")?;
+    let top_names = root.entries(true, "release root")?;
     let expected_top: BTreeSet<String> = [
         MANIFEST_FILE_NAME.to_owned(),
         SIDECAR_FILE_NAME.to_owned(),
@@ -3205,111 +3544,133 @@ fn validate_artifact_set(
     ]
     .into_iter()
     .collect();
-    if names != expected_top {
+    if top_names != expected_top {
         return Err(ProducerError::ArtifactSetMismatch(format!(
             "release {} top-level file set differs from manifest, sidecar and artifacts",
-            evidence.release_id
+            directory.display()
         )));
     }
-    let artifact_root = directory.join(ARTIFACT_DIRECTORY);
-    let artifact_entries = fs::read_dir(&artifact_root)
-        .map_err(|error| io_error("read staged artifact directory", error))?;
-    let mut artifact_names = BTreeSet::new();
-    for entry in artifact_entries {
-        let entry = entry.map_err(|error| io_error("read staged artifact entry", error))?;
-        artifact_names.insert(entry.file_name().to_string_lossy().into_owned());
+    probe.at(TreeProbePoint::RootEnumerated, directory);
+    let manifest = root.open_child(MANIFEST_FILE_NAME, false)?;
+    require_regular(&manifest, MANIFEST_FILE_NAME)?;
+    let sidecar = root.open_child(SIDECAR_FILE_NAME, false)?;
+    require_regular(&sidecar, SIDECAR_FILE_NAME)?;
+    let artifacts_fd = root.open_child(ARTIFACT_DIRECTORY, true)?;
+    let mut artifacts =
+        DescriptorDirectory::from_descriptor(artifacts_fd, "open artifacts stream")?;
+    let artifact_names = artifacts.entries(false, "artifacts")?;
+    probe.at(TreeProbePoint::ArtifactsEnumerated, directory);
+    Ok(ReleaseTree {
+        root,
+        artifacts,
+        manifest,
+        sidecar,
+        top_names,
+        artifact_names,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[expect(
+    unsafe_code,
+    reason = "bytes are read from an already opened descriptor with libc read"
+)]
+fn read_descriptor(descriptor: libc::c_int, label: &str) -> Result<Vec<u8>, ProducerError> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 16_384];
+    loop {
+        // SAFETY: `descriptor` is a live file descriptor held by `ReleaseTree`,
+        // and `buffer` is writable for its declared length.
+        let count = unsafe { libc::read(descriptor, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count == 0 {
+            break;
+        }
+        if count < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(descriptor_error(&format!("read {label}"), error));
+        }
+        bytes.extend_from_slice(&buffer[..count as usize]);
+    }
+    Ok(bytes)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_artifact_set_with(
+    directory: &Path,
+    evidence: &PublicationEvidence,
+    sidecar_sha256: Option<&str>,
+    policy: &ResourcePolicy,
+    probe: &dyn TreeValidationProbe,
+) -> Result<(), ProducerError> {
+    if evidence.artifact_paths.len() != evidence.artifact_stored_sha256.len() {
+        return Err(ProducerError::ArtifactSetMismatch(
+            "declared artifact paths and stored digests have different lengths".to_owned(),
+        ));
+    }
+    let mut tree = open_release_tree(directory, probe)?;
+    let manifest = read_descriptor(tree.manifest.raw, "manifest descriptor")?;
+    if hex_encode(&sha256(&manifest)) != evidence.manifest_sha256 {
+        return Err(ProducerError::PublicationEvidence(
+            "manifest digest differs from operation evidence".to_owned(),
+        ));
+    }
+    if let Some(expected) = sidecar_sha256 {
+        let sidecar = read_descriptor(tree.sidecar.raw, "signature sidecar descriptor")?;
+        if hex_encode(&sha256(&sidecar)) != expected {
+            return Err(ProducerError::PublicationEvidence(
+                "signature sidecar digest differs from the prepared sidecar".to_owned(),
+            ));
+        }
     }
     let mut expected_artifacts = BTreeSet::new();
     for path in &evidence.artifact_paths {
         validate_artifact_path(path, policy)?;
-        let relative = path
-            .strip_prefix(&format!("{ARTIFACT_DIRECTORY}/"))
-            .ok_or_else(|| {
-                ProducerError::InvalidArtifactPath(
-                    path.clone(),
-                    "declared artifact path is not release-relative under artifacts/".to_owned(),
-                )
-            })?;
-        expected_artifacts.insert(relative.to_owned());
+        let relative = descriptor_relative_path(path)?;
+        if !expected_artifacts.insert(relative.to_owned()) {
+            return Err(ProducerError::ArtifactSetMismatch(format!(
+                "declared artifact path {path} is repeated"
+            )));
+        }
     }
-    if artifact_names != expected_artifacts {
+    if expected_artifacts != tree.artifact_names {
         return Err(ProducerError::ArtifactSetMismatch(format!(
             "release {} artifact set differs from the declared inventory",
-            evidence.release_id
+            directory.display()
         )));
-    }
-    let manifest_digest = hex_encode(&sha256(
-        &fs::read(directory.join(MANIFEST_FILE_NAME))
-            .map_err(|error| io_error("read staged manifest", error))?,
-    ));
-    if manifest_digest != evidence.manifest_sha256 {
-        return Err(ProducerError::PublicationEvidence(
-            "manifest digest differs from operation evidence".to_owned(),
-        ));
     }
     for (path, digest) in evidence
         .artifact_paths
         .iter()
         .zip(&evidence.artifact_stored_sha256)
     {
-        let relative = path
-            .strip_prefix(&format!("{ARTIFACT_DIRECTORY}/"))
-            .ok_or_else(|| {
-                ProducerError::InvalidArtifactPath(
-                    path.clone(),
-                    "declared artifact path is not release-relative under artifacts/".to_owned(),
-                )
-            })?;
-        let bytes = fs::read(artifact_root.join(relative))
-            .map_err(|error| io_error(&format!("read staged artifact {relative}"), error))?;
+        let relative = descriptor_relative_path(path)?;
+        probe.at(TreeProbePoint::ArtifactOpen, directory);
+        let descriptor = tree.artifacts.open_child(relative, false)?;
+        require_regular(&descriptor, &format!("artifact {relative}"))?;
+        let bytes = read_descriptor(descriptor.raw, &format!("artifact {relative}"))?;
         if hex_encode(&sha256(&bytes)) != *digest {
             return Err(ProducerError::PublicationEvidence(format!(
                 "artifact digest differs for {relative}"
             )));
         }
     }
-    Ok(())
+    tree.finish()
 }
 
-/// Read one directory descriptor without following a symlink at its own path.
-fn read_no_follow_directory(path: &Path) -> Result<BTreeSet<String>, ProducerError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| io_error(&format!("read descriptor {}", path.display()), error))?;
-    if !metadata.file_type().is_dir() {
-        return Err(ProducerError::UncertainPublication(format!(
-            "release descriptor {} is not a real directory",
-            path.display()
-        )));
-    }
-    let mut names = BTreeSet::new();
-    for entry in fs::read_dir(path)
-        .map_err(|error| io_error(&format!("read release {}", path.display()), error))?
-    {
-        let entry = entry.map_err(|error| io_error("read release entry", error))?;
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|error| io_error(&format!("read entry {}", entry.path().display()), error))?;
-        if !metadata.file_type().is_dir() && !metadata.file_type().is_file() {
-            return Err(ProducerError::UncertainPublication(format!(
-                "release entry {} is neither a directory nor a regular file",
-                entry.path().display()
-            )));
-        }
-        names.insert(entry.file_name().to_string_lossy().into_owned());
-    }
-    Ok(names)
-}
-
-/// Read one regular file descriptor without following a symlink at its path.
-fn read_no_follow_regular(path: &Path) -> Result<Vec<u8>, ProducerError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|error| io_error(&format!("read descriptor {}", path.display()), error))?;
-    if !metadata.file_type().is_file() {
-        return Err(ProducerError::UncertainPublication(format!(
-            "release descriptor {} is not a regular file",
-            path.display()
-        )));
-    }
-    fs::read(path).map_err(|error| io_error(&format!("read {}", path.display()), error))
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn validate_artifact_set_with(
+    _directory: &Path,
+    _evidence: &PublicationEvidence,
+    _sidecar_sha256: Option<&str>,
+    _policy: &ResourcePolicy,
+    _probe: &dyn TreeValidationProbe,
+) -> Result<(), ProducerError> {
+    Err(ProducerError::UncertainPublication(
+        "descriptor-relative tree validation requires Linux openat or macOS openat".to_owned(),
+    ))
 }
 
 /// Recover the exact uncompressed stream declared by one artifact descriptor.
@@ -3346,40 +3707,52 @@ fn validate_intent_tree(
     intent: &PublicationIntentV2,
     policy: &ResourcePolicy,
 ) -> Result<(), ProducerError> {
-    let top = read_no_follow_directory(directory)?;
-    let expected_top: BTreeSet<String> = [
-        MANIFEST_FILE_NAME.to_owned(),
-        SIDECAR_FILE_NAME.to_owned(),
-        ARTIFACT_DIRECTORY.to_owned(),
-    ]
-    .into_iter()
-    .collect();
-    if top != expected_top {
-        return Err(ProducerError::UncertainPublication(format!(
-            "release {} has an unexpected top-level tree",
-            intent.release_id
-        )));
-    }
-    let manifest_bytes = read_no_follow_regular(&directory.join(MANIFEST_FILE_NAME))?;
-    if hex_encode(&sha256(&manifest_bytes)) != intent.manifest_sha256 {
+    validate_intent_tree_with(directory, intent, policy, &NoTreeProbe)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn validate_intent_tree_with(
+    directory: &Path,
+    intent: &PublicationIntentV2,
+    policy: &ResourcePolicy,
+    probe: &dyn TreeValidationProbe,
+) -> Result<(), ProducerError> {
+    let mut tree = open_release_tree(directory, probe)?;
+    let manifest = read_descriptor(tree.manifest.raw, "manifest descriptor")?;
+    if hex_encode(&sha256(&manifest)) != intent.manifest_sha256 {
         return Err(ProducerError::UncertainPublication(
             "manifest digest disagrees with the verified intent".to_owned(),
         ));
     }
-    let sidecar_bytes = read_no_follow_regular(&directory.join(SIDECAR_FILE_NAME))?;
-    if hex_encode(&sha256(&sidecar_bytes)) != intent.sidecar_sha256 {
+    let sidecar = read_descriptor(tree.sidecar.raw, "signature sidecar descriptor")?;
+    if hex_encode(&sha256(&sidecar)) != intent.sidecar_sha256 {
         return Err(ProducerError::UncertainPublication(
             "signature sidecar digest disagrees with the verified intent".to_owned(),
         ));
     }
-    let artifact_root = directory.join(ARTIFACT_DIRECTORY);
-    let actual = read_no_follow_directory(&artifact_root)?;
     let mut expected = BTreeSet::new();
     for descriptor in &intent.artifacts {
         validate_artifact_path(&descriptor.path, policy)?;
         let relative = descriptor_relative_path(&descriptor.path)?;
-        expected.insert(relative.to_owned());
-        let bytes = read_no_follow_regular(&artifact_root.join(relative))?;
+        if !expected.insert(relative.to_owned()) {
+            return Err(ProducerError::ArtifactSetMismatch(format!(
+                "intent repeats artifact path {}",
+                descriptor.path
+            )));
+        }
+    }
+    if expected != tree.artifact_names {
+        return Err(ProducerError::UncertainPublication(format!(
+            "release {} artifact set differs from the verified inventory",
+            directory.display()
+        )));
+    }
+    for descriptor in &intent.artifacts {
+        let relative = descriptor_relative_path(&descriptor.path)?;
+        probe.at(TreeProbePoint::ArtifactOpen, directory);
+        let artifact = tree.artifacts.open_child(relative, false)?;
+        require_regular(&artifact, &format!("artifact {relative}"))?;
+        let bytes = read_descriptor(artifact.raw, &format!("artifact {relative}"))?;
         let stored_length = u64::try_from(bytes.len()).map_err(|_| {
             ProducerError::PolicyExceeded("artifact stream exceeds addressable length".to_owned())
         })?;
@@ -3402,13 +3775,19 @@ fn validate_intent_tree(
             )));
         }
     }
-    if actual != expected {
-        return Err(ProducerError::UncertainPublication(format!(
-            "release {} artifact set differs from the verified inventory",
-            intent.release_id
-        )));
-    }
-    Ok(())
+    tree.finish()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn validate_intent_tree_with(
+    _directory: &Path,
+    _intent: &PublicationIntentV2,
+    _policy: &ResourcePolicy,
+    _probe: &dyn TreeValidationProbe,
+) -> Result<(), ProducerError> {
+    Err(ProducerError::UncertainPublication(
+        "descriptor-relative tree validation requires Linux openat or macOS openat".to_owned(),
+    ))
 }
 
 /// Reject a release directory name that is not one safe relative component.
@@ -4058,7 +4437,7 @@ fn recover_final_directory(
     let final_dir = root.join(&operation.final_directory);
     fs.record(PublicationRecoveryEvent::FinalDirectoryFound);
     fs.record(PublicationRecoveryEvent::VerifyFinalDirectory);
-    validate_artifact_set(&final_dir, evidence, policy)?;
+    validate_artifact_set(&final_dir, evidence, None, policy)?;
     fs.record(PublicationRecoveryEvent::VerifyOperationIdentity);
     verify_operation_identity(&final_dir, evidence, operation, ledger, policy)?;
 
@@ -4283,7 +4662,7 @@ fn recover_interrupted_inner(
                 "incomplete staging evidence; publication is not acknowledged".to_owned(),
             ));
         }
-        validate_artifact_set(&staging, evidence, policy)?;
+        validate_artifact_set(&staging, evidence, None, policy)?;
         sync_directory(&staging)?;
         if !legacy {
             sync_directory(&staging.join(ARTIFACT_DIRECTORY))?;
@@ -4343,12 +4722,13 @@ fn build_release_inner(
     let prepared = prepare_release(request)?;
     provision_directory(request.ledger_dir, "ledger", fs)?;
     provision_directory(request.release_root, "release root", fs)?;
+    let sidecar_sha256 = hex_encode(&sha256(&prepared.sidecar_bytes));
     let intent = PublicationIntentV2 {
         schema_version: INTENT_SCHEMA_VERSION,
         operation_id: request.operation_id.to_owned(),
         release_id: prepared.evidence.release_id.clone(),
         manifest_sha256: prepared.evidence.manifest_sha256.clone(),
-        sidecar_sha256: hex_encode(&sha256(&prepared.sidecar_bytes)),
+        sidecar_sha256: sidecar_sha256.clone(),
         data_sha256: prepared.evidence.data_sha256.clone(),
         commit_position: request.commit_position.to_owned(),
         staging_directory: staging_name(request.operation_id),
@@ -4442,7 +4822,12 @@ fn build_release_inner(
     fs.boundary(PublicationBoundary::StagingDirectorySynced)?;
     let mut tree = stage_for_state(&entry, PublicationState::StagingTreeDurable)?;
     write_stage(request.ledger_dir, &mut tree, 2, request.policy, fs)?;
-    validate_artifact_set(&staging, &prepared.evidence, request.policy)?;
+    validate_artifact_set(
+        &staging,
+        &prepared.evidence,
+        Some(&sidecar_sha256),
+        request.policy,
+    )?;
     let final_dir = request.release_root.join(&prepared.evidence.release_id);
     finalize_publication_v2(
         request.release_root,
@@ -4488,6 +4873,10 @@ mod tests {
     use std::env;
     use std::error::Error as StdError;
     use std::fs;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::unix::fs::symlink;
     use std::process;
     use std::process::Command;
 
@@ -5698,7 +6087,7 @@ mod tests {
         evidence.artifact_paths = vec!["artifacts/a.jsonl".to_owned()];
         evidence.artifact_stored_sha256 = vec!["22".repeat(32)];
         let temp = TempDir::new()?;
-        let result = validate_artifact_set(temp.path(), &evidence, &test_policy());
+        let result = validate_artifact_set(temp.path(), &evidence, None, &test_policy());
         assert!(
             matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
             "missing declared artifact fails closed"
@@ -6080,6 +6469,7 @@ mod tests {
         validate_artifact_set(
             &root.join(".staging-operation-before-rename"),
             &evidence,
+            None,
             &policy,
         )?;
         assert!(
@@ -6207,6 +6597,7 @@ mod tests {
         validate_artifact_set(
             &root.join("release-concurrent"),
             &winners[0].evidence,
+            None,
             &policy,
         )?;
         let receipts = fs::read_dir(&ledger)?
@@ -6261,7 +6652,7 @@ mod tests {
         )?;
         evidence.publication_operation_id = "operation-parent-fault".to_owned();
         let final_dir = root.join("release-parent-fault");
-        validate_artifact_set(&final_dir, &evidence, &policy)?;
+        validate_artifact_set(&final_dir, &evidence, None, &policy)?;
         assert_eq!(
             last_stage(&ledger, "operation-parent-fault")?,
             PublicationState::StagingTreeDurable,
@@ -6622,7 +7013,12 @@ mod tests {
             root.join("release-stage-recovery").exists(),
             "final directory exists after staged recovery"
         );
-        validate_artifact_set(&root.join("release-stage-recovery"), &evidence, &policy)?;
+        validate_artifact_set(
+            &root.join("release-stage-recovery"),
+            &evidence,
+            None,
+            &policy,
+        )?;
         Ok(())
     }
 
@@ -6919,7 +7315,12 @@ mod tests {
             .join("artifacts")
             .join("extra.jsonl");
         fs::write(&extra, b"unexpected")?;
-        let result = validate_artifact_set(&root.join("release-extra"), &outcome.evidence, &policy);
+        let result = validate_artifact_set(
+            &root.join("release-extra"),
+            &outcome.evidence,
+            None,
+            &policy,
+        );
         assert!(
             matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
             "an extra file under artifacts/ fails the exact-set check"
@@ -6953,6 +7354,7 @@ mod tests {
         let result = validate_artifact_set(
             &root.join("release-missing-file"),
             &outcome.evidence,
+            None,
             &policy,
         );
         assert!(
@@ -6960,6 +7362,459 @@ mod tests {
             "a missing declared artifact fails the exact-set check"
         );
         Ok(())
+    }
+
+    /// Descriptor-relative validation fixture that stops before the rename.
+    struct StagingFixture {
+        /// Temporary tree kept alive for the whole fixture.
+        temp: TempDir,
+        /// Publication root holding the staging directory.
+        root: PathBuf,
+        /// Ledger holding the intent and the staged journal records.
+        ledger: PathBuf,
+        /// Staging directory under validation.
+        staging: PathBuf,
+        /// Release identity from the prepared outcome.
+        release_id: String,
+        /// Operation identity bound into the durable intent.
+        operation_id: String,
+        /// Evidence with the declared artifact inventory.
+        evidence: PublicationEvidence,
+        /// Digest of the prepared signature sidecar bytes.
+        sidecar_sha256: String,
+        /// Resource policy used by the fixture.
+        policy: ResourcePolicy,
+    }
+
+    /// Build one complete staging tree without a receipt or availability marker.
+    fn staging_fixture(release_id: &str) -> Result<StagingFixture, Box<dyn StdError>> {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest(release_id);
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let operation_id = format!("operation-{release_id}");
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let prepared_dir = TempDir::new()?;
+        let prepared = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &prepared_dir.path().join("releases"),
+            &prepared_dir.path().join("ledger"),
+            &operation_id,
+            PublicationFaults::default(),
+        )?;
+        let evidence = prepared.evidence;
+        let sidecar_sha256 = hex_encode(&sha256(&prepared.sidecar_bytes));
+        let faults = PublicationFaults {
+            fail_before_rename: true,
+            ..PublicationFaults::default()
+        };
+        let incomplete = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            &operation_id,
+            faults,
+        );
+        assert!(
+            matches!(incomplete, Err(ProducerError::Io(..))),
+            "the injected pre-rename failure stops the build"
+        );
+        assert!(
+            !ledger.join(format!("{release_id}.receipt.json")).exists(),
+            "the incomplete staging tree has no receipt"
+        );
+        assert!(
+            !ledger.join(format!("{release_id}.available")).exists(),
+            "the incomplete staging tree has no availability marker"
+        );
+        Ok(StagingFixture {
+            temp,
+            staging: root.join(staging_name(&operation_id)),
+            root,
+            ledger,
+            release_id: release_id.to_owned(),
+            operation_id,
+            evidence,
+            sidecar_sha256,
+            policy,
+        })
+    }
+
+    /// Closure-backed probe used by the descriptor mutation tests.
+    struct ClosureProbe<'a, F>(&'a F);
+
+    impl<F> TreeValidationProbe for ClosureProbe<'_, F>
+    where
+        F: Fn(TreeProbePoint, &Path),
+    {
+        fn at(&self, point: TreeProbePoint, directory: &Path) {
+            (self.0)(point, directory);
+        }
+    }
+
+    /// Confirm a tree failure withholds every local acknowledgement.
+    fn assert_quarantined_without_ack(fixture: &StagingFixture) -> Result<(), Box<dyn StdError>> {
+        let receipt = fixture
+            .ledger
+            .join(format!("{}.receipt.json", fixture.release_id));
+        let marker = fixture
+            .ledger
+            .join(format!("{}.available", fixture.release_id));
+        assert!(!receipt.exists(), "no receipt exists before recovery");
+        assert!(!marker.exists(), "no marker exists before recovery");
+        let recovered = super::recover_interrupted(
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.operation_id,
+            &fixture.policy,
+        );
+        assert!(
+            matches!(
+                recovered,
+                Ok(RecoveryOutcome::UncertainPublicationQuarantined)
+            ),
+            "v2 recovery quarantines the tampered tree"
+        );
+        assert!(!receipt.exists(), "quarantine writes no receipt");
+        assert!(!marker.exists(), "quarantine writes no availability marker");
+        Ok(())
+    }
+
+    /// Replace one file with a symlink to an outside file of identical bytes.
+    fn link_outside_file(path: &Path, outside: &Path) -> Result<(), Box<dyn StdError>> {
+        fs::write(outside, fs::read(path)?)?;
+        fs::remove_file(path)?;
+        symlink(outside, path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn symlinked_artifacts_directory_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-artifacts-link")?;
+        let real = fixture.staging.join("artifacts-real");
+        fs::rename(fixture.staging.join(ARTIFACT_DIRECTORY), &real)?;
+        symlink("artifacts-real", fixture.staging.join(ARTIFACT_DIRECTORY))?;
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a symlinked artifacts directory fails the descriptor boundary check"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn symlinked_manifest_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-manifest-link")?;
+        let outside = fixture.temp.path().join("outside-manifest.json");
+        link_outside_file(&fixture.staging.join(MANIFEST_FILE_NAME), &outside)?;
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a symlinked manifest fails the no-follow classification"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn symlinked_sidecar_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-sidecar-link")?;
+        let outside = fixture.temp.path().join("outside-sidecar.json");
+        link_outside_file(&fixture.staging.join(SIDECAR_FILE_NAME), &outside)?;
+        let result = validate_artifact_set(
+            &fixture.staging,
+            &fixture.evidence,
+            Some(&fixture.sidecar_sha256),
+            &fixture.policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a symlinked sidecar fails the no-follow classification"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn symlinked_artifact_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-artifact-link")?;
+        let outside = fixture.temp.path().join("outside-artifact.jsonl");
+        link_outside_file(
+            &fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl"),
+            &outside,
+        )?;
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a symlinked artifact fails the no-follow classification"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "mkfifo creates the named-pipe fixture used by the object-type test"
+    )]
+    fn artifact_fifo_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-artifact-fifo")?;
+        let artifact = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        fs::remove_file(&artifact)?;
+        let name = CString::new(artifact.as_os_str().as_bytes())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        // SAFETY: `name` owns a NUL-terminated buffer for this call. The
+        // fixture path is inside a private temporary directory.
+        let status = unsafe { libc::mkfifo(name.as_ptr(), 0o600) };
+        assert_eq!(status, 0, "mkfifo creates the named pipe fixture");
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a FIFO under artifacts/ fails the object-type check"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn artifact_directory_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-artifact-directory")?;
+        let artifact = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        fs::remove_file(&artifact)?;
+        fs::create_dir(&artifact)?;
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a directory at a declared artifact path fails the object-type check"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn changed_artifact_bytes_are_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-artifact-bytes")?;
+        fs::write(
+            fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl"),
+            b"tampered artifact bytes",
+        )?;
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "changed artifact bytes fail the bound stored digest"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn changed_sidecar_bytes_are_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-sidecar-bytes")?;
+        fs::write(
+            fixture.staging.join(SIDECAR_FILE_NAME),
+            b"tampered sidecar bytes",
+        )?;
+        let result = validate_artifact_set(
+            &fixture.staging,
+            &fixture.evidence,
+            Some(&fixture.sidecar_sha256),
+            &fixture.policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::PublicationEvidence(_))),
+            "changed sidecar bytes fail the prepared sidecar digest"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn artifact_name_is_not_trusted_after_enumeration() -> TestResult {
+        let fixture = staging_fixture("release-tree-name-swap")?;
+        let artifact = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        let held = fixture.staging.join(ARTIFACT_DIRECTORY).join("held.jsonl");
+        let outside = fixture.temp.path().join("outside-name-swap.jsonl");
+        fs::write(&outside, fs::read(&artifact)?)?;
+        let probe = ClosureProbe(&|point: TreeProbePoint, _directory: &Path| {
+            if point == TreeProbePoint::ArtifactsEnumerated {
+                fs::rename(&artifact, &held).expect("the probe renames the enumerated artifact");
+                symlink(&outside, &artifact).expect("the probe links the old name outside");
+            }
+        });
+        let result = validate_artifact_set_with(
+            &fixture.staging,
+            &fixture.evidence,
+            None,
+            &fixture.policy,
+            &probe,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a name swapped after enumeration fails at the no-follow open"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn root_files_are_not_trusted_after_enumeration() -> TestResult {
+        let fixture = staging_fixture("release-tree-root-file-swap")?;
+        let manifest = fixture.staging.join(MANIFEST_FILE_NAME);
+        let sidecar = fixture.staging.join(SIDECAR_FILE_NAME);
+        let outside_manifest = fixture.temp.path().join("outside-swap-manifest.json");
+        let outside_sidecar = fixture.temp.path().join("outside-swap-sidecar.json");
+        fs::write(&outside_manifest, fs::read(&manifest)?)?;
+        fs::write(&outside_sidecar, fs::read(&sidecar)?)?;
+        let probe = ClosureProbe(&|point: TreeProbePoint, _directory: &Path| {
+            if point == TreeProbePoint::RootEnumerated {
+                fs::remove_file(&manifest).expect("the probe removes the manifest entry");
+                symlink(&outside_manifest, &manifest).expect("the probe links the manifest");
+                fs::remove_file(&sidecar).expect("the probe removes the sidecar entry");
+                symlink(&outside_sidecar, &sidecar).expect("the probe links the sidecar");
+            }
+        });
+        let result = validate_artifact_set_with(
+            &fixture.staging,
+            &fixture.evidence,
+            Some(&fixture.sidecar_sha256),
+            &fixture.policy,
+            &probe,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "root files swapped after enumeration fail at the no-follow opens"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn artifacts_directory_is_not_trusted_after_enumeration() -> TestResult {
+        let fixture = staging_fixture("release-tree-directory-swap")?;
+        let artifacts = fixture.staging.join(ARTIFACT_DIRECTORY);
+        let moved = fixture.staging.join("artifacts-moved");
+        let probe = ClosureProbe(&|point: TreeProbePoint, _directory: &Path| {
+            if point == TreeProbePoint::RootEnumerated {
+                fs::rename(&artifacts, &moved).expect("the probe moves the artifacts directory");
+                symlink("artifacts-moved", &artifacts)
+                    .expect("the probe links the old artifacts name");
+            }
+        });
+        let result = validate_artifact_set_with(
+            &fixture.staging,
+            &fixture.evidence,
+            None,
+            &fixture.policy,
+            &probe,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a directory swapped after enumeration fails the no-follow open"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn root_descriptor_pins_the_tree_when_its_path_is_replaced() -> TestResult {
+        let fixture = staging_fixture("release-tree-pinned-root")?;
+        let moved = fixture.root.join("moved-release-tree");
+        let probe = ClosureProbe(&|point: TreeProbePoint, _directory: &Path| {
+            if point == TreeProbePoint::ArtifactsEnumerated {
+                fs::rename(&fixture.staging, &moved).expect("the probe moves the release root");
+                symlink(&moved, &fixture.staging)
+                    .expect("the probe links the original release path");
+            }
+        });
+        validate_artifact_set_with(
+            &fixture.staging,
+            &fixture.evidence,
+            Some(&fixture.sidecar_sha256),
+            &fixture.policy,
+            &probe,
+        )?;
+        assert!(
+            moved.join(ARTIFACT_DIRECTORY).join("a.jsonl").is_file(),
+            "the opened descriptors follow the original directory inode"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hard_links_are_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-hard-link")?;
+        let alias = fixture.temp.path().join("artifact-alias.jsonl");
+        fs::hard_link(
+            fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl"),
+            &alias,
+        )?;
+        let result =
+            validate_artifact_set(&fixture.staging, &fixture.evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "an external hard link to an artifact fails the single-owner policy"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn hard_link_created_after_enumeration_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-late-hard-link")?;
+        let artifact = fixture.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl");
+        let alias = fixture.temp.path().join("late-artifact-alias.jsonl");
+        let probe = ClosureProbe(&|point: TreeProbePoint, _directory: &Path| {
+            if point == TreeProbePoint::ArtifactsEnumerated {
+                fs::hard_link(&artifact, &alias).expect("the probe adds a hard link");
+            }
+        });
+        let result = validate_artifact_set_with(
+            &fixture.staging,
+            &fixture.evidence,
+            None,
+            &fixture.policy,
+            &probe,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::UncertainPublication(_))),
+            "a hard link added after enumeration fails at the opened descriptor"
+        );
+        assert_quarantined_without_ack(&fixture)
+    }
+
+    #[test]
+    fn duplicate_declared_artifact_is_rejected() -> TestResult {
+        let fixture = staging_fixture("release-tree-duplicate-artifact")?;
+        let mut evidence = fixture.evidence.clone();
+        evidence.artifact_paths.push("artifacts/a.jsonl".to_owned());
+        evidence
+            .artifact_stored_sha256
+            .push(fixture.evidence.artifact_stored_sha256[0].clone());
+        let result = validate_artifact_set(&fixture.staging, &evidence, None, &fixture.policy);
+        assert!(
+            matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
+            "a repeated declared artifact path fails the exact-set check"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn extra_and_missing_artifacts_quarantine_recovery() -> TestResult {
+        let extra = staging_fixture("release-tree-extra-recovery")?;
+        fs::write(
+            extra.staging.join(ARTIFACT_DIRECTORY).join("extra.jsonl"),
+            b"unexpected",
+        )?;
+        assert_quarantined_without_ack(&extra)?;
+        let missing = staging_fixture("release-tree-missing-recovery")?;
+        fs::remove_file(missing.staging.join(ARTIFACT_DIRECTORY).join("a.jsonl"))?;
+        assert_quarantined_without_ack(&missing)
     }
 
     #[test]
