@@ -133,6 +133,7 @@ SOURCE_RESPONSIBILITIES = {
     "src/integrity/quality.rs": "universal quality states, reason vocabulary, transition rules and two-sided reconciliation accounting",
     "src/domain/reference_data.rs": "effective-dated entity, venue, listing and specification graph with fail-closed identity resolution",
     "src/domain/reference_core.rs": "canonical object classes with opaque identity, identifier assertions and order-independent fail-closed resolution, append-only bitemporal assertion ledger and exact-dimension coverage cells",
+    "src/domain/capability_registry.rs": "evidence-bound source, product and feed capability assertions with separate rights standing, four-outcome resolution, explicit coverage promotion allow-list and per-state coverage counts",
     "src/domain/instrument_terms.rs": "family-typed instrument terms with unit-bearing exact measures, checked integer arithmetic, typed contract families and instances, append-only bitemporal revisions and fail-closed conformance reporting",
     "src/domain/market_registry.rs": "versioned country packs with typed authority, venue, segment and product assertions, reference-validated insertion and four-outcome fail-closed registry resolution",
     "src/governance/rights.rs": "fail-closed licensing registry, typed authorization identity (actor, action, data object kind/id/version, recipient class and identity), action-object applicability matrix, exact versioned universe containment with recorded membership evidence, usage rights, decisions and entitlement authorization",

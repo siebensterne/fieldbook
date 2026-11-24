@@ -2,6 +2,7 @@
 //! `domain` domain module.
 
 pub mod canonical;
+pub mod capability_registry;
 pub mod event_model;
 pub mod fixed;
 pub mod identity;

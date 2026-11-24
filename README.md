@@ -80,6 +80,8 @@ rather than a rewrite of history.
   — FB-REF-002 unit-bearing measures, family terms and revision record.
 - [Jurisdiction, venue and product registry](docs/fb-ref-004-market-registry-2026-11-24.md)
   — FB-REF-004 country packs, typed assertions and registry resolution record.
+- [Source, product and capability registry](docs/fb-ref-005-capability-coverage-2026-11-24.md)
+  — FB-REF-005 proof references, separate rights standing and coverage promotion record.
 
 Format contracts: [replay format](docs/replay-format.md),
 [raw-frame journal](docs/raw-frame-journal.md),
