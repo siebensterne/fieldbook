@@ -70,7 +70,7 @@ impl fmt::Display for AssetClass {
 }
 
 /// Instrument or information object kind within an asset class.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InstrumentKind {
     CommonShare,

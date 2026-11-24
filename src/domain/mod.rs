@@ -6,6 +6,7 @@ pub mod event_model;
 pub mod fixed;
 pub mod identity;
 pub mod information;
+pub mod instrument_terms;
 pub mod model;
 pub mod products;
 pub mod reference_core;
