@@ -17,6 +17,10 @@
 //! path is NFC without conversion, and non-ASCII input fails closed, so no
 //! ambiguous normalized duplicate can arise.
 //!
+//! [`crate::distribution::ndc_wire`] is the single canonical wire mapping. This
+//! module produces manifest bytes only through that mapping; it owns no
+//! second serialization of the manifest.
+//!
 //! Publication moves one complete, synced staging directory into its final
 //! name with a single no-replace directory rename. Linux uses
 //! `renameat2(RENAME_NOREPLACE)` and macOS uses `renamex_np(RENAME_EXCL)`;
@@ -149,6 +153,10 @@ pub enum ProducerError {
     /// Correction lineage failed strict validation.
     #[error("invalid lineage: {0}")]
     InvalidLineage(String),
+
+    /// The canonical wire mapping refused the supplied manifest or evidence.
+    #[error("canonical wire mapping failed: {0}")]
+    WireMapping(String),
 
     /// Signing configuration failed strict validation or self-check.
     #[error("invalid signature configuration: {0}")]
@@ -706,6 +714,10 @@ pub struct BuildRequest<'a> {
     pub commit_position: &'a str,
     /// Complete typed manifest without digests of itself.
     pub manifest: &'a ReleaseManifest,
+    /// Typed evidence supplement required by the canonical wire mapping.
+    pub evidence: &'a crate::distribution::ndc_wire::EvidenceSpec,
+    /// Event types observed in the validated artifact record streams.
+    pub observed_event_types: &'a BTreeSet<String>,
     /// Artifact inputs in any order; the producer sorts them canonically.
     pub artifacts: &'a [ArtifactInput],
     /// Injected signing material.
@@ -1252,43 +1264,6 @@ impl ToJcs for PublicationIdentity {
     }
 }
 
-impl ToJcs for ReleaseManifest {
-    fn to_jcs(&self) -> Result<JcsValue, ProducerError> {
-        Ok(jcs_object(vec![
-            (
-                "schema_version",
-                jcs_integer(u64::from(self.schema_version))?,
-            ),
-            (
-                "contract_version",
-                jcs_string(self.contract_version.clone()),
-            ),
-            (
-                "contract_revision",
-                jcs_string(self.contract_revision.clone()),
-            ),
-            ("release_identity", self.release_identity.to_jcs()?),
-            ("source_scope", self.source_scope.to_jcs()?),
-            ("producer_activity", self.producer_activity.to_jcs()?),
-            ("rights", self.rights.to_jcs()?),
-            ("coverage", self.coverage.to_jcs()?),
-            ("lineage", self.lineage.to_jcs()?),
-            ("schema_versions", self.schema_versions.to_jcs()?),
-            ("digests", self.digests.to_jcs()?),
-            ("publication_identity", self.publication_identity.to_jcs()?),
-            (
-                "artifacts",
-                JcsValue::Array(
-                    self.artifacts
-                        .iter()
-                        .map(ToJcs::to_jcs)
-                        .collect::<Result<Vec<_>, _>>()?,
-                ),
-            ),
-        ]))
-    }
-}
-
 impl ToJcs for SignatureSidecar {
     fn to_jcs(&self) -> Result<JcsValue, ProducerError> {
         Ok(jcs_object(vec![
@@ -1522,14 +1497,6 @@ pub fn canonicalize_strict(
 pub fn parse_jcs_value(text: &str) -> Result<JcsValue, ProducerError> {
     serde_json::from_str::<JcsValue>(text)
         .map_err(|error| ProducerError::InvalidJson(error.to_string()))
-}
-
-/// Produce the canonical bytes `M` for a complete typed manifest.
-pub fn canonicalize_manifest(
-    manifest: &ReleaseManifest,
-    policy: &ResourcePolicy,
-) -> Result<Vec<u8>, ProducerError> {
-    canonicalize_strict(&manifest.to_jcs()?, policy)
 }
 
 /// Lowercase hex encoding helper for digests and signatures.
@@ -2086,7 +2053,14 @@ fn prepare_release(request: &BuildRequest<'_>) -> Result<PreparedRelease, Produc
     let mut manifest = request.manifest.clone();
     manifest.artifacts = descriptors.clone();
     manifest.digests.data_sha256 = data_sha256.clone();
-    let manifest_bytes = canonicalize_manifest(&manifest, request.policy)?;
+    let wire_manifest = crate::distribution::ndc_wire::map_manifest(
+        &manifest,
+        request.evidence,
+        &data_sha256,
+        request.observed_event_types,
+    )
+    .map_err(|error| ProducerError::WireMapping(error.to_string()))?;
+    let manifest_bytes = canonicalize_strict(&wire_manifest, request.policy)?;
     if manifest_bytes.len() > request.policy.max_manifest_bytes as usize {
         return Err(ProducerError::PolicyExceeded(
             "canonical manifest exceeds policy".to_owned(),
@@ -2248,6 +2222,7 @@ fn read_stage_operations(
 fn validate_artifact_set(
     directory: &Path,
     evidence: &PublicationEvidence,
+    policy: &ResourcePolicy,
 ) -> Result<(), ProducerError> {
     let entries = fs::read_dir(directory)
         .map_err(|error| io_error(&format!("read release {}", directory.display()), error))?;
@@ -2256,16 +2231,43 @@ fn validate_artifact_set(
         let entry = entry.map_err(|error| io_error("read release entry", error))?;
         names.insert(entry.file_name().to_string_lossy().into_owned());
     }
-    let mut expected = BTreeSet::new();
-    expected.insert(MANIFEST_FILE_NAME.to_owned());
-    expected.insert(SIDECAR_FILE_NAME.to_owned());
-    for path in &evidence.artifact_paths {
-        let file_name = path.rsplit('/').next().unwrap_or(path).to_owned();
-        expected.insert(file_name);
-    }
-    if names != expected {
+    let expected_top: BTreeSet<String> = [
+        MANIFEST_FILE_NAME.to_owned(),
+        SIDECAR_FILE_NAME.to_owned(),
+        ARTIFACT_DIRECTORY.to_owned(),
+    ]
+    .into_iter()
+    .collect();
+    if names != expected_top {
         return Err(ProducerError::ArtifactSetMismatch(format!(
-            "release {} file set differs from the declared inventory",
+            "release {} top-level file set differs from manifest, sidecar and artifacts",
+            evidence.release_id
+        )));
+    }
+    let artifact_root = directory.join(ARTIFACT_DIRECTORY);
+    let artifact_entries = fs::read_dir(&artifact_root)
+        .map_err(|error| io_error("read staged artifact directory", error))?;
+    let mut artifact_names = BTreeSet::new();
+    for entry in artifact_entries {
+        let entry = entry.map_err(|error| io_error("read staged artifact entry", error))?;
+        artifact_names.insert(entry.file_name().to_string_lossy().into_owned());
+    }
+    let mut expected_artifacts = BTreeSet::new();
+    for path in &evidence.artifact_paths {
+        validate_artifact_path(path, policy)?;
+        let relative = path
+            .strip_prefix(&format!("{ARTIFACT_DIRECTORY}/"))
+            .ok_or_else(|| {
+                ProducerError::InvalidArtifactPath(
+                    path.clone(),
+                    "declared artifact path is not release-relative under artifacts/".to_owned(),
+                )
+            })?;
+        expected_artifacts.insert(relative.to_owned());
+    }
+    if artifact_names != expected_artifacts {
+        return Err(ProducerError::ArtifactSetMismatch(format!(
+            "release {} artifact set differs from the declared inventory",
             evidence.release_id
         )));
     }
@@ -2283,12 +2285,19 @@ fn validate_artifact_set(
         .iter()
         .zip(&evidence.artifact_stored_sha256)
     {
-        let file_name = path.rsplit('/').next().unwrap_or(path);
-        let bytes = fs::read(directory.join(file_name))
-            .map_err(|error| io_error(&format!("read staged artifact {file_name}"), error))?;
+        let relative = path
+            .strip_prefix(&format!("{ARTIFACT_DIRECTORY}/"))
+            .ok_or_else(|| {
+                ProducerError::InvalidArtifactPath(
+                    path.clone(),
+                    "declared artifact path is not release-relative under artifacts/".to_owned(),
+                )
+            })?;
+        let bytes = fs::read(artifact_root.join(relative))
+            .map_err(|error| io_error(&format!("read staged artifact {relative}"), error))?;
         if hex_encode(&sha256(&bytes)) != *digest {
             return Err(ProducerError::PublicationEvidence(format!(
-                "artifact digest differs for {file_name}"
+                "artifact digest differs for {relative}"
             )));
         }
     }
@@ -2564,7 +2573,7 @@ pub fn recover_interrupted(
                 "durable receipt without a final release directory".to_owned(),
             ));
         }
-        validate_artifact_set(&final_dir, evidence)?;
+        validate_artifact_set(&final_dir, evidence, policy)?;
         let marker = ledger.join(format!("{}.available", evidence.release_id));
         if !marker.exists() {
             write_new_file(&marker, operation.operation_id.as_bytes())?;
@@ -2574,7 +2583,7 @@ pub fn recover_interrupted(
         return Ok(RecoveryOutcome::AlreadyAvailable);
     }
     if final_dir.exists() {
-        validate_artifact_set(&final_dir, evidence)?;
+        validate_artifact_set(&final_dir, evidence, policy)?;
         let bytes = canonicalize_strict(&recovery_receipt(evidence).to_jcs()?, policy)?;
         let mut bytes = bytes;
         bytes.push(b'\n');
@@ -2598,7 +2607,7 @@ pub fn recover_interrupted(
                 "incomplete staging evidence; publication is not acknowledged".to_owned(),
             ));
         }
-        validate_artifact_set(&staging, evidence)?;
+        validate_artifact_set(&staging, evidence, policy)?;
         sync_directory(&staging)?;
         let receipt = recovery_receipt(evidence);
         finalize_publication(
@@ -2655,9 +2664,12 @@ fn build_release_inner(
 
     write_new_file(&staging.join(MANIFEST_FILE_NAME), &prepared.manifest_bytes)?;
     write_new_file(&staging.join(SIDECAR_FILE_NAME), &prepared.sidecar_bytes)?;
+    let artifact_root = staging.join(ARTIFACT_DIRECTORY);
+    fs::create_dir(&artifact_root)
+        .map_err(|error| io_error("create staging artifact directory", error))?;
     for (path, bytes) in &prepared.artifacts {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        write_new_file(&staging.join(name), bytes)?;
+        validate_artifact_path(path, request.policy)?;
+        write_new_file(&staging.join(path), bytes)?;
     }
     let mut written = operation.clone();
     written.stage = PublicationState::FilesWritten;
@@ -2669,7 +2681,7 @@ fn build_release_inner(
     let mut synced_staging = operation.clone();
     synced_staging.stage = PublicationState::StagingDirFsynced;
     write_stage(request.ledger_dir, &synced_staging, 3, request.policy)?;
-    validate_artifact_set(&staging, &prepared.evidence)?;
+    validate_artifact_set(&staging, &prepared.evidence, request.policy)?;
     let final_dir = request.release_root.join(&prepared.evidence.release_id);
     finalize_publication(
         request.release_root,
@@ -2713,9 +2725,14 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::distribution::ndc_wire;
     use tempfile::TempDir;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    const SPEC: &str = include_str!(
+        "../../docs/specifications/ndc-conformance-producer-spec-example-2026-11-24.json"
+    );
 
     fn test_policy() -> ResourcePolicy {
         ResourcePolicy {
@@ -2728,9 +2745,9 @@ mod tests {
             max_record_bytes: 1_000,
             max_records_per_artifact: 100,
             max_path_component_bytes: 128,
-            max_nesting_depth: 16,
-            max_object_members: 32,
-            max_array_elements: 32,
+            max_nesting_depth: 32,
+            max_object_members: 64,
+            max_array_elements: 64,
             max_sidecar_bytes: 4_096,
         }
     }
@@ -2741,70 +2758,19 @@ mod tests {
         (signing, verifying)
     }
 
+    fn test_spec() -> ndc_wire::ConformanceSpec {
+        ndc_wire::parse_conformance_spec(SPEC).expect("embedded conformance spec parses")
+    }
+
     fn test_manifest(release_id: &str) -> ReleaseManifest {
-        ReleaseManifest {
-            schema_version: MANIFEST_SCHEMA_VERSION,
-            contract_version: "v2".to_owned(),
-            contract_revision: "review-7".to_owned(),
-            release_identity: ReleaseIdentity {
-                release_id: release_id.to_owned(),
-                release_version: "1".to_owned(),
-                as_of_ns: "1000".to_owned(),
-                publication_state: PublicationState::Available,
-                created_at_utc_ns: "1100".to_owned(),
-            },
-            source_scope: SourceScope {
-                provider_id: "provider-abstract".to_owned(),
-                source_product_id: "product-abstract".to_owned(),
-                venue_id: None,
-                segment_id: None,
-                dataset_id: "dataset-abstract".to_owned(),
-            },
-            producer_activity: ProducerActivity {
-                performed_operations: vec!["op-abstract".to_owned()],
-                operation_evidence: vec!["evidence-abstract".to_owned()],
-            },
-            rights: RightsEvidence {
-                permission_grants: vec![],
-                document_references: vec![],
-                reviewed_attestations: vec![],
-            },
-            coverage: CoverageEvidence {
-                dimensions: vec![CoverageDimension {
-                    dimension_id: "dimension-abstract".to_owned(),
-                    universe_id: "universe-abstract".to_owned(),
-                    numerator: 3,
-                    denominator: 4,
-                    verdict: "UNKNOWN".to_owned(),
-                    evidence_reference: "coverage-ref".to_owned(),
-                }],
-            },
-            lineage: Lineage {
-                raw_archive_reference: "archive-ref".to_owned(),
-                raw_archive_sha256: "00".repeat(32),
-                transformation_record: "transform-ref".to_owned(),
-                knowledge_time_ns: "900".to_owned(),
-                revision: 2,
-                supersedes: None,
-            },
-            schema_versions: SchemaVersions {
-                contract_version: "v2".to_owned(),
-                normalizer_version: "normalizer-1".to_owned(),
-                payload_schema_version: "payload-1".to_owned(),
-                envelope_version: "envelope-1".to_owned(),
-            },
-            digests: ManifestDigests {
-                data_sha256: "00".repeat(32),
-                digest_algorithm: DIGEST_ALGORITHM.to_owned(),
-            },
-            publication_identity: PublicationIdentity {
-                publisher_identity: "publisher-abstract".to_owned(),
-                signing_key_id: "test-key-1".to_owned(),
-                signature_reference: SIDECAR_FILE_NAME.to_owned(),
-                archive_reference: "archive-ref".to_owned(),
-            },
-            artifacts: vec![],
-        }
+        let mut manifest = test_spec().manifest;
+        manifest.release_identity.release_id = release_id.to_owned();
+        manifest.lineage.supersedes = None;
+        manifest
+    }
+
+    fn test_evidence() -> ndc_wire::EvidenceSpec {
+        test_spec().evidence
     }
 
     fn record(text: &str, policy: &ResourcePolicy) -> Result<CanonicalRecord, ProducerError> {
@@ -2896,14 +2862,18 @@ mod tests {
         let signature = SignatureConfig {
             signing_key: signing,
             verifying_key: verifying,
-            key_id: "test-key-1",
+            key_id: &manifest.publication_identity.signing_key_id,
         };
+        let evidence = test_evidence();
+        let observed_event_types = BTreeSet::new();
         let request = BuildRequest {
             release_root: root,
             ledger_dir: ledger,
             operation_id,
             commit_position: "position-1",
             manifest,
+            evidence: &evidence,
+            observed_event_types: &observed_event_types,
             artifacts,
             signature,
             policy,
@@ -2932,6 +2902,42 @@ mod tests {
             "operation-1",
             PublicationFaults::default(),
         )
+    }
+
+    fn build_from_spec(
+        spec: &ndc_wire::ConformanceSpec,
+        policy: &ResourcePolicy,
+        root: &Path,
+        ledger: &Path,
+    ) -> Result<BuildOutcome, ProducerError> {
+        let (signing, verifying) = test_keys();
+        let (artifacts, observed) = ndc_wire::spec_to_build_inputs(spec, policy)
+            .map_err(|error| ProducerError::WireMapping(error.to_string()))?;
+        let receipts: Vec<PublicationReceipt> = Vec::new();
+        let lineage = LineageContext {
+            predecessor: None,
+            known_receipts: &receipts,
+            now_ns: 10_000,
+        };
+        let signature = SignatureConfig {
+            signing_key: &signing,
+            verifying_key: &verifying,
+            key_id: &spec.manifest.publication_identity.signing_key_id,
+        };
+        let request = BuildRequest {
+            release_root: root,
+            ledger_dir: ledger,
+            operation_id: "operation-spec",
+            commit_position: "position-spec",
+            manifest: &spec.manifest,
+            evidence: &spec.evidence,
+            observed_event_types: &observed,
+            artifacts: &artifacts,
+            signature,
+            policy,
+            lineage,
+        };
+        build_release(&request)
     }
 
     fn operation_from_evidence(
@@ -3150,14 +3156,39 @@ mod tests {
     #[test]
     fn manifest_bytes_are_deterministic_and_self_digest_free() -> TestResult {
         let policy = test_policy();
+        let (signing, verifying) = test_keys();
         let manifest = test_manifest("release-det");
-        let first = canonicalize_manifest(&manifest, &policy)?;
-        let second = canonicalize_manifest(&manifest, &policy)?;
+        let record = sequenced(r#"{"kind":"abstract"}"#, 1, &policy)?;
+        let artifacts = vec![sequenced_artifact(
+            "artifacts/a.jsonl",
+            "partition-a",
+            0,
+            vec![record],
+        )];
+        let temp = TempDir::new()?;
+        let first = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &temp.path().join("root-one"),
+            &temp.path().join("ledger-one"),
+        )?;
+        let second = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &temp.path().join("root-two"),
+            &temp.path().join("ledger-two"),
+        )?;
         assert_eq!(
-            first, second,
-            "identical typed input yields identical bytes"
+            first.manifest_bytes, second.manifest_bytes,
+            "identical typed input yields identical canonical manifest bytes"
         );
-        let text = String::from_utf8(first)?;
+        let text = String::from_utf8(first.manifest_bytes)?;
         assert!(
             !text.contains("manifest_sha256"),
             "no self-digest in manifest"
@@ -3173,14 +3204,31 @@ mod tests {
     #[test]
     fn manifest_digest_tampering_is_detected() -> TestResult {
         let policy = test_policy();
+        let (signing, verifying) = test_keys();
         let manifest = test_manifest("release-tamper");
-        let original = canonicalize_manifest(&manifest, &policy)?;
-        let mut tampered = original.clone();
+        let record = sequenced(r#"{"kind":"abstract"}"#, 1, &policy)?;
+        let artifacts = vec![sequenced_artifact(
+            "artifacts/a.jsonl",
+            "partition-a",
+            0,
+            vec![record],
+        )];
+        let temp = TempDir::new()?;
+        let outcome = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &temp.path().join("root"),
+            &temp.path().join("ledger"),
+        )?;
+        let mut tampered = outcome.manifest_bytes.clone();
         if let Some(byte) = tampered.last_mut() {
             *byte = b' ';
         }
         assert_ne!(
-            sha256(&original),
+            sha256(&outcome.manifest_bytes),
             sha256(&tampered),
             "a changed canonical byte changes the digest"
         );
@@ -3457,7 +3505,7 @@ mod tests {
             artifact_stored_sha256: vec!["22".repeat(32)],
         };
         let temp = TempDir::new()?;
-        let result = validate_artifact_set(temp.path(), &evidence);
+        let result = validate_artifact_set(temp.path(), &evidence, &test_policy());
         assert!(
             matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
             "missing declared artifact fails closed"
@@ -3845,7 +3893,11 @@ mod tests {
             &policy,
             "operation-before-rename",
         )?;
-        validate_artifact_set(&root.join(".staging-operation-before-rename"), &evidence)?;
+        validate_artifact_set(
+            &root.join(".staging-operation-before-rename"),
+            &evidence,
+            &policy,
+        )?;
         assert!(
             !ledger.join("release-before-rename.receipt.json").exists(),
             "no acknowledgement exists before the rename"
@@ -3968,7 +4020,11 @@ mod tests {
                 );
             }
         }
-        validate_artifact_set(&root.join("release-concurrent"), &winners[0].evidence)?;
+        validate_artifact_set(
+            &root.join("release-concurrent"),
+            &winners[0].evidence,
+            &policy,
+        )?;
         let receipts = fs::read_dir(&ledger)?
             .filter(|entry| {
                 entry.as_ref().is_ok_and(|item| {
@@ -4021,7 +4077,7 @@ mod tests {
         )?;
         evidence.publication_operation_id = "operation-parent-fault".to_owned();
         let final_dir = root.join("release-parent-fault");
-        validate_artifact_set(&final_dir, &evidence)?;
+        validate_artifact_set(&final_dir, &evidence, &policy)?;
         assert_eq!(
             last_stage(&ledger, "operation-parent-fault")?,
             PublicationState::AtomicNoReplaceRename,
@@ -4222,7 +4278,11 @@ mod tests {
             &policy,
             "operation-incomplete",
         )?;
-        fs::remove_file(root.join(".staging-operation-incomplete").join("a.jsonl"))?;
+        fs::remove_file(
+            root.join(".staging-operation-incomplete")
+                .join("artifacts")
+                .join("a.jsonl"),
+        )?;
         clear_stages(&ledger, "operation-incomplete")?;
         write_stage_sequence(
             &ledger,
@@ -4413,7 +4473,7 @@ mod tests {
             root.join("release-stage-recovery").exists(),
             "final directory exists after staged recovery"
         );
-        validate_artifact_set(&root.join("release-stage-recovery"), &evidence)?;
+        validate_artifact_set(&root.join("release-stage-recovery"), &evidence, &policy)?;
         Ok(())
     }
 
@@ -4593,7 +4653,11 @@ mod tests {
         let secret = signing.to_bytes();
         let mut files = vec![root.join("release-no-key").join(MANIFEST_FILE_NAME)];
         files.push(root.join("release-no-key").join(SIDECAR_FILE_NAME));
-        files.push(root.join("release-no-key").join("a.jsonl"));
+        files.push(
+            root.join("release-no-key")
+                .join("artifacts")
+                .join("a.jsonl"),
+        );
         for path in files {
             let bytes = fs::read(path)?;
             assert!(
@@ -4602,5 +4666,454 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    #[test]
+    fn build_release_publishes_artifacts_directory_layout() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-layout");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("root");
+        build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &temp.path().join("ledger"),
+        )?;
+        let release = root.join("release-layout");
+        let mut top = Vec::new();
+        for entry in fs::read_dir(&release)? {
+            top.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        top.sort();
+        assert_eq!(
+            top,
+            vec!["artifacts", "manifest.json", "signature.json"],
+            "published release has exactly the manifest, sidecar and artifacts directory"
+        );
+        assert!(
+            release.join("artifacts").join("a.jsonl").is_file(),
+            "artifact is stored at its declared relative path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn declared_relative_paths_are_not_flattened_to_root() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-no-flatten");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact(
+            "artifacts/named-artifact.jsonl",
+            "part",
+            0,
+            records,
+        )];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("root");
+        let outcome = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &temp.path().join("ledger"),
+        )?;
+        let release = root.join("release-no-flatten");
+        assert!(
+            !release.join("named-artifact.jsonl").exists(),
+            "no artifact is written to the release root"
+        );
+        assert!(
+            release
+                .join("artifacts")
+                .join("named-artifact.jsonl")
+                .is_file(),
+            "the declared artifacts path is preserved verbatim"
+        );
+        assert_eq!(
+            outcome.evidence.artifact_paths,
+            vec!["artifacts/named-artifact.jsonl".to_owned()],
+            "evidence retains the declared relative path"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_file_set_rejects_an_extra_artifact() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-extra");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("root");
+        let outcome = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &temp.path().join("ledger"),
+        )?;
+        let extra = root
+            .join("release-extra")
+            .join("artifacts")
+            .join("extra.jsonl");
+        fs::write(&extra, b"unexpected")?;
+        let result = validate_artifact_set(&root.join("release-extra"), &outcome.evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
+            "an extra file under artifacts/ fails the exact-set check"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_file_set_rejects_a_missing_artifact() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-missing-file");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("root");
+        let outcome = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &temp.path().join("ledger"),
+        )?;
+        fs::remove_file(
+            root.join("release-missing-file")
+                .join("artifacts")
+                .join("a.jsonl"),
+        )?;
+        let result = validate_artifact_set(
+            &root.join("release-missing-file"),
+            &outcome.evidence,
+            &policy,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
+            "a missing declared artifact fails the exact-set check"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn declared_path_outside_artifacts_is_rejected() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-outside");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("outside.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let result = build_fixture(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &temp.path().join("root"),
+            &temp.path().join("ledger"),
+        );
+        assert!(
+            matches!(result, Err(ProducerError::InvalidArtifactPath(..))),
+            "a declared path outside artifacts/ fails closed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_manifest_bytes_match_the_wire_mapping() -> TestResult {
+        let policy = test_policy();
+        let mut spec = test_spec();
+        spec.manifest.lineage.supersedes = None;
+        let wire_key = SigningKey::from_bytes(&ndc_wire::CONFORMANCE_SIGNING_SEED);
+        let wire_verifying = wire_key.verifying_key();
+        let (wire, _) =
+            ndc_wire::build_conformance_release(&spec, &policy, &wire_key, &wire_verifying)?;
+        let temp = TempDir::new()?;
+        let produced = build_from_spec(
+            &spec,
+            &policy,
+            &temp.path().join("root"),
+            &temp.path().join("ledger"),
+        )?;
+        assert_eq!(
+            produced.manifest_bytes, wire.manifest_bytes,
+            "production builder and wire mapping emit identical manifest bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sidecar_digest_and_signature_agree_with_canonical_bytes() -> TestResult {
+        let policy = test_policy();
+        let mut spec = test_spec();
+        spec.manifest.lineage.supersedes = None;
+        let temp = TempDir::new()?;
+        let produced = build_from_spec(
+            &spec,
+            &policy,
+            &temp.path().join("root"),
+            &temp.path().join("ledger"),
+        )?;
+        let digest = hex_encode(&sha256(&produced.manifest_bytes));
+        let text = String::from_utf8(produced.sidecar_bytes.clone())?;
+        let value = parse_jcs_value(text.trim_end_matches('\n'))?;
+        let JcsValue::Object(fields) = value else {
+            return Err("sidecar is not an object".into());
+        };
+        let mut claimed = "";
+        let mut signature_b64 = "";
+        for (name, member) in &fields {
+            let JcsValue::String(text) = member else {
+                continue;
+            };
+            match name.as_str() {
+                "manifest_sha256" => claimed = text,
+                "signature_b64" => signature_b64 = text,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            claimed, digest,
+            "sidecar digest binds the production canonical bytes"
+        );
+        let mut message = SIGNING_DOMAIN.to_vec();
+        message.extend_from_slice(&sha256(&produced.manifest_bytes));
+        let bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, signature_b64)?;
+        let fixed: [u8; 64] = bytes.try_into().map_err(|_| "signature is not 64 bytes")?;
+        let signature = ed25519_dalek::Signature::from_bytes(&fixed);
+        let (_, verifying) = test_keys();
+        verifying
+            .verify(&message, &signature)
+            .map_err(|error| format!("injected key rejected the sidecar signature: {error}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_carries_wire_only_members() -> TestResult {
+        let policy = test_policy();
+        let mut spec = test_spec();
+        spec.manifest.lineage.supersedes = None;
+        let temp = TempDir::new()?;
+        let produced = build_from_spec(
+            &spec,
+            &policy,
+            &temp.path().join("root"),
+            &temp.path().join("ledger"),
+        )?;
+        let value = parse_jcs_value(&String::from_utf8(produced.manifest_bytes.clone())?)?;
+        let JcsValue::Object(entries) = value else {
+            return Err("manifest is not an object".into());
+        };
+        assert!(
+            entries.iter().any(|(name, _)| name == "schema_versions"),
+            "wire-only schema versions section is present"
+        );
+        assert!(
+            text_contains(&produced.manifest_bytes, "payload_schemas"),
+            "wire-only payload schema registry is present"
+        );
+        assert_eq!(
+            entries.len(),
+            13,
+            "manifest has exactly thirteen wire members"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn builder_does_not_invent_rights_grants() -> TestResult {
+        let policy = test_policy();
+        let mut spec = test_spec();
+        spec.manifest.lineage.supersedes = None;
+        let declared = spec.manifest.rights.permission_grants.len();
+        let temp = TempDir::new()?;
+        let produced = build_from_spec(
+            &spec,
+            &policy,
+            &temp.path().join("root"),
+            &temp.path().join("ledger"),
+        )?;
+        let value = parse_grant_count(&produced.manifest_bytes)?;
+        assert_eq!(
+            value, declared,
+            "the builder emits exactly the declared rights grants"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staging_writes_artifacts_directory_before_rename() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-staged-layout");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("root");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_before_rename: true,
+            ..PublicationFaults::default()
+        };
+        let result = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-staged-layout",
+            faults,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the injected pre-rename failure is typed"
+        );
+        let staged = root.join(".staging-operation-staged-layout");
+        assert!(
+            staged.join("artifacts").join("a.jsonl").is_file(),
+            "staging holds the artifact under artifacts/ before publication"
+        );
+        assert!(
+            !staged.join("a.jsonl").exists(),
+            "staging never flattens the artifact into its root"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_with_artifacts_layout_succeeds() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-recovery-layout");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("root");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_before_rename: true,
+            ..PublicationFaults::default()
+        };
+        let interrupted = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-recovery-layout",
+            faults,
+        );
+        assert!(
+            matches!(interrupted, Err(ProducerError::Io(..))),
+            "the injected pre-rename failure is typed"
+        );
+        let evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-recovery-layout",
+        )?;
+        let outcome = recover_interrupted(&root, &ledger, &evidence, &policy)?;
+        assert_eq!(
+            outcome,
+            RecoveryOutcome::RecoveredStaged,
+            "complete staging is promoted after verification"
+        );
+        let release = root.join("release-recovery-layout");
+        assert!(
+            release.join("artifacts").join("a.jsonl").is_file(),
+            "recovered release retains the artifacts directory layout"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_detects_an_artifact_in_the_wrong_directory() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let manifest = test_manifest("release-wrong-dir");
+        let records = vec![sequenced("{\"alpha\":\"aa\"}", 1, &policy)?];
+        let artifacts = vec![sequenced_artifact("artifacts/a.jsonl", "part", 0, records)];
+        let (signing, verifying) = test_keys();
+        let root = temp.path().join("root");
+        let ledger = temp.path().join("ledger");
+        let faults = PublicationFaults {
+            fail_before_rename: true,
+            ..PublicationFaults::default()
+        };
+        let interrupted = build_with_faults(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-wrong-dir",
+            faults,
+        );
+        assert!(
+            matches!(interrupted, Err(ProducerError::Io(..))),
+            "the injected pre-rename failure is typed"
+        );
+        let staged = root.join(".staging-operation-wrong-dir");
+        fs::rename(
+            staged.join("artifacts").join("a.jsonl"),
+            staged.join("a.jsonl"),
+        )?;
+        let evidence = evidence_for_operation(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            "operation-wrong-dir",
+        )?;
+        let result = recover_interrupted(&root, &ledger, &evidence, &policy);
+        assert!(
+            matches!(result, Err(ProducerError::ArtifactSetMismatch(_))),
+            "an artifact outside artifacts/ is refused by recovery"
+        );
+        Ok(())
+    }
+
+    fn text_contains(bytes: &[u8], needle: &str) -> bool {
+        std::str::from_utf8(bytes).is_ok_and(|text| text.contains(needle))
+    }
+
+    fn parse_grant_count(bytes: &[u8]) -> Result<usize, Box<dyn StdError>> {
+        let text = std::str::from_utf8(bytes)?;
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        let grants = value
+            .get("rights")
+            .and_then(|rights| rights.get("permission_grants"))
+            .and_then(serde_json::Value::as_array)
+            .ok_or("rights.permission_grants is absent")?;
+        Ok(grants.len())
     }
 }
