@@ -76,8 +76,15 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// Sidecar layout version implemented here.
 pub const SIDECAR_SCHEMA_VERSION: u32 = 1;
 
-/// Publication journal layout version carried by each stage record.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 1;
+/// Publication journal layout version carried by each new stage record.
+///
+/// Version 2 adds the directory-entry and tree barriers defined by
+/// FB-PUB-019. Version 1 records stay immutable and readable as legacy
+/// evidence; see the dated record for the compatibility rule.
+pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
+
+/// Legacy journal layout version retained for immutable schema-v1 records.
+pub const LEGACY_JOURNAL_SCHEMA_VERSION: u32 = 1;
 
 /// Predecessor digest bound to the first record of a journal chain.
 pub const JOURNAL_GENESIS_DIGEST: &str =
@@ -218,32 +225,50 @@ pub enum RecoveryOutcome {
 }
 
 /// State in the ratified publication state machine.
+///
+/// The eight first-declared variants are the immutable schema-v1 states. No
+/// v1 variant is redefined in place: its wire literal, digest input and rank
+/// stay as published. Schema v2 adds four variants for the directory-entry
+/// barriers. `Available` is shared by both versions and keeps rank seven so
+/// recovery treats the final acknowledgement identically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PublicationState {
-    /// Exclusive sibling staging directory exists.
+    /// Legacy v1: exclusive sibling staging directory exists.
     #[serde(rename = "STAGING_CREATED")]
     StagingCreated,
-    /// Every release file is written.
+    /// Legacy v1: every release file is written.
     #[serde(rename = "FILES_WRITTEN")]
     FilesWritten,
-    /// Every release file is synced.
+    /// Legacy v1: every release file is synced.
     #[serde(rename = "FILES_SYNCED")]
     FilesSynced,
-    /// The staging directory is synced.
+    /// Legacy v1: the staging directory is synced.
     #[serde(rename = "STAGING_DIR_FSYNCED")]
     StagingDirFsynced,
-    /// The no-replace finalization primitive has run.
+    /// Legacy v1: the no-replace finalization primitive has run.
     #[serde(rename = "ATOMIC_NO_REPLACE_RENAME")]
     AtomicNoReplaceRename,
-    /// The parent directory is synced.
+    /// Legacy v1: the parent directory is synced.
     #[serde(rename = "PARENT_DIR_FSYNCED")]
     ParentDirFsynced,
-    /// The durable receipt exists.
+    /// Legacy v1: the durable receipt exists.
     #[serde(rename = "DURABLE_PUBLICATION_RECEIPT")]
     DurablePublicationReceipt,
-    /// The availability marker exists.
+    /// The availability marker exists; shared by schema v1 and v2.
     #[serde(rename = "AVAILABLE")]
     Available,
+    /// Schema v2: operation intent is durable before a release-root change.
+    #[serde(rename = "OPERATION_INTENT_DURABLE")]
+    OperationIntentDurable,
+    /// Schema v2: the staging entry in the release root is durable.
+    #[serde(rename = "STAGING_ENTRY_DURABLE")]
+    StagingEntryDurable,
+    /// Schema v2: the complete staging tree is durable.
+    #[serde(rename = "STAGING_TREE_DURABLE")]
+    StagingTreeDurable,
+    /// Schema v2: the final release name is durable after the rename.
+    #[serde(rename = "RENAME_DURABLE")]
+    RenameDurable,
 }
 
 impl PublicationState {
@@ -259,26 +284,37 @@ impl PublicationState {
             Self::ParentDirFsynced => "PARENT_DIR_FSYNCED",
             Self::DurablePublicationReceipt => "DURABLE_PUBLICATION_RECEIPT",
             Self::Available => "AVAILABLE",
+            Self::OperationIntentDurable => "OPERATION_INTENT_DURABLE",
+            Self::StagingEntryDurable => "STAGING_ENTRY_DURABLE",
+            Self::StagingTreeDurable => "STAGING_TREE_DURABLE",
+            Self::RenameDurable => "RENAME_DURABLE",
         }
     }
 
     /// Position of this state in the ratified transition sequence.
+    ///
+    /// Ranks are shared across schema versions so cross-version evidence
+    /// checks remain monotonic. The v2 ranks coincide with the v1 barriers
+    /// they replace: tree durability with staging sync and rename durability
+    /// with parent sync.
     #[must_use]
     pub const fn rank(self) -> u8 {
         match self {
-            Self::StagingCreated => 0,
-            Self::FilesWritten => 1,
+            Self::StagingCreated | Self::OperationIntentDurable => 0,
+            Self::FilesWritten | Self::StagingEntryDurable => 1,
             Self::FilesSynced => 2,
-            Self::StagingDirFsynced => 3,
+            Self::StagingDirFsynced | Self::StagingTreeDurable => 3,
             Self::AtomicNoReplaceRename => 4,
-            Self::ParentDirFsynced => 5,
+            Self::ParentDirFsynced | Self::RenameDurable => 5,
             Self::DurablePublicationReceipt => 6,
             Self::Available => 7,
         }
     }
 }
 
-const STAGE_ORDER: [PublicationState; 8] = [
+/// Immutable schema-v1 stage order. Legacy chains are read and reconciled
+/// with this order; no record in the chain is rewritten.
+const V1_STAGE_ORDER: [PublicationState; 8] = [
     PublicationState::StagingCreated,
     PublicationState::FilesWritten,
     PublicationState::FilesSynced,
@@ -288,6 +324,27 @@ const STAGE_ORDER: [PublicationState; 8] = [
     PublicationState::DurablePublicationReceipt,
     PublicationState::Available,
 ];
+
+/// Schema-v2 stage order. Each record follows the durable barrier listed in
+/// the FB-PUB-019 dated record.
+const V2_STAGE_ORDER: [PublicationState; 5] = [
+    PublicationState::OperationIntentDurable,
+    PublicationState::StagingEntryDurable,
+    PublicationState::StagingTreeDurable,
+    PublicationState::RenameDurable,
+    PublicationState::Available,
+];
+
+/// Stage order bound to one journal schema version.
+fn stage_order(schema_version: u32) -> Result<&'static [PublicationState], ProducerError> {
+    match schema_version {
+        LEGACY_JOURNAL_SCHEMA_VERSION => Ok(&V1_STAGE_ORDER),
+        JOURNAL_SCHEMA_VERSION => Ok(&V2_STAGE_ORDER),
+        _ => Err(ProducerError::PublicationJournal(format!(
+            "unsupported journal schema version {schema_version}"
+        ))),
+    }
+}
 
 /// Ordered events emitted by the publication filesystem during recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2280,6 +2337,25 @@ fn write_new_file(path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
         .map_err(|error| io_error(&format!("sync {}", path.display()), error))
 }
 
+/// Write one new regular file without a sync. The caller places the sync
+/// boundary explicitly so a crash between write and sync is observable.
+fn write_release_file(path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| io_error(&format!("create {}", path.display()), error))?;
+    file.write_all(bytes)
+        .map_err(|error| io_error(&format!("write {}", path.display()), error))
+}
+
+fn sync_file(path: &Path) -> Result<(), ProducerError> {
+    let file = File::open(path)
+        .map_err(|error| io_error(&format!("open file {}", path.display()), error))?;
+    file.sync_all()
+        .map_err(|error| io_error(&format!("sync file {}", path.display()), error))
+}
+
 fn sync_directory(path: &Path) -> Result<(), ProducerError> {
     let directory = File::open(path)
         .map_err(|error| io_error(&format!("open directory {}", path.display()), error))?;
@@ -2421,10 +2497,18 @@ fn validate_stage_record(
     bytes: &[u8],
     policy: &ResourcePolicy,
 ) -> Result<(), ProducerError> {
-    if operation.schema_version != JOURNAL_SCHEMA_VERSION {
-        return Err(ProducerError::PublicationJournal(format!(
-            "stage {} carries journal schema version {}",
+    let order = stage_order(operation.schema_version).map_err(|error| {
+        ProducerError::PublicationJournal(format!(
+            "stage {} carries an unsupported journal schema version {}: {error}",
             operation.sequence_number, operation.schema_version
+        ))
+    })?;
+    if !order.contains(&operation.stage) {
+        return Err(ProducerError::PublicationJournal(format!(
+            "stage {} declares {} outside schema version {}",
+            operation.sequence_number,
+            operation.stage.as_str(),
+            operation.schema_version
         )));
     }
     if operation.record_sha256 != journal_checksum(operation, policy)? {
@@ -2494,10 +2578,12 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
             "first journal record lacks the genesis predecessor digest".to_owned(),
         ));
     }
-    if first.stage != PublicationState::StagingCreated {
+    let order = stage_order(first.schema_version)?;
+    if first.stage != order[0] {
         return Err(ProducerError::PublicationJournal(format!(
-            "first journal record declares {} instead of STAGING_CREATED",
-            first.stage.as_str()
+            "first journal record declares {} instead of {}",
+            first.stage.as_str(),
+            order[0].as_str()
         )));
     }
     let mut previous: Option<&PublicationOperation> = None;
@@ -2505,6 +2591,12 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
         let expected_ordinal = u32::try_from(index).map_err(|_| {
             ProducerError::PublicationEvidence("stage ordinal exceeds addressable range".to_owned())
         })?;
+        if operation.schema_version != first.schema_version {
+            return Err(ProducerError::PublicationJournal(format!(
+                "stage {ordinal} carries journal schema version {} instead of {}",
+                operation.schema_version, first.schema_version
+            )));
+        }
         if *ordinal != expected_ordinal {
             return Err(ProducerError::PublicationEvidence(format!(
                 "stage ordinal {ordinal} repeats or skips position {expected_ordinal}"
@@ -2528,8 +2620,10 @@ fn validate_stage_sequence(stages: &[(u32, PublicationOperation)]) -> Result<(),
                 "stage {ordinal} conflicts with the lineage at ordinal 0"
             )));
         }
-        let expected_state = STAGE_ORDER.get(index).ok_or_else(|| {
-            ProducerError::PublicationEvidence("stage history exceeds the state machine".to_owned())
+        let expected_state = order.get(index).ok_or_else(|| {
+            ProducerError::PublicationEvidence(
+                "stage history exceeds the schema state machine".to_owned(),
+            )
         })?;
         if operation.stage != *expected_state {
             return Err(ProducerError::PublicationEvidence(format!(
@@ -2815,6 +2909,79 @@ struct PublicationFaults {
     fail_before_journal_dir_sync_at: Option<u32>,
     /// Fail after the numbered journal ledger directory sync, counted from one.
     fail_after_journal_dir_sync_at: Option<u32>,
+    /// Fail after the staging directory is created and before the root sync.
+    fail_after_staging_mkdir: bool,
+    /// Fail after the staging-entry root sync and before its journal commit.
+    fail_after_release_root_sync: bool,
+    /// Fail after the staging artifacts directory is created.
+    fail_after_artifacts_mkdir: bool,
+    /// Fail after the numbered regular-file write, counted from one.
+    fail_after_file_write_at: Option<u32>,
+    /// Fail after the numbered regular-file sync, counted from one.
+    fail_after_file_sync_at: Option<u32>,
+    /// Fail after the staging artifacts directory sync.
+    fail_after_artifacts_dir_sync: bool,
+    /// Fail after the staging directory sync and before its journal commit.
+    fail_after_staging_dir_sync: bool,
+    /// Fail after the rename and before the release-root sync.
+    fail_after_rename_before_root_sync: bool,
+    /// Fail after the rename root sync and before its journal commit.
+    fail_after_root_sync_before_rename_stage: bool,
+    /// Fail after the receipt file write and before its sync.
+    fail_after_receipt_write: bool,
+    /// Fail after the receipt file sync and before the ledger sync.
+    fail_after_receipt_sync: bool,
+    /// Fail after the receipt ledger sync and before the marker write.
+    fail_after_receipt_ledger_sync: bool,
+    /// Fail after the marker file write and before its sync.
+    fail_after_marker_write: bool,
+    /// Fail after the marker file sync and before the ledger sync.
+    fail_after_marker_sync: bool,
+    /// Fail after the marker ledger sync and before the final journal commit.
+    fail_after_marker_ledger_sync: bool,
+}
+
+/// Ordered filesystem boundary reported by the publication path. Each variant
+/// sits after a completed host operation and before the next durable claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "offline crash tests consume every declared filesystem boundary"
+    )
+)]
+enum PublicationBoundary {
+    /// The staging directory entry was created in the release root.
+    StagingDirectoryCreated,
+    /// The release root was synced after the staging entry was created.
+    StagingEntryRootSynced,
+    /// The staging artifacts directory was created.
+    ArtifactDirectoryCreated,
+    /// One regular file was written; the number counts writes from one.
+    ReleaseFileWritten(u32),
+    /// One regular file was synced; the number counts syncs from one.
+    ReleaseFileSynced(u32),
+    /// The staging artifacts directory was synced.
+    ArtifactDirectorySynced,
+    /// The staging directory was synced.
+    StagingDirectorySynced,
+    /// The no-replace rename committed before any root sync.
+    RenameCommitted,
+    /// The release root was synced after the rename.
+    RenameRootSynced,
+    /// The receipt file was written before its sync.
+    ReceiptFileWritten,
+    /// The receipt file was synced before the ledger sync.
+    ReceiptFileSynced,
+    /// The receipt ledger directory was synced.
+    ReceiptLedgerSynced,
+    /// The availability marker was written before its sync.
+    MarkerFileWritten,
+    /// The availability marker was synced before the ledger sync.
+    MarkerFileSynced,
+    /// The ledger directory was synced after the marker write.
+    MarkerLedgerSynced,
 }
 
 /// Filesystem boundary used by publication and recovery. The production
@@ -2823,6 +2990,9 @@ struct PublicationFaults {
 trait PublicationFs {
     /// Record one logical publication event.
     fn record(&self, event: PublicationRecoveryEvent);
+
+    /// Report one completed filesystem boundary and inject a crash there.
+    fn boundary(&self, boundary: PublicationBoundary) -> Result<(), ProducerError>;
 
     /// Sync the parent that carries a provisioned directory entry.
     fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError>;
@@ -2838,6 +3008,9 @@ trait PublicationFs {
     /// Sync the parent directory that holds the final release name.
     fn sync_release_parent(&self, root: &Path) -> Result<(), ProducerError>;
 
+    /// Sync the release root that carries the staging directory entry.
+    fn sync_staging_entry_parent(&self, root: &Path) -> Result<(), ProducerError>;
+
     /// Create, write and sync one durable receipt file.
     fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError>;
 
@@ -2852,6 +3025,10 @@ struct RealPublicationFs;
 
 impl PublicationFs for RealPublicationFs {
     fn record(&self, _event: PublicationRecoveryEvent) {}
+
+    fn boundary(&self, _boundary: PublicationBoundary) -> Result<(), ProducerError> {
+        Ok(())
+    }
 
     fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError> {
         sync_directory(parent)
@@ -2871,8 +3048,15 @@ impl PublicationFs for RealPublicationFs {
         sync_directory(root)
     }
 
+    fn sync_staging_entry_parent(&self, root: &Path) -> Result<(), ProducerError> {
+        sync_directory(root)
+    }
+
     fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
-        write_new_file(path, bytes)
+        write_release_file(path, bytes)?;
+        self.boundary(PublicationBoundary::ReceiptFileWritten)?;
+        sync_file(path)?;
+        self.boundary(PublicationBoundary::ReceiptFileSynced)
     }
 
     fn sync_receipt_ledger(&self, ledger: &Path) -> Result<(), ProducerError> {
@@ -2880,7 +3064,10 @@ impl PublicationFs for RealPublicationFs {
     }
 
     fn commit_availability_marker(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
-        write_new_file(path, bytes)
+        write_release_file(path, bytes)?;
+        self.boundary(PublicationBoundary::MarkerFileWritten)?;
+        sync_file(path)?;
+        self.boundary(PublicationBoundary::MarkerFileSynced)
     }
 }
 
@@ -2990,11 +3177,13 @@ fn ensure_sibling_release_paths(staging: &Path, final_dir: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Rename a fully synced staging tree with the legacy schema-v1 stage order.
+/// Legacy records stay readable through this path and are not rewritten.
 #[expect(
     clippy::too_many_arguments,
     reason = "the publication boundary carries two paths, operation evidence, a policy, injected faults and a filesystem boundary"
 )]
-fn finalize_publication(
+fn finalize_publication_v1(
     root: &Path,
     ledger: &Path,
     operation: &PublicationOperation,
@@ -3058,6 +3247,77 @@ fn finalize_publication(
     fs.sync_receipt_ledger(ledger)?;
     let mut available = stage_for_state(&cursor, PublicationState::Available)?;
     write_stage(ledger, &mut available, start + 3, policy, fs)?;
+    Ok(())
+}
+
+/// Rename a fully synced staging tree with the schema-v2 stage order. The
+/// rename durable stage follows the release-root sync; the final stage
+/// follows both receipt and marker ledger syncs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the publication boundary carries two paths, operation evidence, a policy, injected faults and a filesystem boundary"
+)]
+fn finalize_publication_v2(
+    root: &Path,
+    ledger: &Path,
+    operation: &PublicationOperation,
+    staging: &Path,
+    final_dir: &Path,
+    receipt: &PublicationReceipt,
+    policy: &ResourcePolicy,
+    faults: PublicationFaults,
+    fs: &dyn PublicationFs,
+) -> Result<(), ProducerError> {
+    ensure_sibling_release_paths(staging, final_dir)?;
+    let start = next_stage_ordinal(ledger, &operation.operation_id, policy)?;
+    let mut cursor = operation.clone();
+
+    if faults.fail_before_rename {
+        return Err(io_error(
+            "injected failure before the directory rename",
+            io::Error::other("injected failure before the directory rename"),
+        ));
+    }
+    atomic_no_replace_rename(staging, final_dir).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            ProducerError::PublicationCollision(operation.release_id.clone())
+        } else {
+            io_error("atomic no-replace directory rename", error)
+        }
+    })?;
+    fs.boundary(PublicationBoundary::RenameCommitted)?;
+    if faults.fail_after_rename_before_stage
+        || faults.fail_after_rename_before_root_sync
+        || faults.fail_after_rename
+    {
+        return Err(io_error(
+            "injected failure after the rename syscall",
+            io::Error::other("injected failure after the rename syscall"),
+        ));
+    }
+    fs.sync_release_parent(root)?;
+    fs.boundary(PublicationBoundary::RenameRootSynced)?;
+    if faults.fail_after_root_sync_before_rename_stage {
+        return Err(io_error(
+            "injected failure after the rename root sync",
+            io::Error::other("injected failure after the rename root sync"),
+        ));
+    }
+    // The rename and its root sync both completed before this record exists.
+    let mut renamed = stage_for_state(&cursor, PublicationState::RenameDurable)?;
+    write_stage(ledger, &mut renamed, start, policy, fs)?;
+    cursor = renamed;
+
+    let receipt_path = ledger.join(format!("{}.receipt.json", receipt.release_id));
+    fs.commit_receipt(&receipt_path, &receipt_file_bytes(receipt, policy)?)?;
+    fs.sync_receipt_ledger(ledger)?;
+
+    let marker = ledger.join(format!("{}.available", receipt.release_id));
+    fs.commit_availability_marker(&marker, operation.operation_id.as_bytes())?;
+    fs.sync_receipt_ledger(ledger)?;
+
+    let mut available = stage_for_state(&cursor, PublicationState::Available)?;
+    write_stage(ledger, &mut available, start + 1, policy, fs)?;
     Ok(())
 }
 
@@ -3172,7 +3432,8 @@ fn recover_final_directory(
         }
     }
 
-    if last.rank() < PublicationState::ParentDirFsynced.rank() {
+    let legacy = operation.schema_version == LEGACY_JOURNAL_SCHEMA_VERSION;
+    if legacy && last.rank() < PublicationState::ParentDirFsynced.rank() {
         fs.sync_release_parent(root)?;
         advance_recovery_stage(
             ledger,
@@ -3184,8 +3445,13 @@ fn recover_final_directory(
         )?;
         last = PublicationState::ParentDirFsynced;
     }
+    let rename_barrier = if legacy {
+        PublicationState::ParentDirFsynced
+    } else {
+        PublicationState::RenameDurable
+    };
     fs.record(PublicationRecoveryEvent::VerifyDurabilityTransition);
-    verify_durable_stage(ledger, evidence, PublicationState::ParentDirFsynced, policy)?;
+    verify_durable_stage(ledger, evidence, rename_barrier, policy)?;
 
     if !receipt_present {
         fs.commit_receipt(
@@ -3194,7 +3460,7 @@ fn recover_final_directory(
         )?;
     }
     fs.sync_receipt_ledger(ledger)?;
-    if last.rank() < PublicationState::DurablePublicationReceipt.rank() {
+    if legacy && last.rank() < PublicationState::DurablePublicationReceipt.rank() {
         advance_recovery_stage(
             ledger,
             evidence,
@@ -3269,25 +3535,48 @@ fn recover_interrupted_inner(
         );
     }
     if staging.exists() {
-        if operation.stage.rank() < PublicationState::StagingDirFsynced.rank() {
+        let legacy = operation.schema_version == LEGACY_JOURNAL_SCHEMA_VERSION;
+        let tree_barrier = if legacy {
+            PublicationState::StagingDirFsynced
+        } else {
+            PublicationState::StagingTreeDurable
+        };
+        if operation.stage.rank() < tree_barrier.rank() {
             return Err(ProducerError::UncertainPublication(
                 "incomplete staging evidence; publication is not acknowledged".to_owned(),
             ));
         }
         validate_artifact_set(&staging, evidence, policy)?;
         sync_directory(&staging)?;
+        if !legacy {
+            sync_directory(&staging.join(ARTIFACT_DIRECTORY))?;
+        }
         let receipt = recovery_receipt(evidence);
-        finalize_publication(
-            root,
-            ledger,
-            &operation,
-            &staging,
-            &final_dir,
-            &receipt,
-            policy,
-            PublicationFaults::default(),
-            fs,
-        )?;
+        if legacy {
+            finalize_publication_v1(
+                root,
+                ledger,
+                &operation,
+                &staging,
+                &final_dir,
+                &receipt,
+                policy,
+                PublicationFaults::default(),
+                fs,
+            )?;
+        } else {
+            finalize_publication_v2(
+                root,
+                ledger,
+                &operation,
+                &staging,
+                &final_dir,
+                &receipt,
+                policy,
+                PublicationFaults::default(),
+                fs,
+            )?;
+        }
         return Ok(RecoveryOutcome::RecoveredStaged);
     }
     if ledger
@@ -3334,9 +3623,12 @@ fn build_release_inner(
             .supersedes_release_id
             .clone(),
         expected_receipt_sha256: prepared.evidence.receipt_sha256.clone(),
-        stage: PublicationState::StagingCreated,
+        stage: PublicationState::OperationIntentDurable,
         record_sha256: String::new(),
     };
+    // Operation intent is committed before the release root changes.
+    write_stage(request.ledger_dir, &mut operation, 0, request.policy, fs)?;
+
     let staging = request.release_root.join(&operation.staging_directory);
     fs::create_dir(&staging).map_err(|error| {
         if error.kind() == std::io::ErrorKind::AlreadyExists {
@@ -3345,36 +3637,46 @@ fn build_release_inner(
             io_error("create staging directory", error)
         }
     })?;
-    write_stage(request.ledger_dir, &mut operation, 0, request.policy, fs)?;
+    fs.boundary(PublicationBoundary::StagingDirectoryCreated)?;
+    fs.sync_staging_entry_parent(request.release_root)?;
+    fs.boundary(PublicationBoundary::StagingEntryRootSynced)?;
+    let mut entry = stage_for_state(&operation, PublicationState::StagingEntryDurable)?;
+    write_stage(request.ledger_dir, &mut entry, 1, request.policy, fs)?;
 
-    write_new_file(&staging.join(MANIFEST_FILE_NAME), &prepared.manifest_bytes)?;
-    write_new_file(&staging.join(SIDECAR_FILE_NAME), &prepared.sidecar_bytes)?;
     let artifact_root = staging.join(ARTIFACT_DIRECTORY);
     fs::create_dir(&artifact_root)
         .map_err(|error| io_error("create staging artifact directory", error))?;
+    fs.boundary(PublicationBoundary::ArtifactDirectoryCreated)?;
+
+    let mut files: Vec<(PathBuf, &[u8])> = vec![
+        (staging.join(MANIFEST_FILE_NAME), &prepared.manifest_bytes),
+        (staging.join(SIDECAR_FILE_NAME), &prepared.sidecar_bytes),
+    ];
     for (path, bytes) in &prepared.artifacts {
         validate_artifact_path(path, request.policy)?;
-        write_new_file(&staging.join(path), bytes)?;
+        files.push((staging.join(path), bytes));
     }
-    let mut written = stage_for_state(&operation, PublicationState::FilesWritten)?;
-    write_stage(request.ledger_dir, &mut written, 1, request.policy, fs)?;
-    let mut synced_files = stage_for_state(&written, PublicationState::FilesSynced)?;
-    write_stage(request.ledger_dir, &mut synced_files, 2, request.policy, fs)?;
+    for (index, (path, bytes)) in files.iter().enumerate() {
+        let ordinal = u32::try_from(index.saturating_add(1)).map_err(|_| {
+            ProducerError::PolicyExceeded("release file count exceeds the journal range".to_owned())
+        })?;
+        write_release_file(path, bytes)?;
+        fs.boundary(PublicationBoundary::ReleaseFileWritten(ordinal))?;
+        sync_file(path)?;
+        fs.boundary(PublicationBoundary::ReleaseFileSynced(ordinal))?;
+    }
+    sync_directory(&artifact_root)?;
+    fs.boundary(PublicationBoundary::ArtifactDirectorySynced)?;
     sync_directory(&staging)?;
-    let mut synced_staging = stage_for_state(&synced_files, PublicationState::StagingDirFsynced)?;
-    write_stage(
-        request.ledger_dir,
-        &mut synced_staging,
-        3,
-        request.policy,
-        fs,
-    )?;
+    fs.boundary(PublicationBoundary::StagingDirectorySynced)?;
+    let mut tree = stage_for_state(&entry, PublicationState::StagingTreeDurable)?;
+    write_stage(request.ledger_dir, &mut tree, 2, request.policy, fs)?;
     validate_artifact_set(&staging, &prepared.evidence, request.policy)?;
     let final_dir = request.release_root.join(&prepared.evidence.release_id);
-    finalize_publication(
+    finalize_publication_v2(
         request.release_root,
         request.ledger_dir,
-        &synced_staging,
+        &tree,
         &staging,
         &final_dir,
         &prepared.receipt,
@@ -3541,6 +3843,7 @@ mod tests {
         provisioning_syncs: Cell<u32>,
         journal_syncs: Cell<u32>,
         events: RefCell<Vec<PublicationRecoveryEvent>>,
+        boundaries: RefCell<Vec<PublicationBoundary>>,
     }
 
     impl RecordingPublicationFs {
@@ -3551,11 +3854,16 @@ mod tests {
                 provisioning_syncs: Cell::new(0),
                 journal_syncs: Cell::new(0),
                 events: RefCell::new(Vec::new()),
+                boundaries: RefCell::new(Vec::new()),
             }
         }
 
         fn events(&self) -> Vec<PublicationRecoveryEvent> {
             self.events.borrow().clone()
+        }
+
+        fn boundaries(&self) -> Vec<PublicationBoundary> {
+            self.boundaries.borrow().clone()
         }
 
         fn journal_sync_count(&self) -> u32 {
@@ -3566,6 +3874,54 @@ mod tests {
     impl PublicationFs for RecordingPublicationFs {
         fn record(&self, event: PublicationRecoveryEvent) {
             self.events.borrow_mut().push(event);
+        }
+
+        fn boundary(&self, boundary: PublicationBoundary) -> Result<(), ProducerError> {
+            self.boundaries.borrow_mut().push(boundary);
+            let failed = match boundary {
+                PublicationBoundary::StagingDirectoryCreated => {
+                    self.faults.fail_after_staging_mkdir
+                }
+                PublicationBoundary::StagingEntryRootSynced => {
+                    self.faults.fail_after_release_root_sync
+                }
+                PublicationBoundary::ArtifactDirectoryCreated => {
+                    self.faults.fail_after_artifacts_mkdir
+                }
+                PublicationBoundary::ReleaseFileWritten(ordinal) => {
+                    self.faults.fail_after_file_write_at == Some(ordinal)
+                }
+                PublicationBoundary::ReleaseFileSynced(ordinal) => {
+                    self.faults.fail_after_file_sync_at == Some(ordinal)
+                }
+                PublicationBoundary::ArtifactDirectorySynced => {
+                    self.faults.fail_after_artifacts_dir_sync
+                }
+                PublicationBoundary::StagingDirectorySynced => {
+                    self.faults.fail_after_staging_dir_sync
+                }
+                PublicationBoundary::RenameCommitted => {
+                    self.faults.fail_after_rename_before_root_sync
+                }
+                PublicationBoundary::RenameRootSynced => {
+                    self.faults.fail_after_root_sync_before_rename_stage
+                }
+                PublicationBoundary::ReceiptFileWritten => self.faults.fail_after_receipt_write,
+                PublicationBoundary::ReceiptFileSynced => self.faults.fail_after_receipt_sync,
+                PublicationBoundary::ReceiptLedgerSynced => {
+                    self.faults.fail_after_receipt_ledger_sync
+                }
+                PublicationBoundary::MarkerFileWritten => self.faults.fail_after_marker_write,
+                PublicationBoundary::MarkerFileSynced => self.faults.fail_after_marker_sync,
+                PublicationBoundary::MarkerLedgerSynced => {
+                    self.faults.fail_after_marker_ledger_sync
+                }
+            };
+            if failed {
+                Err(injected(&format!("injected failure at {boundary:?}")))
+            } else {
+                Ok(())
+            }
         }
 
         fn sync_provisioned_parent(&self, parent: &Path) -> Result<(), ProducerError> {
@@ -3616,6 +3972,10 @@ mod tests {
             Ok(())
         }
 
+        fn sync_staging_entry_parent(&self, root: &Path) -> Result<(), ProducerError> {
+            sync_directory(root)
+        }
+
         fn commit_receipt(&self, path: &Path, bytes: &[u8]) -> Result<(), ProducerError> {
             self.record(PublicationRecoveryEvent::CommitReceipt);
             if self.faults.fail_receipt_commit {
@@ -3628,7 +3988,10 @@ mod tests {
                     .map_err(|error| io_error("flush partial receipt", error))?;
                 return Err(injected("injected failure during receipt creation"));
             }
-            write_new_file(path, bytes)
+            write_release_file(path, bytes)?;
+            self.boundary(PublicationBoundary::ReceiptFileWritten)?;
+            sync_file(path)?;
+            self.boundary(PublicationBoundary::ReceiptFileSynced)
         }
 
         fn sync_receipt_ledger(&self, ledger: &Path) -> Result<(), ProducerError> {
@@ -3641,7 +4004,12 @@ mod tests {
             if ordinal == 2 && self.faults.fail_marker_ledger_sync {
                 return Err(injected("injected failure during marker ledger sync"));
             }
-            sync_directory(ledger)
+            sync_directory(ledger)?;
+            if ordinal == 1 {
+                self.boundary(PublicationBoundary::ReceiptLedgerSynced)
+            } else {
+                self.boundary(PublicationBoundary::MarkerLedgerSynced)
+            }
         }
 
         fn commit_availability_marker(
@@ -3660,7 +4028,10 @@ mod tests {
                     .map_err(|error| io_error("flush partial marker", error))?;
                 return Err(injected("injected failure during marker creation"));
             }
-            write_new_file(path, bytes)
+            write_release_file(path, bytes)?;
+            self.boundary(PublicationBoundary::MarkerFileWritten)?;
+            sync_file(path)?;
+            self.boundary(PublicationBoundary::MarkerFileSynced)
         }
     }
 
@@ -3847,7 +4218,7 @@ mod tests {
             final_directory: evidence.release_id.clone(),
             supersedes_release_id: evidence.expected_receipt.supersedes_release_id.clone(),
             expected_receipt_sha256: evidence.receipt_sha256.clone(),
-            stage: PublicationState::StagingCreated,
+            stage: PublicationState::OperationIntentDurable,
             record_sha256: String::new(),
         }
     }
@@ -3908,6 +4279,31 @@ mod tests {
         Ok(())
     }
 
+    /// Install a schema-v1 chain for a legacy recovery fixture. The fixture
+    /// writes fresh evidence; it does not alter an existing published record.
+    fn write_legacy_chain(
+        ledger: &Path,
+        evidence: &PublicationEvidence,
+        operation_id: &str,
+        states: &[PublicationState],
+    ) -> Result<(), Box<dyn StdError>> {
+        let policy = test_policy();
+        clear_stages(ledger, operation_id)?;
+        let mut operation = operation_from_evidence(evidence, operation_id);
+        operation.schema_version = LEGACY_JOURNAL_SCHEMA_VERSION;
+        operation.stage = states[0];
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        write_stage_sequence(ledger, &operation, states, &policy, &fs)
+    }
+
+    const LEGACY_RENAME_STAGES: [PublicationState; 5] = [
+        PublicationState::StagingCreated,
+        PublicationState::FilesWritten,
+        PublicationState::FilesSynced,
+        PublicationState::StagingDirFsynced,
+        PublicationState::AtomicNoReplaceRename,
+    ];
+
     fn clear_stages(ledger: &Path, operation_id: &str) -> Result<(), Box<dyn StdError>> {
         let prefix = format!("{operation_id}.stage.");
         for entry in fs::read_dir(ledger)? {
@@ -3930,6 +4326,71 @@ mod tests {
             .last()
             .ok_or_else(|| io::Error::other("no stage evidence"))?;
         Ok(operation.stage)
+    }
+
+    /// Assert the four negative outcomes required for every injected failure:
+    /// the journal stays bound to the operation, no receipt is acknowledged,
+    /// no availability marker is acknowledged and no dataset is admitted.
+    fn assert_unacknowledged(
+        ledger: &Path,
+        release_id: &str,
+        evidence: &PublicationEvidence,
+    ) -> Result<(), Box<dyn StdError>> {
+        let policy = test_policy();
+        let stages = read_stage_operations(ledger, &evidence.publication_operation_id, &policy)?;
+        assert!(
+            stages
+                .iter()
+                .all(|(_, staged)| staged.operation_id == evidence.publication_operation_id),
+            "every committed stage keeps the failed operation identity"
+        );
+        let receipt_acknowledged =
+            load_receipt(ledger, release_id)?.is_some_and(|(bytes, receipt)| {
+                receipt_matches(&receipt, &bytes, evidence)
+                    && stages
+                        .last()
+                        .is_some_and(|(_, staged)| staged.stage == PublicationState::Available)
+            });
+        assert!(
+            !receipt_acknowledged,
+            "receipt_acknowledged stays false after the injected failure"
+        );
+        let marker_path = ledger.join(format!("{release_id}.available"));
+        let marker_acknowledged = marker_path.exists()
+            && fs::read(&marker_path)? == evidence.publication_operation_id.as_bytes()
+            && stages
+                .last()
+                .is_some_and(|(_, staged)| staged.stage == PublicationState::Available);
+        assert!(
+            !marker_acknowledged,
+            "available_marker_acknowledged stays false after the injected failure"
+        );
+        let dataset_admitted = stages
+            .iter()
+            .any(|(_, staged)| staged.stage == PublicationState::Available);
+        assert!(
+            !dataset_admitted,
+            "dataset_admitted stays false after the injected failure"
+        );
+        Ok(())
+    }
+
+    /// Assert the exact v2 stage sequence for one operation.
+    fn assert_v2_stages(ledger: &Path, operation_id: &str) -> Result<(), Box<dyn StdError>> {
+        let policy = test_policy();
+        let stages = read_stage_operations(ledger, operation_id, &policy)?;
+        let observed: Vec<PublicationState> = stages.iter().map(|(_, item)| item.stage).collect();
+        assert_eq!(
+            observed, V2_STAGE_ORDER,
+            "the journal follows the schema-v2 durable barrier order"
+        );
+        assert!(
+            stages
+                .iter()
+                .all(|(_, staged)| staged.schema_version == JOURNAL_SCHEMA_VERSION),
+            "every v2 stage carries schema version two"
+        );
+        Ok(())
     }
 
     #[test]
@@ -4744,19 +5205,10 @@ mod tests {
         let stages = read_stage_operations(&ledger, "operation-1", &policy)?;
         let observed: Vec<PublicationState> = stages.iter().map(|(_, item)| item.stage).collect();
         assert_eq!(
-            observed,
-            vec![
-                PublicationState::StagingCreated,
-                PublicationState::FilesWritten,
-                PublicationState::FilesSynced,
-                PublicationState::StagingDirFsynced,
-                PublicationState::AtomicNoReplaceRename,
-                PublicationState::ParentDirFsynced,
-                PublicationState::DurablePublicationReceipt,
-                PublicationState::Available,
-            ],
-            "stage evidence follows the committed transition order"
+            observed, V2_STAGE_ORDER,
+            "stage evidence follows the committed schema-v2 transition order"
         );
+        assert_v2_stages(&ledger, "operation-1")?;
         assert!(
             !root.join(".staging-operation-1").exists(),
             "the staging name is consumed by the final directory rename"
@@ -4814,7 +5266,7 @@ mod tests {
         );
         assert_eq!(
             last_stage(&ledger, "operation-before-rename")?,
-            PublicationState::StagingDirFsynced,
+            PublicationState::StagingTreeDurable,
             "no rename stage is claimed before the rename"
         );
         let evidence = evidence_for_operation(
@@ -4884,7 +5336,7 @@ mod tests {
         );
         assert_ne!(
             last_stage(&ledger, "operation-rename-collision")?,
-            PublicationState::AtomicNoReplaceRename,
+            PublicationState::RenameDurable,
             "a failed rename is not labelled as committed"
         );
         assert!(
@@ -5012,8 +5464,8 @@ mod tests {
         validate_artifact_set(&final_dir, &evidence, &policy)?;
         assert_eq!(
             last_stage(&ledger, "operation-parent-fault")?,
-            PublicationState::AtomicNoReplaceRename,
-            "the rename is recorded before the parent directory sync"
+            PublicationState::StagingTreeDurable,
+            "no rename claim exists without the release-root sync"
         );
         assert!(
             !ledger.join("release-parent-fault.receipt.json").exists(),
@@ -5023,23 +5475,12 @@ mod tests {
             !ledger.join("release-parent-fault.available").exists(),
             "an uncertain publication carries no availability marker"
         );
-        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy)?;
-        assert_eq!(
-            recovered,
-            RecoveryOutcome::RecoveredPublished,
-            "reconciliation commits the receipt for the verified final directory"
-        );
-        let (_, receipt) = load_receipt(&ledger, "release-parent-fault")?
-            .ok_or_else(|| io::Error::other("missing reconciled receipt"))?;
-        assert_eq!(
-            receipt.result,
-            PublicationState::Available,
-            "recovery commits an acknowledgement that the failed run did not write"
-        );
+        let recovered = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
-            ledger.join("release-parent-fault.available").exists(),
-            "recovery writes the availability marker after the receipt"
+            matches!(recovered, Err(ProducerError::UncertainPublication(_))),
+            "a final directory without a rename durable stage is quarantined"
         );
+        assert_unacknowledged(&ledger, "release-parent-fault", &evidence)?;
         Ok(())
     }
 
@@ -5074,8 +5515,8 @@ mod tests {
         );
         assert_eq!(
             last_stage(&ledger, "operation-receipt-fault")?,
-            PublicationState::ParentDirFsynced,
-            "the publication exists with the parent directory synced"
+            PublicationState::RenameDurable,
+            "the final name is durable before the receipt write"
         );
         let receipt_bytes = fs::read(ledger.join("release-receipt-fault.receipt.json"))?;
         assert!(receipt_bytes.is_empty(), "receipt is empty after crash");
@@ -5129,8 +5570,8 @@ mod tests {
         );
         assert_eq!(
             last_stage(&ledger, "operation-marker-fault")?,
-            PublicationState::DurablePublicationReceipt,
-            "the receipt is committed before the availability marker"
+            PublicationState::RenameDurable,
+            "the rename is durable before the availability marker"
         );
         assert!(
             load_receipt(&ledger, "release-marker-fault")?.is_some(),
@@ -5203,8 +5644,8 @@ mod tests {
             &ledger,
             &operation_from_evidence(&evidence, "operation-incomplete"),
             &[
-                PublicationState::StagingCreated,
-                PublicationState::FilesWritten,
+                PublicationState::OperationIntentDurable,
+                PublicationState::StagingEntryDurable,
             ],
             &policy,
             &journal_fs,
@@ -6135,16 +6576,22 @@ mod tests {
         )?;
         assert_eq!(
             stage,
-            PublicationState::AtomicNoReplaceRename,
-            "the rename stage is durable before the crash"
+            PublicationState::StagingTreeDurable,
+            "v2 does not claim a rename before the release-root sync"
         );
+        write_legacy_chain(
+            &ledger,
+            &evidence,
+            "operation-after-rename",
+            &LEGACY_RENAME_STAGES,
+        )?;
         let fs = RecordingPublicationFs::new(PublicationFaults::default());
         let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
         assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
         assert_eq!(
             fs.events(),
             FULL_RECOVERY_ORDER.to_vec(),
-            "recovery syncs the release parent before committing the receipt"
+            "legacy recovery syncs the release parent before committing the receipt"
         );
         Ok(())
     }
@@ -6168,7 +6615,7 @@ mod tests {
         )?;
         assert_eq!(
             stage,
-            PublicationState::StagingDirFsynced,
+            PublicationState::StagingTreeDurable,
             "no stage claims a rename that has no durable record"
         );
         assert!(
@@ -6216,16 +6663,22 @@ mod tests {
         )?;
         assert_eq!(
             stage,
-            PublicationState::AtomicNoReplaceRename,
-            "a failed parent sync leaves the rename as the last stage"
+            PublicationState::StagingTreeDurable,
+            "v2 does not claim a rename when the parent sync failed"
         );
+        write_legacy_chain(
+            &ledger,
+            &evidence,
+            "operation-parent-sync",
+            &LEGACY_RENAME_STAGES,
+        )?;
         let fs = RecordingPublicationFs::new(PublicationFaults::default());
         let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
         assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
         assert_eq!(
             fs.events(),
             FULL_RECOVERY_ORDER.to_vec(),
-            "recovery supplies the missing parent sync before any receipt"
+            "legacy recovery supplies the missing parent sync before any receipt"
         );
         Ok(())
     }
@@ -6249,16 +6702,22 @@ mod tests {
         )?;
         assert_eq!(
             stage,
-            PublicationState::AtomicNoReplaceRename,
-            "the crash precedes the parent-synced stage record"
+            PublicationState::StagingTreeDurable,
+            "v2 commits the rename claim only after the root sync"
         );
+        write_legacy_chain(
+            &ledger,
+            &evidence,
+            "operation-after-parent",
+            &LEGACY_RENAME_STAGES,
+        )?;
         let fs = RecordingPublicationFs::new(PublicationFaults::default());
         let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
         assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
         assert_eq!(
             fs.events(),
             FULL_RECOVERY_ORDER.to_vec(),
-            "recovery repeats the parent sync before committing the receipt"
+            "legacy recovery repeats the parent sync before committing the receipt"
         );
         Ok(())
     }
@@ -6282,8 +6741,8 @@ mod tests {
         )?;
         assert_eq!(
             stage,
-            PublicationState::ParentDirFsynced,
-            "the receipt ledger sync failure precedes the receipt stage"
+            PublicationState::RenameDurable,
+            "the receipt ledger sync failure precedes the final stage"
         );
         let fs = RecordingPublicationFs::new(PublicationFaults::default());
         let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &fs)?;
@@ -6324,7 +6783,7 @@ mod tests {
         )?;
         assert_eq!(
             stage,
-            PublicationState::DurablePublicationReceipt,
+            PublicationState::RenameDurable,
             "the marker ledger sync failure precedes the available stage"
         );
         let fs = RecordingPublicationFs::new(PublicationFaults::default());
@@ -6496,8 +6955,8 @@ mod tests {
             &ledger,
             &evidence,
             "operation-forger",
-            4,
-            PublicationState::AtomicNoReplaceRename,
+            3,
+            PublicationState::RenameDurable,
             &policy,
             &journal_fs,
         )?;
@@ -6531,32 +6990,32 @@ mod tests {
             &root,
             &ledger,
         )?;
-        let original = stage_path(&ledger, "operation-journal", 4);
+        let original = stage_path(&ledger, "operation-journal", 2);
         let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
         fs::remove_file(&original)?;
         let mut regressed = operation_from_evidence(&evidence, "operation-journal");
-        regressed.stage = PublicationState::FilesWritten;
-        stage_record_at(&ledger, &regressed, 4, &policy, &journal_fs)?;
+        regressed.stage = PublicationState::OperationIntentDurable;
+        stage_record_at(&ledger, &regressed, 2, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
             "a stage regression is rejected before any acknowledgement"
         );
-        fs::remove_file(stage_path(&ledger, "operation-journal", 4))?;
+        fs::remove_file(stage_path(&ledger, "operation-journal", 2))?;
         let mut conflicting = operation_from_evidence(&evidence, "operation-journal");
-        conflicting.stage = PublicationState::AtomicNoReplaceRename;
+        conflicting.stage = PublicationState::StagingTreeDurable;
         conflicting.release_id = "release-other".to_owned();
-        stage_record_at(&ledger, &conflicting, 4, &policy, &journal_fs)?;
+        stage_record_at(&ledger, &conflicting, 2, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
             "a conflicting release identity in the journal is rejected"
         );
-        fs::remove_file(stage_path(&ledger, "operation-journal", 4))?;
+        fs::remove_file(stage_path(&ledger, "operation-journal", 2))?;
         let mut wrong_digest = operation_from_evidence(&evidence, "operation-journal");
-        wrong_digest.stage = PublicationState::AtomicNoReplaceRename;
+        wrong_digest.stage = PublicationState::StagingTreeDurable;
         wrong_digest.manifest_sha256 = "ff".repeat(32);
-        stage_record_at(&ledger, &wrong_digest, 4, &policy, &journal_fs)?;
+        stage_record_at(&ledger, &wrong_digest, 2, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
@@ -6566,7 +7025,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_and_out_of_range_stage_ordinals_fail_closed() -> TestResult {
+    fn mismatched_and_out_of_range_stage_ordinals_fail_closed() -> TestResult {
         let temp = TempDir::new()?;
         let policy = test_policy();
         let root = temp.path().join("releases");
@@ -6586,22 +7045,22 @@ mod tests {
             PublicationState::Available,
         )?;
         let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
-        stage_record_at(&ledger, &extra, 8, &policy, &journal_fs)?;
+        stage_record_at(&ledger, &extra, 5, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
             "a stage beyond the ratified state machine is rejected"
         );
-        fs::remove_file(stage_path(&ledger, "operation-ordinals", 8))?;
-        stage_record_at(&ledger, &extra, 9, &policy, &journal_fs)?;
+        fs::remove_file(stage_path(&ledger, "operation-ordinals", 5))?;
+        stage_record_at(&ledger, &extra, 7, &policy, &journal_fs)?;
         fs::rename(
-            stage_path(&ledger, "operation-ordinals", 9),
-            ledger.join("operation-ordinals.stage.4.json"),
+            stage_path(&ledger, "operation-ordinals", 7),
+            ledger.join("operation-ordinals.stage.2.json"),
         )?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationJournal(_))),
-            "a duplicate sequence number at one stage ordinal is rejected"
+            "a sequence number disagreeing with its stage ordinal is rejected"
         );
         Ok(())
     }
@@ -6741,6 +7200,12 @@ mod tests {
             matches!(result, Err(ProducerError::Io(..))),
             "the correction crash is typed"
         );
+        write_legacy_chain(
+            &ledger,
+            &evidence,
+            "operation-correction",
+            &LEGACY_RENAME_STAGES,
+        )?;
         let recovery_fs = RecordingPublicationFs::new(PublicationFaults::default());
         let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &recovery_fs)?;
         assert_recovered_receipt(&ledger, &evidence.release_id, &evidence, outcome)?;
@@ -6788,7 +7253,7 @@ mod tests {
         let policy = test_policy();
         let artifacts = boundary_artifacts(&policy);
         let (signing, verifying) = test_keys();
-        for ordinal in 1..=8_u32 {
+        for ordinal in 1..=5_u32 {
             let temp = TempDir::new()?;
             let root = temp.path().join("releases");
             let ledger = temp.path().join("ledger");
@@ -6829,7 +7294,7 @@ mod tests {
                 "all committed stage records remain readable after a restart"
             );
             validate_stage_history(&stages, &evidence)?;
-            let expected_stage = STAGE_ORDER[(ordinal - 1) as usize];
+            let expected_stage = V2_STAGE_ORDER[(ordinal - 1) as usize];
             assert_eq!(
                 last_stage(&ledger, &operation_id)?,
                 expected_stage,
@@ -6837,15 +7302,15 @@ mod tests {
             );
             let recovery_fs = RecordingPublicationFs::new(PublicationFaults::default());
             let outcome = recover_with_fs(&root, &ledger, &evidence, &policy, &recovery_fs);
-            if ordinal <= 3 {
+            if ordinal <= 2 {
                 assert!(
                     matches!(outcome, Err(ProducerError::UncertainPublication(_))),
                     "an incomplete staged chain withholds the acknowledgement"
                 );
             } else {
-                let expected = if ordinal == 4 {
+                let expected = if ordinal == 3 {
                     RecoveryOutcome::RecoveredStaged
-                } else if ordinal == 8 {
+                } else if ordinal == 5 {
                     RecoveryOutcome::AlreadyAvailable
                 } else {
                     RecoveryOutcome::RecoveredPublished
@@ -6864,7 +7329,7 @@ mod tests {
         let policy = test_policy();
         let artifacts = boundary_artifacts(&policy);
         let (signing, verifying) = test_keys();
-        for ordinal in 1..=8_u32 {
+        for ordinal in 1..=5_u32 {
             let temp = TempDir::new()?;
             let root = temp.path().join("releases");
             let ledger = temp.path().join("ledger");
@@ -6920,15 +7385,15 @@ mod tests {
                     matches!(outcome, Ok(RecoveryOutcome::NoEvidence)),
                     "a lost first record leaves no operation evidence"
                 );
-            } else if ordinal <= 5 {
+            } else if ordinal <= 4 {
                 assert!(
                     matches!(outcome, Err(ProducerError::UncertainPublication(_))),
-                    "a lost pre-receipt record leaves an uncertain publication"
+                    "a lost stage before the rename claim leaves an uncertain publication"
                 );
             } else {
                 assert!(
                     matches!(outcome, Ok(RecoveryOutcome::RecoveredPublished)),
-                    "later recovery acknowledges only a verified final directory"
+                    "recovery acknowledges only a verified final directory"
                 );
             }
         }
@@ -6954,7 +7419,7 @@ mod tests {
         let ledger = temp.path().join("ledger");
         let evidence = outcome.evidence;
         let stages = read_stage_operations(&ledger, "operation-1", &policy)?;
-        assert_eq!(stages.len(), 8, "one record is committed per transition");
+        assert_eq!(stages.len(), 5, "one record is committed per transition");
         let (ordinal, first) = &stages[0];
         assert_eq!(*ordinal, 0, "the first record occupies ordinal zero");
         assert_eq!(
@@ -7008,8 +7473,8 @@ mod tests {
         );
         assert_eq!(
             first.stage,
-            PublicationState::StagingCreated,
-            "the first state is staging created"
+            PublicationState::OperationIntentDurable,
+            "the first state records durable operation intent"
         );
         let bytes = fs::read(stage_path(&ledger, "operation-1", 0))?;
         assert_eq!(
@@ -7082,26 +7547,38 @@ mod tests {
             &ledger,
         )?;
         let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
-        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 2))?;
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 1))?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
             "a missing transition breaks the ordinal sequence"
         );
-        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 3))?;
-        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 4))?;
+        fs::remove_file(stage_path(&ledger, "operation-journal-rules", 2))?;
+        stage_at(
+            &ledger,
+            &evidence,
+            "operation-journal-rules",
+            1,
+            PublicationState::StagingEntryDurable,
+            &policy,
+            &journal_fs,
+        )?;
         stage_at(
             &ledger,
             &evidence,
             "operation-journal-rules",
             2,
-            PublicationState::FilesSynced,
+            PublicationState::OperationIntentDurable,
             &policy,
             &journal_fs,
         )?;
         let mut unrecognized = operation_from_evidence(&evidence, "operation-journal-rules");
         unrecognized.stage = PublicationState::Available;
-        stage_record_at(&ledger, &unrecognized, 3, &policy, &journal_fs)?;
+        unrecognized.sequence_number = 3;
+        let prior_bytes = fs::read(stage_path(&ledger, "operation-journal-rules", 2))?;
+        let prior: PublicationOperation = serde_json::from_slice(&prior_bytes)?;
+        unrecognized.previous_record_sha256 = prior.record_sha256;
+        write_stage(&ledger, &mut unrecognized, 3, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
@@ -7110,7 +7587,7 @@ mod tests {
         fs::remove_file(stage_path(&ledger, "operation-journal-rules", 3))?;
         fs::remove_file(stage_path(&ledger, "operation-journal-rules", 2))?;
         let mut self_predecessor = operation_from_evidence(&evidence, "operation-journal-rules");
-        self_predecessor.stage = PublicationState::FilesSynced;
+        self_predecessor.stage = PublicationState::OperationIntentDurable;
         self_predecessor.supersedes_release_id = Some(evidence.release_id.clone());
         stage_record_at(&ledger, &self_predecessor, 2, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
@@ -7120,7 +7597,7 @@ mod tests {
         );
         fs::remove_file(stage_path(&ledger, "operation-journal-rules", 2))?;
         let mut foreign_predecessor = operation_from_evidence(&evidence, "operation-journal-rules");
-        foreign_predecessor.stage = PublicationState::FilesSynced;
+        foreign_predecessor.stage = PublicationState::OperationIntentDurable;
         foreign_predecessor.supersedes_release_id = Some("release-other".to_owned());
         stage_record_at(&ledger, &foreign_predecessor, 2, &policy, &journal_fs)?;
         let result = recover_interrupted(&root, &ledger, &evidence, &policy);
@@ -7182,6 +7659,587 @@ mod tests {
         assert!(
             matches!(result, Err(ProducerError::PublicationEvidence(_))),
             "a release root without an established parent fails closed"
+        );
+        Ok(())
+    }
+
+    /// Complete ordered boundary sequence for one v2 publication build.
+    const FULL_BUILD_BOUNDARIES: [PublicationBoundary; 19] = [
+        PublicationBoundary::StagingDirectoryCreated,
+        PublicationBoundary::StagingEntryRootSynced,
+        PublicationBoundary::ArtifactDirectoryCreated,
+        PublicationBoundary::ReleaseFileWritten(1),
+        PublicationBoundary::ReleaseFileSynced(1),
+        PublicationBoundary::ReleaseFileWritten(2),
+        PublicationBoundary::ReleaseFileSynced(2),
+        PublicationBoundary::ReleaseFileWritten(3),
+        PublicationBoundary::ReleaseFileSynced(3),
+        PublicationBoundary::ArtifactDirectorySynced,
+        PublicationBoundary::StagingDirectorySynced,
+        PublicationBoundary::RenameCommitted,
+        PublicationBoundary::RenameRootSynced,
+        PublicationBoundary::ReceiptFileWritten,
+        PublicationBoundary::ReceiptFileSynced,
+        PublicationBoundary::ReceiptLedgerSynced,
+        PublicationBoundary::MarkerFileWritten,
+        PublicationBoundary::MarkerFileSynced,
+        PublicationBoundary::MarkerLedgerSynced,
+    ];
+
+    fn interrupt_directory_boundary(
+        faults: PublicationFaults,
+        operation_id: &str,
+        release_id: &str,
+        root: &Path,
+        ledger: &Path,
+    ) -> Result<(PublicationEvidence, RecordingPublicationFs), Box<dyn StdError>> {
+        let policy = test_policy();
+        let manifest = boundary_manifest(release_id);
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let fs = RecordingPublicationFs::new(faults);
+        let result = build_with_faults_and_fs(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            root,
+            ledger,
+            operation_id,
+            faults,
+            &fs,
+        );
+        assert!(
+            matches!(result, Err(ProducerError::Io(..))),
+            "the injected directory boundary failure is typed: {result:?}"
+        );
+        let evidence = boundary_evidence(&manifest, &artifacts, operation_id)?;
+        Ok((evidence, fs))
+    }
+
+    fn assert_boundary_prefix(fs: &RecordingPublicationFs, count: usize, context: &str) {
+        let observed = fs.boundaries();
+        assert!(
+            observed.as_slice() == &FULL_BUILD_BOUNDARIES[..count],
+            "{context}: expected {count} ordered boundaries, observed {observed:?}"
+        );
+    }
+
+    fn assert_crash_before_rename(
+        root: &Path,
+        ledger: &Path,
+        release_id: &str,
+        evidence: &PublicationEvidence,
+        expected_stage: PublicationState,
+    ) -> Result<(), Box<dyn StdError>> {
+        assert_eq!(
+            last_stage(ledger, &evidence.publication_operation_id)?,
+            expected_stage,
+            "the failed run claims no barrier beyond the injected boundary"
+        );
+        assert_unacknowledged(ledger, release_id, evidence)?;
+        let outcome = recover_interrupted(root, ledger, evidence, &test_policy());
+        assert!(
+            matches!(outcome, Err(ProducerError::UncertainPublication(_))),
+            "recovery quarantines a publication without complete rename evidence"
+        );
+        assert_unacknowledged(ledger, release_id, evidence)?;
+        Ok(())
+    }
+
+    fn assert_crash_after_rename(
+        root: &Path,
+        ledger: &Path,
+        release_id: &str,
+        evidence: &PublicationEvidence,
+    ) -> Result<(), Box<dyn StdError>> {
+        assert_eq!(
+            last_stage(ledger, &evidence.publication_operation_id)?,
+            PublicationState::RenameDurable,
+            "the rename durable stage survives the acknowledgement crash"
+        );
+        assert_unacknowledged(ledger, release_id, evidence)?;
+        let recovery_fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let outcome = recover_with_fs(root, ledger, evidence, &test_policy(), &recovery_fs);
+        assert_recovered_receipt(ledger, release_id, evidence, outcome?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn staging_mkdir_crash_withholds_the_entry_claim() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_staging_mkdir: true,
+                ..PublicationFaults::default()
+            },
+            "operation-staging-mkdir",
+            "release-staging-mkdir",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 1, "staging mkdir is the first boundary");
+        assert_crash_before_rename(
+            &root,
+            &ledger,
+            "release-staging-mkdir",
+            &evidence,
+            PublicationState::OperationIntentDurable,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn release_root_sync_crash_withholds_the_entry_claim() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_release_root_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-entry-root-sync",
+            "release-entry-root-sync",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 2, "the root sync follows staging creation");
+        assert_crash_before_rename(
+            &root,
+            &ledger,
+            "release-entry-root-sync",
+            &evidence,
+            PublicationState::OperationIntentDurable,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn artifacts_mkdir_crash_withholds_the_tree_claim() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_artifacts_mkdir: true,
+                ..PublicationFaults::default()
+            },
+            "operation-artifacts-mkdir",
+            "release-artifacts-mkdir",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 3, "the artifacts directory follows the entry claim");
+        assert_crash_before_rename(
+            &root,
+            &ledger,
+            "release-artifacts-mkdir",
+            &evidence,
+            PublicationState::StagingEntryDurable,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn regular_file_write_crash_withholds_the_tree_claim() -> TestResult {
+        for ordinal in 1..=3_u32 {
+            let temp = TempDir::new()?;
+            let root = temp.path().join("releases");
+            let ledger = temp.path().join("ledger");
+            let operation_id = format!("operation-file-write-{ordinal}");
+            let release_id = format!("release-file-write-{ordinal}");
+            let (evidence, fs) = interrupt_directory_boundary(
+                PublicationFaults {
+                    fail_after_file_write_at: Some(ordinal),
+                    ..PublicationFaults::default()
+                },
+                &operation_id,
+                &release_id,
+                &root,
+                &ledger,
+            )?;
+            let boundary_count = usize::try_from(ordinal.saturating_mul(2).saturating_add(2))?;
+            assert_boundary_prefix(
+                &fs,
+                boundary_count,
+                "a write fault stops before the file sync",
+            );
+            assert_crash_before_rename(
+                &root,
+                &ledger,
+                &release_id,
+                &evidence,
+                PublicationState::StagingEntryDurable,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn regular_file_sync_crash_withholds_the_tree_claim() -> TestResult {
+        for ordinal in 1..=3_u32 {
+            let temp = TempDir::new()?;
+            let root = temp.path().join("releases");
+            let ledger = temp.path().join("ledger");
+            let operation_id = format!("operation-file-sync-{ordinal}");
+            let release_id = format!("release-file-sync-{ordinal}");
+            let (evidence, fs) = interrupt_directory_boundary(
+                PublicationFaults {
+                    fail_after_file_sync_at: Some(ordinal),
+                    ..PublicationFaults::default()
+                },
+                &operation_id,
+                &release_id,
+                &root,
+                &ledger,
+            )?;
+            let boundary_count = usize::try_from(ordinal.saturating_mul(2).saturating_add(3))?;
+            assert_boundary_prefix(
+                &fs,
+                boundary_count,
+                "a sync fault stops before the next write",
+            );
+            assert_crash_before_rename(
+                &root,
+                &ledger,
+                &release_id,
+                &evidence,
+                PublicationState::StagingEntryDurable,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn artifacts_directory_sync_crash_withholds_the_tree_claim() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_artifacts_dir_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-artifacts-sync",
+            "release-artifacts-sync",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(
+            &fs,
+            10,
+            "the artifacts directory sync follows all file syncs",
+        );
+        assert_crash_before_rename(
+            &root,
+            &ledger,
+            "release-artifacts-sync",
+            &evidence,
+            PublicationState::StagingEntryDurable,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn staging_directory_sync_crash_withholds_the_tree_claim() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_staging_dir_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-staging-sync",
+            "release-staging-sync",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(
+            &fs,
+            11,
+            "the staging directory sync follows the artifacts sync",
+        );
+        assert_crash_before_rename(
+            &root,
+            &ledger,
+            "release-staging-sync",
+            &evidence,
+            PublicationState::StagingEntryDurable,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn rename_before_root_sync_crash_is_quarantined() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_rename_before_root_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-rename-crash",
+            "release-rename-crash",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 12, "the rename completes before its root sync");
+        assert!(
+            root.join("release-rename-crash").exists(),
+            "the no-replace rename produced the final name before the crash"
+        );
+        assert_crash_before_rename(
+            &root,
+            &ledger,
+            "release-rename-crash",
+            &evidence,
+            PublicationState::StagingTreeDurable,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn rename_root_sync_crash_is_quarantined() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_root_sync_before_rename_stage: true,
+                ..PublicationFaults::default()
+            },
+            "operation-root-sync-crash",
+            "release-root-sync-crash",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 13, "the root sync completes before the rename claim");
+        assert_crash_before_rename(
+            &root,
+            &ledger,
+            "release-root-sync-crash",
+            &evidence,
+            PublicationState::StagingTreeDurable,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_write_crash_preserves_receipt_fidelity() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_receipt_write: true,
+                ..PublicationFaults::default()
+            },
+            "operation-receipt-write",
+            "release-receipt-write",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 14, "the receipt write precedes its sync");
+        assert_crash_after_rename(&root, &ledger, "release-receipt-write", &evidence)?;
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_sync_crash_preserves_receipt_fidelity() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_receipt_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-receipt-sync-boundary",
+            "release-receipt-sync-boundary",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 15, "the receipt sync precedes the ledger sync");
+        assert_crash_after_rename(&root, &ledger, "release-receipt-sync-boundary", &evidence)?;
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_ledger_sync_crash_preserves_receipt_fidelity() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_receipt_ledger_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-receipt-ledger",
+            "release-receipt-ledger",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 16, "the receipt ledger sync precedes the marker");
+        assert_crash_after_rename(&root, &ledger, "release-receipt-ledger", &evidence)?;
+        Ok(())
+    }
+
+    #[test]
+    fn marker_write_crash_preserves_receipt_fidelity() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_marker_write: true,
+                ..PublicationFaults::default()
+            },
+            "operation-marker-write",
+            "release-marker-write",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 17, "the marker write precedes its sync");
+        assert_crash_after_rename(&root, &ledger, "release-marker-write", &evidence)?;
+        Ok(())
+    }
+
+    #[test]
+    fn marker_sync_crash_preserves_receipt_fidelity() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_marker_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-marker-sync-boundary",
+            "release-marker-sync-boundary",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 18, "the marker sync precedes the ledger sync");
+        assert_crash_after_rename(&root, &ledger, "release-marker-sync-boundary", &evidence)?;
+        Ok(())
+    }
+
+    #[test]
+    fn marker_ledger_sync_crash_preserves_receipt_fidelity() -> TestResult {
+        let temp = TempDir::new()?;
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let (evidence, fs) = interrupt_directory_boundary(
+            PublicationFaults {
+                fail_after_marker_ledger_sync: true,
+                ..PublicationFaults::default()
+            },
+            "operation-marker-ledger",
+            "release-marker-ledger",
+            &root,
+            &ledger,
+        )?;
+        assert_boundary_prefix(&fs, 19, "the marker ledger sync precedes the final claim");
+        assert_crash_after_rename(&root, &ledger, "release-marker-ledger", &evidence)?;
+        Ok(())
+    }
+
+    #[test]
+    fn complete_build_reports_every_boundary_in_order() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let root = temp.path().join("releases");
+        let ledger = temp.path().join("ledger");
+        let manifest = boundary_manifest("release-all-boundaries");
+        let artifacts = boundary_artifacts(&policy);
+        let (signing, verifying) = test_keys();
+        let fs = RecordingPublicationFs::new(PublicationFaults::default());
+        build_with_faults_and_fs(
+            &manifest,
+            &artifacts,
+            &signing,
+            &verifying,
+            &policy,
+            &root,
+            &ledger,
+            "operation-all-boundaries",
+            PublicationFaults::default(),
+            &fs,
+        )?;
+        assert_eq!(
+            fs.boundaries(),
+            FULL_BUILD_BOUNDARIES,
+            "every v2 filesystem boundary is reported in the ratified order"
+        );
+        assert_v2_stages(&ledger, "operation-all-boundaries")?;
+        Ok(())
+    }
+
+    #[test]
+    fn schema_v1_records_remain_readable_and_auditable() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&ledger)?;
+        let evidence = boundary_evidence(
+            &boundary_manifest("release-legacy-audit"),
+            &boundary_artifacts(&policy),
+            "operation-legacy-audit",
+        )?;
+        write_legacy_chain(
+            &ledger,
+            &evidence,
+            "operation-legacy-audit",
+            &V1_STAGE_ORDER,
+        )?;
+        let stages = read_stage_operations(&ledger, "operation-legacy-audit", &policy)?;
+        let observed: Vec<PublicationState> = stages.iter().map(|(_, item)| item.stage).collect();
+        assert_eq!(observed, V1_STAGE_ORDER, "legacy v1 states remain readable");
+        assert!(
+            stages
+                .iter()
+                .all(|(_, staged)| staged.schema_version == LEGACY_JOURNAL_SCHEMA_VERSION),
+            "legacy v1 records keep their declared schema version"
+        );
+        validate_stage_history(&stages, &evidence)?;
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_schema_journal_chain_fails_closed() -> TestResult {
+        let temp = TempDir::new()?;
+        let policy = test_policy();
+        let ledger = temp.path().join("ledger");
+        fs::create_dir_all(&ledger)?;
+        let evidence = boundary_evidence(
+            &boundary_manifest("release-legacy-mixed"),
+            &boundary_artifacts(&policy),
+            "operation-legacy-mixed",
+        )?;
+        write_legacy_chain(
+            &ledger,
+            &evidence,
+            "operation-legacy-mixed",
+            &V1_STAGE_ORDER[..2],
+        )?;
+        let journal_fs = RecordingPublicationFs::new(PublicationFaults::default());
+        let mut v2_record = operation_from_evidence(&evidence, "operation-legacy-mixed");
+        v2_record.stage = PublicationState::StagingTreeDurable;
+        let prior_bytes = fs::read(stage_path(&ledger, "operation-legacy-mixed", 1))?;
+        let prior: PublicationOperation = serde_json::from_slice(&prior_bytes)?;
+        v2_record.sequence_number = 2;
+        v2_record.previous_record_sha256 = prior.record_sha256;
+        write_stage(&ledger, &mut v2_record, 2, &policy, &journal_fs)?;
+        let result = read_stage_operations(&ledger, "operation-legacy-mixed", &policy);
+        assert!(
+            matches!(result, Err(ProducerError::PublicationJournal(_))),
+            "a journal chain never mixes schema v1 and schema v2 records"
         );
         Ok(())
     }
