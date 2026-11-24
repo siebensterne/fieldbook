@@ -22,6 +22,7 @@ pub use distribution::inspect;
 pub use distribution::metrics;
 pub use distribution::probe;
 pub use domain::canonical;
+pub use domain::capability_registry;
 pub use domain::event_model;
 pub use domain::fixed;
 pub use domain::identity;
