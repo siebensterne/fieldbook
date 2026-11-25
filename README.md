@@ -114,6 +114,9 @@ rather than a rewrite of history.
 - [Plan/source pairing through canonical sorting](docs/fb-stream-001-plan-source-pairing-2026-11-24.md)
   — FB-STREAM-001 paired sorting, artifact-source binding evidence, refusal
   before consumption and compatibility record.
+- [Producer expansion ratio against stored bytes](docs/fb-limit-001-expansion-ratio-2026-11-24.md)
+  — FB-LIMIT-001 stored-based ratio check, `u128` arithmetic, zero-stored-byte
+  rule and gate record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)
