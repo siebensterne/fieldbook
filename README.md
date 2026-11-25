@@ -111,6 +111,9 @@ rather than a rewrite of history.
 - [Bounded streaming producer lifecycle](docs/fb-b15-streaming-producer-2026-11-24.md)
   — FB-B15 bounded one-record source, immutable versioned resource profile,
   two-intent seal, replay proof, spool quarantine and deferred maxima.
+- [Plan/source pairing through canonical sorting](docs/fb-stream-001-plan-source-pairing-2026-11-24.md)
+  — FB-STREAM-001 paired sorting, artifact-source binding evidence, refusal
+  before consumption and compatibility record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)

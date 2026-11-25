@@ -132,6 +132,10 @@ pub enum StreamError {
     #[error("source identity mismatch in `{0}`: planned {1}, observed {2}")]
     SourceIdentityMismatch(String, String, String),
 
+    /// The opened source reported a different stream binding than the plan.
+    #[error("source binding mismatch in `{0}`: planned {1}, observed {2}")]
+    SourceBindingMismatch(String, String, String),
+
     /// A replay proof member differed from the preparation commitment.
     #[error("source replay mismatch in `{0}`: {1}")]
     SourceReplayMismatch(String, String),
@@ -178,6 +182,7 @@ impl StreamError {
             Self::InvalidRecordOrder(..) => "STREAM_INVALID_ORDER",
             Self::PolicyExceeded(_) => "STREAM_POLICY_EXCEEDED",
             Self::SourceIdentityMismatch(..) => "STREAM_SOURCE_IDENTITY",
+            Self::SourceBindingMismatch(..) => "STREAM_SOURCE_BINDING",
             Self::SourceReplayMismatch(..) => "STREAM_REPLAY_MISMATCH",
             Self::SpoolEvidenceMismatch(..) => "STREAM_SPOOL_EVIDENCE",
             Self::PublicationCancelled(_) => "STREAM_CANCELLED_BEFORE_SEAL",
@@ -228,6 +233,15 @@ pub struct SourceIdentity {
     pub revision: String,
 }
 
+/// Opaque token shared by snapshot identities and stream bindings.
+fn is_opaque_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
+
 impl SourceIdentity {
     /// Validate and construct one opaque source identity.
     pub fn new(
@@ -236,14 +250,7 @@ impl SourceIdentity {
     ) -> Result<Self, StreamError> {
         let snapshot_id = snapshot_id.into();
         let revision = revision.into();
-        let valid = |value: &str| {
-            !value.is_empty()
-                && value.len() <= 128
-                && value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        };
-        if !valid(&snapshot_id) || !valid(&revision) {
+        if !is_opaque_token(&snapshot_id) || !is_opaque_token(&revision) {
             return Err(StreamError::InvalidRecord(
                 0,
                 "source identity is empty or outside the opaque alphabet".to_owned(),
@@ -254,6 +261,25 @@ impl SourceIdentity {
             revision,
         })
     }
+}
+
+/// Binding of one canonical artifact position to one caller-declared stream.
+/// The binding separates streams that report one shared snapshot identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactSourceBinding {
+    /// Canonical partition of the bound artifact.
+    pub logical_partition_id: String,
+    /// Canonical shard ordinal of the bound artifact.
+    pub shard_ordinal: u32,
+    /// Release-relative path of the bound artifact.
+    pub path: String,
+    /// Snapshot identifier declared by the plan and reported by the source.
+    pub source_snapshot_id: String,
+    /// Revision declared by the plan and reported by the source.
+    pub source_revision: String,
+    /// Stream identifier unique within the snapshot.
+    pub binding_id: String,
 }
 
 /// Compression method declared by one artifact plan.
@@ -299,6 +325,9 @@ pub struct ArtifactPlan {
     pub source_snapshot_id: String,
     /// Immutable source revision.
     pub source_revision: String,
+    /// Stream identifier that separates this artifact from other streams on
+    /// the same snapshot. The source must report the same identifier.
+    pub source_binding_id: String,
     /// Replayability declaration checked against the opened source.
     pub replayability: Replayability,
     /// Digest committed over emitted canonical bytes.
@@ -319,12 +348,27 @@ impl ArtifactPlan {
             self.source_revision.clone(),
         )
     }
+
+    /// Binding evidence derived from this plan for the two ledger intents.
+    #[must_use]
+    pub fn source_binding(&self) -> ArtifactSourceBinding {
+        ArtifactSourceBinding {
+            logical_partition_id: self.logical_partition_id.clone(),
+            shard_ordinal: self.shard_ordinal,
+            path: self.path.clone(),
+            source_snapshot_id: self.source_snapshot_id.clone(),
+            source_revision: self.source_revision.clone(),
+            binding_id: self.source_binding_id.clone(),
+        }
+    }
 }
 
 /// Bounded, one-record-at-a-time source for one planned artifact.
 pub trait ArtifactRecordSource {
     /// Opaque snapshot identity and revision; must equal the plan values.
     fn source_identity(&self) -> SourceIdentity;
+    /// Stream binding reported by this source; must equal the plan value.
+    fn source_binding_id(&self) -> String;
     /// Declaration checked against the plan; a weaker declaration fails closed.
     fn replayability(&self) -> Replayability;
     /// Next canonical record without a line terminator, or `None` at end of
@@ -339,6 +383,7 @@ pub trait ArtifactRecordSource {
 pub struct BoundedRecordFramer<R: IoRead> {
     reader: R,
     identity: SourceIdentity,
+    binding_id: String,
     replayability: Replayability,
     max_record_bytes: u64,
     buffer: Vec<u8>,
@@ -347,10 +392,12 @@ pub struct BoundedRecordFramer<R: IoRead> {
 }
 
 impl<R: IoRead> BoundedRecordFramer<R> {
-    /// Construct a framer with a profile-supplied record bound.
+    /// Construct a framer with a profile-supplied record bound and a declared
+    /// stream binding.
     pub fn new(
         reader: R,
         identity: SourceIdentity,
+        binding_id: impl Into<String>,
         replayability: Replayability,
         max_record_bytes: u64,
     ) -> Result<Self, StreamError> {
@@ -359,9 +406,16 @@ impl<R: IoRead> BoundedRecordFramer<R> {
                 "max_record_bytes must be positive".to_owned(),
             ));
         }
+        let binding_id = binding_id.into();
+        if !is_opaque_token(&binding_id) {
+            return Err(StreamError::PolicyExceeded(
+                "source binding is empty or outside the opaque alphabet".to_owned(),
+            ));
+        }
         Ok(Self {
             reader,
             identity,
+            binding_id,
             replayability,
             max_record_bytes,
             buffer: Vec::new(),
@@ -374,6 +428,10 @@ impl<R: IoRead> BoundedRecordFramer<R> {
 impl<R: IoRead> ArtifactRecordSource for BoundedRecordFramer<R> {
     fn source_identity(&self) -> SourceIdentity {
         self.identity.clone()
+    }
+
+    fn source_binding_id(&self) -> String {
+        self.binding_id.clone()
     }
 
     fn replayability(&self) -> Replayability {
@@ -441,6 +499,8 @@ impl<R: IoRead> ArtifactRecordSource for BoundedRecordFramer<R> {
 /// Commitments proven against the preparation intent before publication.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplayProof {
+    /// Binding of the source that emitted this proof.
+    pub source_binding_id: String,
     /// Digest over emitted canonical bytes in order.
     pub source_content_digest: String,
     /// Observed record count.
@@ -457,6 +517,13 @@ pub fn verify_replay_proof(
     plan: &ArtifactPlan,
     proof: &ReplayProof,
 ) -> Result<(), StreamError> {
+    if proof.source_binding_id != plan.source_binding_id {
+        return Err(StreamError::SourceBindingMismatch(
+            path.to_owned(),
+            plan.source_binding_id.clone(),
+            proof.source_binding_id.clone(),
+        ));
+    }
     if proof.source_content_digest != plan.source_content_digest {
         return Err(StreamError::SourceReplayMismatch(
             path.to_owned(),
@@ -737,6 +804,7 @@ impl RecordHandoff {
 struct ArtifactStreamInput<'a> {
     source: &'a mut dyn ArtifactRecordSource,
     plan: &'a ArtifactPlan,
+    expected_replayability: Replayability,
     path: &'a Path,
     dataset_hasher: &'a mut Sha256,
     release_expanded: &'a mut u64,
@@ -766,11 +834,20 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
             format!("{}#{}", observed.snapshot_id, observed.revision),
         ));
     }
-    if input.source.replayability() != input.plan.replayability {
+    if input.source.replayability() != input.expected_replayability {
         return Err(StreamError::SourceIdentityMismatch(
             input.plan.path.clone(),
-            input.plan.replayability.as_str().to_owned(),
+            input.expected_replayability.as_str().to_owned(),
             input.source.replayability().as_str().to_owned(),
+        ));
+    }
+    let planned_binding = input.plan.source_binding_id.as_str();
+    let observed_binding = input.source.source_binding_id();
+    if planned_binding != observed_binding {
+        return Err(StreamError::SourceBindingMismatch(
+            input.plan.path.clone(),
+            planned_binding.to_owned(),
+            observed_binding,
         ));
     }
     enforce(
@@ -864,6 +941,7 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
         enforce(sink.expanded_bytes, allowed, "max_expansion_ratio")?;
     }
     let proof = ReplayProof {
+        source_binding_id: input.plan.source_binding_id.clone(),
         source_content_digest: hex_encode(&content_hasher.finalize()),
         record_count,
         first_order_key: tracker.first.clone().unwrap_or_default(),
@@ -991,6 +1069,8 @@ pub struct PreparationIntent {
     pub operation_id: String,
     /// Complete ordered artifact source plan.
     pub source_plan: Vec<ArtifactPlan>,
+    /// Ordered artifact-to-stream bindings for this operation.
+    pub source_bindings: Vec<ArtifactSourceBinding>,
     /// Selected role-profile identifier.
     pub resource_profile_id: String,
     /// Canonical digest of the selected role profile.
@@ -1041,6 +1121,8 @@ pub struct SealedPublicationIntent {
     pub data_sha256: String,
     /// Full ordered descriptor inventory.
     pub artifact_inventory: Vec<crate::distribution::ndc_release::ArtifactDescriptor>,
+    /// Ordered artifact-to-stream bindings carried from preparation.
+    pub source_bindings: Vec<ArtifactSourceBinding>,
     /// Total stored bytes across artifacts.
     pub stored_bytes: u64,
     /// Total expanded bytes across artifacts.
@@ -1081,8 +1163,8 @@ fn sealed_file(ledger: &Path, operation_id: &str) -> PathBuf {
     ledger.join(format!("{operation_id}.sealed.json"))
 }
 
-fn spool_evidence_file(ledger: &Path, operation_id: &str) -> PathBuf {
-    ledger.join(format!("{operation_id}.{SPOOL_SEALED}.json"))
+fn spool_evidence_file(ledger: &Path, operation_id: &str, binding_id: &str) -> PathBuf {
+    ledger.join(format!("{operation_id}.{binding_id}.{SPOOL_SEALED}.json"))
 }
 
 fn commit_ledger_record(path: &Path, bytes: &[u8], ledger: &Path) -> Result<(), StreamError> {
@@ -1215,7 +1297,15 @@ pub fn spool_non_replayable(
             identity.snapshot_id,
         ));
     }
-    let file_name = format!("{operation_id}-spool.spool");
+    let observed_binding = source.source_binding_id();
+    if observed_binding != plan.source_binding_id {
+        return Err(StreamError::SourceBindingMismatch(
+            plan.path.clone(),
+            plan.source_binding_id.clone(),
+            observed_binding,
+        ));
+    }
+    let file_name = format!("{operation_id}-{}-spool.spool", plan.source_binding_id);
     let path = spool_dir.join(&file_name);
     let mut file = OpenOptions::new()
         .write(true)
@@ -1265,11 +1355,16 @@ pub fn spool_non_replayable(
         last_order_key: last,
     };
     let bytes = canonical_ledger_bytes(&evidence)?;
-    commit_ledger_record(&spool_evidence_file(ledger, operation_id), &bytes, ledger)?;
+    commit_ledger_record(
+        &spool_evidence_file(ledger, operation_id, &plan.source_binding_id),
+        &bytes,
+        ledger,
+    )?;
     let reader = BufReader::new(File::open(&path).map_err(|error| io_error("open spool", error))?);
     let framer = BoundedRecordFramer::new(
         reader,
         plan.source_identity()?,
+        plan.source_binding_id.clone(),
         Replayability::Replayable,
         limits.max_record_bytes(),
     )?;
@@ -1411,9 +1506,11 @@ pub struct StreamingBuildRequest<'a> {
     pub observed_event_types: &'a BTreeSet<String>,
     /// Injected signing material.
     pub signature: SignatureConfig<'a>,
-    /// Source objects aligned with `plans`.
+    /// Source objects aligned by input position with `plans`; the pipeline
+    /// moves each source with its plan during canonical sorting.
     pub sources: Vec<Box<dyn ArtifactRecordSource + 'a>>,
-    /// Immutable artifact plans in any order; the pipeline sorts them.
+    /// Immutable artifact plans in any order; each plan declares the binding
+    /// of the source at the same input position.
     pub plans: &'a [ArtifactPlan],
     /// Selected role profile.
     pub profile: &'a ResourceProfile,
@@ -1435,6 +1532,8 @@ pub struct StreamingOutcome {
     pub sidecar_bytes: Vec<u8>,
     /// Sorted descriptors with computed digests.
     pub descriptors: Vec<crate::distribution::ndc_release::ArtifactDescriptor>,
+    /// Per-artifact source bindings in canonical artifact order.
+    pub source_bindings: Vec<ArtifactSourceBinding>,
     /// Durable receipt written by the publication core.
     pub receipt: PublicationReceipt,
     /// Evidence retained for recovery.
@@ -1478,32 +1577,46 @@ fn select_profile(request: &StreamingBuildRequest<'_>) -> Result<(), StreamError
     }
 }
 
-fn validate_plans(request: &StreamingBuildRequest<'_>) -> Result<Vec<ArtifactPlan>, StreamError> {
+/// One plan and the source at its input position. The pair is the unit of
+/// canonical sorting, so a plan cannot be paired with another input's
+/// source after a permutation.
+struct PlannedSource<'a> {
+    plan: ArtifactPlan,
+    source: Box<dyn ArtifactRecordSource + 'a>,
+}
+
+fn validate_sources<'a>(
+    request: &StreamingBuildRequest<'a>,
+    sources: Vec<Box<dyn ArtifactRecordSource + 'a>>,
+) -> Result<Vec<PlannedSource<'a>>, StreamError> {
     let limits = request.profile.limits();
     let count = u64::try_from(request.plans.len())
         .map_err(|_| StreamError::PolicyExceeded("plan count overflow".to_owned()))?;
     enforce(count, limits.max_artifacts_per_release(), "artifact count")?;
     enforce(
-        u64::try_from(request.sources.len())
+        u64::try_from(sources.len())
             .map_err(|_| StreamError::PolicyExceeded("source count overflow".to_owned()))?,
         limits.max_artifacts_per_release(),
         "source count",
     )?;
-    if request.sources.len() != request.plans.len() {
+    if sources.len() != request.plans.len() {
         return Err(StreamError::PolicyExceeded(
             "source count differs from plan count".to_owned(),
         ));
     }
     let policy = limits.to_resource_policy();
-    let mut plans = request.plans.to_vec();
-    plans.sort_by(|left, right| {
-        left.logical_partition_id
-            .cmp(&right.logical_partition_id)
-            .then(left.shard_ordinal.cmp(&right.shard_ordinal))
-    });
+    let mut pairs: Vec<PlannedSource<'a>> = request
+        .plans
+        .iter()
+        .cloned()
+        .zip(sources)
+        .map(|(plan, source)| PlannedSource { plan, source })
+        .collect();
     let mut positions = BTreeSet::new();
     let mut paths = BTreeSet::new();
-    for plan in &plans {
+    let mut bindings = BTreeSet::new();
+    for pair in &pairs {
+        let plan = &pair.plan;
         validate_artifact_path(&plan.path, &policy).map_err(StreamError::Publication)?;
         if !positions.insert((plan.logical_partition_id.clone(), plan.shard_ordinal)) {
             return Err(StreamError::PolicyExceeded(format!(
@@ -1557,8 +1670,25 @@ fn validate_plans(request: &StreamingBuildRequest<'_>) -> Result<Vec<ArtifactPla
             },
         }
         plan.source_identity()?;
+        if !is_opaque_token(&plan.source_binding_id) {
+            return Err(StreamError::PolicyExceeded(
+                "source binding is empty or outside the opaque alphabet".to_owned(),
+            ));
+        }
+        if !bindings.insert(plan.source_binding_id.clone()) {
+            return Err(StreamError::PolicyExceeded(format!(
+                "duplicate artifact binding {}",
+                plan.source_binding_id
+            )));
+        }
     }
-    Ok(plans)
+    pairs.sort_by(|left, right| {
+        left.plan
+            .logical_partition_id
+            .cmp(&right.plan.logical_partition_id)
+            .then(left.plan.shard_ordinal.cmp(&right.plan.shard_ordinal))
+    });
+    Ok(pairs)
 }
 
 fn write_compatibility_stages(
@@ -1625,7 +1755,13 @@ pub fn publish_streaming(
     check_memory_budget(limits)?;
     request.cancellation.check("operation-start")?;
     check_duration(started, limits)?;
-    let plans = validate_plans(&request)?;
+    let sources = std::mem::take(&mut request.sources);
+    let mut pairs = validate_sources(&request, sources)?;
+    let plans: Vec<ArtifactPlan> = pairs.iter().map(|pair| pair.plan.clone()).collect();
+    let source_bindings: Vec<ArtifactSourceBinding> = pairs
+        .iter()
+        .map(|pair| pair.plan.source_binding())
+        .collect();
     let planned_paths = planned_file_set(&plans);
 
     provision_directory(request.ledger_dir, "stream ledger", &RealPublicationFs)?;
@@ -1634,6 +1770,7 @@ pub fn publish_streaming(
         schema_version: STREAM_INTENT_SCHEMA_VERSION,
         operation_id: request.operation_id.to_owned(),
         source_plan: plans.clone(),
+        source_bindings: source_bindings.clone(),
         resource_profile_id: request.profile.id().as_literal(),
         resource_profile_digest: hex_encode(request.profile.digest()),
         role: ProcessingRole::Producer.as_str().to_owned(),
@@ -1650,8 +1787,7 @@ pub fn publish_streaming(
             .map(|plan| SpoolPlan {
                 file_name: format!(
                     "{}-{}-spool.spool",
-                    request.operation_id,
-                    plan.path.replace('/', "_")
+                    request.operation_id, plan.source_binding_id
                 ),
                 max_bytes: limits.temp_disk_bytes(),
             })
@@ -1697,12 +1833,14 @@ pub fn publish_streaming(
     let mut release_records = 0_u64;
     let mut disk_bytes = 0_u64;
     let mut spooled: Vec<(String, SpoolEvidence)> = Vec::new();
-    for (plan, source) in plans.iter().zip(request.sources.iter_mut()) {
+    for pair in pairs.iter_mut() {
         request.cancellation.check("artifact-start")?;
+        let plan = &pair.plan;
+        let source = pair.source.as_mut();
         let mut spool = None;
         if plan.replayability == Replayability::NonReplayable {
             let (evidence, framer) = spool_non_replayable(
-                source.as_mut(),
+                source,
                 plan,
                 request.spool_dir,
                 request.ledger_dir,
@@ -1723,13 +1861,19 @@ pub fn publish_streaming(
             fs::create_dir_all(parent)
                 .map_err(|error| io_error("create artifact parent", error))?;
         }
-        let stream = spool
-            .as_mut()
-            .map(|framer| framer as &mut dyn ArtifactRecordSource)
-            .unwrap_or_else(|| source.as_mut());
+        let expected_replayability = if spool.is_some() {
+            Replayability::Replayable
+        } else {
+            plan.replayability
+        };
+        let stream: &mut dyn ArtifactRecordSource = match spool.as_mut() {
+            Some(framer) => framer,
+            None => source,
+        };
         let result = stream_artifact(ArtifactStreamInput {
             source: stream,
             plan,
+            expected_replayability,
             path: &target,
             dataset_hasher: &mut dataset_hasher,
             release_expanded: &mut release_expanded,
@@ -1793,6 +1937,7 @@ pub fn publish_streaming(
         sidecar_sha256: sealed_manifest.sidecar_sha256.clone(),
         data_sha256: data_sha256.clone(),
         artifact_inventory: descriptors.clone(),
+        source_bindings: source_bindings.clone(),
         stored_bytes: release_stored,
         expanded_bytes: release_expanded,
         record_count: release_records,
@@ -1846,6 +1991,7 @@ pub fn publish_streaming(
         manifest_bytes: sealed_manifest.manifest_bytes,
         sidecar_bytes: sealed_manifest.sidecar_bytes,
         descriptors,
+        source_bindings,
         receipt,
         recovery_evidence: evidence,
         preparation_intent_sha256: preparation_digest,
@@ -1946,6 +2092,7 @@ pub fn recover_streaming(
                 || sealed.operation_id != preparation.operation_id
                 || sealed.resource_profile_id != preparation.resource_profile_id
                 || sealed.resource_profile_digest != preparation.resource_profile_digest
+                || sealed.source_bindings != preparation.source_bindings
             {
                 return Err(StreamError::Publication(
                     ProducerError::PublicationEvidence(
@@ -1965,6 +2112,8 @@ mod tests {
     use std::error::Error as StdError;
     use std::io::Cursor;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     use ed25519_dalek::SigningKey;
     use serde_json::json;
@@ -2087,6 +2236,7 @@ mod tests {
             hasher.update(b"\n");
         }
         Ok(ReplayProof {
+            source_binding_id: plan.source_binding_id.clone(),
             source_content_digest: hex_encode(&hasher.finalize()),
             record_count: u64::try_from(records.len())?,
             first_order_key: tracker.first.unwrap_or_default(),
@@ -2094,12 +2244,13 @@ mod tests {
         })
     }
 
-    fn make_plan(
+    fn make_plan_with_binding(
         partition: &str,
         shard: u32,
         path: &str,
         compression: CompressionMode,
         records: &[CanonicalRecord],
+        binding_id: &str,
     ) -> TestResult<ArtifactPlan> {
         let digest = hex_encode(
             &records
@@ -2127,6 +2278,7 @@ mod tests {
             },
             source_snapshot_id: "SNAPSHOT_A".to_owned(),
             source_revision: "rev-1".to_owned(),
+            source_binding_id: binding_id.to_owned(),
             replayability: Replayability::Replayable,
             source_content_digest: digest,
             expected_record_count: u64::try_from(records.len())?,
@@ -2137,6 +2289,23 @@ mod tests {
         plan.first_order_key = proof.first_order_key;
         plan.last_order_key = proof.last_order_key;
         Ok(plan)
+    }
+
+    fn make_plan(
+        partition: &str,
+        shard: u32,
+        path: &str,
+        compression: CompressionMode,
+        records: &[CanonicalRecord],
+    ) -> TestResult<ArtifactPlan> {
+        make_plan_with_binding(
+            partition,
+            shard,
+            path,
+            compression,
+            records,
+            &format!("{partition}-{shard}"),
+        )
     }
 
     fn source_for(
@@ -2151,6 +2320,7 @@ mod tests {
         let framer = BoundedRecordFramer::new(
             Cursor::new(bytes),
             plan.source_identity()?,
+            plan.source_binding_id.clone(),
             plan.replayability,
             test_profile()?.limits().max_record_bytes(),
         )?;
@@ -2241,6 +2411,7 @@ mod tests {
         let mut framer = BoundedRecordFramer::new(
             Cursor::new(bytes),
             source_identity,
+            "binding-framer",
             Replayability::Replayable,
             policy.max_record_bytes,
         )?;
@@ -2285,6 +2456,7 @@ mod tests {
         let mut framer = BoundedRecordFramer::new(
             reader,
             SourceIdentity::new("SNAPSHOT_A", "rev-1")?,
+            "binding-one-byte",
             Replayability::Replayable,
             4_096,
         )?;
@@ -2306,6 +2478,7 @@ mod tests {
         let mut framer = BoundedRecordFramer::new(
             Cursor::new(too_long),
             identity.clone(),
+            "binding-too-long",
             Replayability::Replayable,
             16,
         )?;
@@ -2320,6 +2493,7 @@ mod tests {
                 bytes
             }),
             identity.clone(),
+            "binding-exact",
             Replayability::Replayable,
             16,
         )?;
@@ -2330,6 +2504,7 @@ mod tests {
         let mut trailing = BoundedRecordFramer::new(
             Cursor::new(b"incomplete".to_vec()),
             identity,
+            "binding-trailing",
             Replayability::Replayable,
             16,
         )?;
@@ -2920,6 +3095,7 @@ mod tests {
             compression_profile_id: COMPRESSION_VERSION_NONE.to_owned(),
             source_snapshot_id: "SNAPSHOT_A".to_owned(),
             source_revision: "rev-1".to_owned(),
+            source_binding_id: "binding-cancel".to_owned(),
             replayability: Replayability::Replayable,
             source_content_digest: String::new(),
             expected_record_count: 1,
@@ -3112,6 +3288,7 @@ mod tests {
                 bytes
             }),
             wrong.source_identity()?,
+            wrong.source_binding_id.clone(),
             Replayability::Replayable,
             4_096,
         )?;
@@ -3195,7 +3372,8 @@ mod tests {
             "a truncated spool is retained as quarantine evidence, not adopted"
         );
         assert!(
-            spool_evidence_file(&fixture.ledger, "operation-spool").exists(),
+            spool_evidence_file(&fixture.ledger, "operation-spool", &plan.source_binding_id)
+                .exists(),
             "the spool seal survives a mismatch"
         );
         Ok(())
@@ -3361,6 +3539,703 @@ mod tests {
             manifest_bytes, outcome.manifest_bytes,
             "the published manifest is the sealed manifest"
         );
+        Ok(())
+    }
+
+    struct CountingSource {
+        inner: Box<dyn ArtifactRecordSource>,
+        completions: Arc<AtomicUsize>,
+        reads: Arc<AtomicUsize>,
+        completed: bool,
+    }
+
+    impl ArtifactRecordSource for CountingSource {
+        fn source_identity(&self) -> SourceIdentity {
+            self.inner.source_identity()
+        }
+
+        fn source_binding_id(&self) -> String {
+            self.inner.source_binding_id()
+        }
+
+        fn replayability(&self) -> Replayability {
+            self.inner.replayability()
+        }
+
+        fn next_record(&mut self) -> Result<Option<CanonicalRecord>, StreamError> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let record = self.inner.next_record()?;
+            if record.is_none() && !self.completed {
+                self.completed = true;
+                self.completions
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            Ok(record)
+        }
+
+        fn max_record_bytes(&self) -> u64 {
+            self.inner.max_record_bytes()
+        }
+    }
+
+    struct ShuffledCase {
+        plans: Vec<ArtifactPlan>,
+        sources: Vec<Box<dyn ArtifactRecordSource>>,
+        records: Vec<Vec<CanonicalRecord>>,
+        completions: Vec<Arc<AtomicUsize>>,
+    }
+
+    fn shuffled_case() -> TestResult<ShuffledCase> {
+        let specs = [
+            (
+                "partition-c",
+                0_u32,
+                "artifacts/c.jsonl",
+                "value-c",
+                7_u64,
+                "binding-c",
+                false,
+            ),
+            (
+                "partition-a",
+                1,
+                "artifacts/a1.jsonl",
+                "value-a1",
+                3,
+                "binding-a1",
+                false,
+            ),
+            (
+                "partition-b",
+                0,
+                "artifacts/b.jsonl",
+                "value-b",
+                5,
+                "binding-b",
+                true,
+            ),
+            (
+                "partition-a",
+                0,
+                "artifacts/a0.jsonl",
+                "value-a0",
+                1,
+                "binding-a0",
+                true,
+            ),
+        ];
+        let mut plans = Vec::new();
+        let mut sources: Vec<Box<dyn ArtifactRecordSource>> = Vec::new();
+        let mut all_records = Vec::new();
+        let mut completions = Vec::new();
+        let mut reads = Vec::new();
+        for (partition, shard, path, text, number, binding, non_replayable) in specs {
+            let records = vec![
+                sequenced_record(text, number)?,
+                sequenced_record(&format!("{text}-next"), number.saturating_add(1))?,
+            ];
+            let mut plan = make_plan_with_binding(
+                partition,
+                shard,
+                path,
+                CompressionMode::None,
+                &records,
+                binding,
+            )?;
+            plan.source_snapshot_id = "SHARED_SNAPSHOT".to_owned();
+            plan.source_revision = "rev-shared".to_owned();
+            if non_replayable {
+                plan.replayability = Replayability::NonReplayable;
+            }
+            let inner = source_for(&plan, &records)?;
+            let completion = Arc::new(AtomicUsize::new(0));
+            let read = Arc::new(AtomicUsize::new(0));
+            sources.push(Box::new(CountingSource {
+                inner,
+                completions: completion.clone(),
+                reads: read.clone(),
+                completed: false,
+            }));
+            completions.push(completion);
+            reads.push(read);
+            all_records.push(records);
+            plans.push(plan);
+        }
+        Ok(ShuffledCase {
+            plans,
+            sources,
+            records: all_records,
+            completions,
+        })
+    }
+
+    fn canonical_expectation(
+        plans: &[ArtifactPlan],
+        records: &[Vec<CanonicalRecord>],
+    ) -> Vec<(ArtifactPlan, Vec<CanonicalRecord>)> {
+        let mut expected: Vec<(ArtifactPlan, Vec<CanonicalRecord>)> =
+            plans.iter().cloned().zip(records.iter().cloned()).collect();
+        expected.sort_by(|left, right| {
+            left.0
+                .logical_partition_id
+                .cmp(&right.0.logical_partition_id)
+                .then(left.0.shard_ordinal.cmp(&right.0.shard_ordinal))
+        });
+        expected
+    }
+
+    fn stream_digest(records: &[CanonicalRecord]) -> String {
+        hex_encode(
+            &records
+                .iter()
+                .fold(Sha256::new(), |mut hasher, record| {
+                    hasher.update(&record.bytes);
+                    hasher.update(b"\n");
+                    hasher
+                })
+                .finalize(),
+        )
+    }
+
+    #[test]
+    fn shuffled_source_binding_pairs_survive_canonical_sort() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let expected = canonical_expectation(&case.plans, &case.records);
+        assert_eq!(
+            outcome.descriptors.len(),
+            expected.len(),
+            "every shuffled artifact produced one descriptor"
+        );
+        for (index, (plan, _)) in expected.iter().enumerate() {
+            let descriptor = &outcome.descriptors[index];
+            assert_eq!(
+                (
+                    descriptor.logical_partition_id.as_str(),
+                    descriptor.shard_ordinal,
+                    descriptor.path.as_str()
+                ),
+                (
+                    plan.logical_partition_id.as_str(),
+                    plan.shard_ordinal,
+                    plan.path.as_str()
+                ),
+                "descriptor {index} carries the canonical position of its paired plan"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_descriptors_digest_and_count_match_assigned_source() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let expected = canonical_expectation(&case.plans, &case.records);
+        for (index, (_, records)) in expected.iter().enumerate() {
+            let descriptor = &outcome.descriptors[index];
+            assert_eq!(
+                descriptor.uncompressed_sha256,
+                stream_digest(records),
+                "descriptor {index} digests the bytes of its assigned source"
+            );
+            assert_eq!(
+                descriptor.record_count,
+                u64::try_from(records.len())?,
+                "descriptor {index} counts the records of its assigned source"
+            );
+            assert_eq!(
+                outcome.source_bindings[index].binding_id, expected[index].0.source_binding_id,
+                "descriptor {index} carries the binding of its assigned source"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_replay_proofs_match_assigned_plans() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let expected = canonical_expectation(&case.plans, &case.records);
+        assert_eq!(
+            outcome.replay_proofs.len(),
+            expected.len(),
+            "one proof is retained for each artifact"
+        );
+        for (index, (plan, records)) in expected.iter().enumerate() {
+            let proof = &outcome.replay_proofs[index];
+            verify_replay_proof(&plan.path, plan, proof)?;
+            assert_eq!(
+                proof.source_binding_id, plan.source_binding_id,
+                "proof {index} binds the plan's source stream"
+            );
+            assert_eq!(
+                proof.source_content_digest,
+                stream_digest(records),
+                "proof {index} digests the assigned source"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_sources_are_consumed_to_end_once_each() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        for (index, counter) in case.completions.iter().enumerate() {
+            assert_eq!(
+                counter.load(std::sync::atomic::Ordering::SeqCst),
+                1,
+                "source {index} reached end of stream in one pass"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_non_replayable_sources_write_separate_binding_spools() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let files: Vec<String> = fs::read_dir(&fixture.spool)?
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .collect();
+        for plan in case
+            .plans
+            .iter()
+            .filter(|plan| plan.replayability == Replayability::NonReplayable)
+        {
+            let expected = format!("operation-b15-{}-spool.spool", plan.source_binding_id);
+            let file_context = format!("binding {} has its own spool file", plan.source_binding_id);
+            assert!(files.contains(&expected), "{file_context}");
+            let evidence_context = format!(
+                "binding {} has its own sealed spool evidence",
+                plan.source_binding_id
+            );
+            assert!(
+                spool_evidence_file(&fixture.ledger, "operation-b15", &plan.source_binding_id)
+                    .exists(),
+                "{evidence_context}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_preparation_intent_carries_canonical_source_bindings() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("the preparation intent is missing"))?;
+        let expected = canonical_expectation(&case.plans, &case.records);
+        let canonical: Vec<ArtifactSourceBinding> = expected
+            .iter()
+            .map(|(plan, _)| plan.source_binding())
+            .collect();
+        assert_eq!(
+            preparation.source_bindings, canonical,
+            "preparation evidence binds each canonical position to one stream"
+        );
+        assert_eq!(
+            outcome.source_bindings, canonical,
+            "the outcome exposes the same canonical bindings"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_sealed_intent_carries_canonical_source_bindings() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let sealed = load_sealed_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("the sealed intent is missing"))?;
+        let expected = canonical_expectation(&case.plans, &case.records);
+        let canonical: Vec<ArtifactSourceBinding> = expected
+            .iter()
+            .map(|(plan, _)| plan.source_binding())
+            .collect();
+        assert_eq!(
+            sealed.source_bindings, canonical,
+            "the seal repeats the preparation binding order"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_recovery_accepts_the_matching_binding_chain() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let policy = test_profile()?.limits().to_resource_policy();
+        let recovered =
+            recover_streaming(&fixture.root, &fixture.ledger, "operation-b15", &policy)?;
+        assert!(
+            matches!(recovered, StreamRecoveryOutcome::Recovered(_)),
+            "a matching binding chain recovers the publication"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_binding_refuses_before_a_record_is_read() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        let inner = BoundedRecordFramer::new(
+            Cursor::new(Vec::new()),
+            plan.source_identity()?,
+            "binding-other",
+            plan.replayability,
+            test_profile()?.limits().max_record_bytes(),
+        )?;
+        let read = Arc::new(AtomicUsize::new(0));
+        let source = CountingSource {
+            inner: Box::new(inner),
+            completions: Arc::new(AtomicUsize::new(0)),
+            reads: read.clone(),
+            completed: false,
+        };
+        let result = publish(
+            &fixture,
+            vec![plan],
+            vec![Box::new(source) as Box<dyn ArtifactRecordSource>],
+            StreamFaults::default(),
+            Cancellation::new(),
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::SourceBindingMismatch(..))),
+            "a source with another binding is refused before consumption"
+        );
+        assert_eq!(
+            read.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no record was read from the misbound source"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-b15").exists(),
+            "a binding mismatch cannot reach the seal"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_binding_refuses_before_a_non_replayable_source_is_spooled() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let mut plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let inner = BoundedRecordFramer::new(
+            Cursor::new(Vec::new()),
+            plan.source_identity()?,
+            "binding-other",
+            plan.replayability,
+            test_profile()?.limits().max_record_bytes(),
+        )?;
+        let read = Arc::new(AtomicUsize::new(0));
+        let source = CountingSource {
+            inner: Box::new(inner),
+            completions: Arc::new(AtomicUsize::new(0)),
+            reads: read.clone(),
+            completed: false,
+        };
+        let result = publish(
+            &fixture,
+            vec![plan.clone()],
+            vec![Box::new(source) as Box<dyn ArtifactRecordSource>],
+            StreamFaults::default(),
+            Cancellation::new(),
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::SourceBindingMismatch(..))),
+            "a misbound non-replayable source is refused before spooling"
+        );
+        assert_eq!(
+            read.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the spool did not consume the misbound source"
+        );
+        assert!(
+            !fixture
+                .spool
+                .join(format!(
+                    "operation-b15-{}-spool.spool",
+                    plan.source_binding_id
+                ))
+                .exists(),
+            "no spool bytes were written for the refused source"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_artifact_positions_reject_in_shuffled_input() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let mut plans = case.plans.clone();
+        plans[0].logical_partition_id = plans[2].logical_partition_id.clone();
+        plans[0].shard_ordinal = plans[2].shard_ordinal;
+        let result = publish(
+            &fixture,
+            plans,
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::PolicyExceeded(message)) if message.contains("duplicate artifact position")),
+            "two plans at one canonical position are refused"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-b15").exists(),
+            "a duplicate position cannot reach the seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_binding_ids_reject_before_preparation() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let mut plans = case.plans.clone();
+        plans[0].source_binding_id = plans[1].source_binding_id.clone();
+        let result = publish(
+            &fixture,
+            plans,
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::PolicyExceeded(message)) if message.contains("duplicate artifact binding")),
+            "two plans may not claim one source stream"
+        );
+        assert!(
+            !preparation_file(&fixture.ledger, "operation-b15").exists(),
+            "a duplicate binding is refused before preparation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_bindings_use_the_opaque_alphabet() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        let sources = vec![source_for(&plan, &records)?];
+        let mut invalid = plan.clone();
+        invalid.source_binding_id = String::new();
+        let result = publish(
+            &fixture,
+            vec![invalid],
+            sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::PolicyExceeded(message)) if message.contains("source binding")),
+            "an empty binding is refused"
+        );
+        assert!(
+            BoundedRecordFramer::new(
+                Cursor::new(Vec::new()),
+                SourceIdentity::new("SNAPSHOT_A", "rev-1")?,
+                "binding.with.dot",
+                Replayability::Replayable,
+                4_096,
+            )
+            .is_err(),
+            "a framer refuses a binding outside the opaque alphabet"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_count_mismatch_rejects_before_preparation() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let mut sources = case.sources;
+        sources.pop();
+        let result = publish(
+            &fixture,
+            case.plans.clone(),
+            sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::PolicyExceeded(message)) if message.contains("source count differs")),
+            "a missing source is refused before any plan is consumed"
+        );
+        assert!(
+            !preparation_file(&fixture.ledger, "operation-b15").exists(),
+            "a count mismatch writes no preparation intent"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_result_is_independent_of_input_order() -> TestResult {
+        let first_fixture = fixture()?;
+        let first = shuffled_case()?;
+        let first_outcome = publish(
+            &first_fixture,
+            first.plans.clone(),
+            first.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let second_fixture = fixture()?;
+        let second = shuffled_case()?;
+        let mut second_plans = second.plans.clone();
+        let mut second_sources = second.sources;
+        second_plans.reverse();
+        second_sources.reverse();
+        let second_outcome = publish(
+            &second_fixture,
+            second_plans,
+            second_sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        assert_eq!(
+            first_outcome.descriptors, second_outcome.descriptors,
+            "descriptors do not depend on input permutation"
+        );
+        assert_eq!(
+            first_outcome.replay_proofs, second_outcome.replay_proofs,
+            "replay proofs do not depend on input permutation"
+        );
+        assert_eq!(
+            first_outcome.manifest_bytes, second_outcome.manifest_bytes,
+            "manifest bytes do not depend on input permutation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shuffled_dataset_digest_follows_the_canonical_assignment() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let expected = canonical_expectation(&case.plans, &case.records);
+        let mut bytes = Vec::new();
+        for (_, records) in expected {
+            for record in records {
+                bytes.extend_from_slice(&record.bytes);
+                bytes.push(b'\n');
+            }
+        }
+        assert_eq!(
+            outcome.recovery_evidence.data_sha256,
+            hex_encode(&sha256_bytes(&bytes)),
+            "the dataset digest follows the canonically assigned sources"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_inventory_matches_canonical_descriptors() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let sealed = load_sealed_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("the sealed intent is missing"))?;
+        assert_eq!(
+            sealed.artifact_inventory, outcome.descriptors,
+            "the seal binds the same canonical descriptor inventory"
+        );
+        for pair in outcome.descriptors.windows(2) {
+            assert!(
+                (pair[0].logical_partition_id.as_str(), pair[0].shard_ordinal)
+                    <= (pair[1].logical_partition_id.as_str(), pair[1].shard_ordinal),
+                "descriptors stay in canonical partition and shard order"
+            );
+        }
         Ok(())
     }
 }
