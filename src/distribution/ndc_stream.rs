@@ -2,10 +2,13 @@
 //! Bounded streaming NDC v2 Profile 1 producer with a two-intent lifecycle.
 //!
 //! This module consumes one canonical record at a time from an
-//! [`ArtifactRecordSource`], validates canonical bytes and byte-derived order
-//! incrementally, updates expanded and stored digests as bytes are emitted,
-//! and writes artifacts to an owned staging tree. No whole-artifact vector,
-//! whole-input record vector or whole-dataset sort exists on this path.
+//! [`ArtifactRecordSource`]. The core owns the record buffer: each adapter
+//! writes record bytes into a bounded [`RecordSink`] that the core supplies,
+//! and canonical JSON is validated only from those core-held bytes. Byte-derived
+//! order, expanded and stored digests are updated incrementally as bytes are
+//! emitted, and artifacts are written to an owned staging tree. No
+//! whole-artifact vector, whole-input record vector or whole-dataset sort
+//! exists on this path.
 //!
 //! A durable [`PreparationIntent`] is written and synced before any source is
 //! consumed. A [`SealedPublicationIntent`] is written and synced only after
@@ -21,7 +24,6 @@
 //! `OPERATIONALLY_QUALIFIED` remain blocked.
 
 use std::collections::BTreeSet;
-use std::collections::VecDeque;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::ffi::CString;
 use std::fmt;
@@ -495,6 +497,11 @@ impl ArtifactPlan {
 }
 
 /// Bounded, one-record-at-a-time source for one planned artifact.
+///
+/// The core owns the record buffer. An adapter writes bytes into the
+/// [`RecordSink`] supplied by the core instead of returning a pre-materialized
+/// record. [`RecordSliceSource`] adapts already-materialized bytes, but it does
+/// not bound allocation that a caller performed before the write.
 pub trait ArtifactRecordSource {
     /// Opaque snapshot identity and revision; must equal the plan values.
     fn source_identity(&self) -> SourceIdentity;
@@ -502,22 +509,181 @@ pub trait ArtifactRecordSource {
     fn source_binding_id(&self) -> String;
     /// Declaration checked against the plan; a weaker declaration fails closed.
     fn replayability(&self) -> Replayability;
-    /// Next canonical record without a line terminator, or `None` at end of
-    /// stream. A call after end of stream is a typed state error.
-    fn next_record(&mut self) -> Result<Option<CanonicalRecord>, StreamError>;
-    /// Profile maximum used by the bounded framer; not a caller hint.
+    /// Write one canonical record, without a line terminator, into the
+    /// core-provided sink. Return `true` when a record was written and `false`
+    /// at end of stream. A call after end of stream is a typed state error.
+    fn write_next_record(&mut self, sink: &mut RecordSink<'_>) -> Result<bool, StreamError>;
+    /// Declared bound checked by the core before the source is consumed.
     fn max_record_bytes(&self) -> u64;
 }
 
-/// Bounded framer over a byte reader. One reusable buffer stays at or below
-/// the profile record bound, and no unbounded line read is used.
+/// Core-owned bounded buffer for one canonical record.
+///
+/// The core allocates and reuses the backing vector. Each write is checked
+/// before the buffer grows, so one oversized write and a sequence of smaller
+/// writes that cross the bound take the same refusal path. An adapter cannot
+/// supply record bytes by any route other than this sink.
+pub struct RecordSink<'a> {
+    buffer: &'a mut Vec<u8>,
+    max_record_bytes: u64,
+    index: usize,
+    exceeded: bool,
+}
+
+impl<'a> RecordSink<'a> {
+    /// Wrap one core-owned reusable buffer with the profile record bound.
+    #[must_use]
+    pub fn new(buffer: &'a mut Vec<u8>, max_record_bytes: u64, index: usize) -> Self {
+        Self {
+            buffer,
+            max_record_bytes,
+            index,
+            exceeded: false,
+        }
+    }
+
+    /// Number of record bytes accepted so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Whether no record bytes were accepted so far.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.buffer.is_empty()
+    }
+
+    /// Whether a write tried to cross the profile record bound.
+    #[must_use]
+    pub fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    /// Append one chunk after checked length accounting.
+    ///
+    /// A chunk that would cross the bound is refused whole; no part of it is
+    /// appended. The `exceeded` marker stays observable to the core even when
+    /// an adapter ignores the returned error.
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), StreamError> {
+        let current = u64::try_from(self.buffer.len())
+            .map_err(|_| StreamError::PolicyExceeded("record length overflow".to_owned()))?;
+        let added = u64::try_from(bytes.len())
+            .map_err(|_| StreamError::PolicyExceeded("write length overflow".to_owned()))?;
+        let total = checked_total(current, added, "record bytes")?;
+        if total > self.max_record_bytes {
+            self.exceeded = true;
+            return Err(StreamError::PolicyExceeded(format!(
+                "record {} exceeds max_record_bytes {}",
+                self.index, self.max_record_bytes
+            )));
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+impl IoWrite for RecordSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.push(bytes)
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Compatibility adapter over records a caller already materialized.
+///
+/// Each record is pushed into the core sink in one bounded write; no extra
+/// copy is made here. The caller's own allocation is outside the core bound,
+/// so this adapter does not claim memory independence for materialized input.
+pub struct RecordSliceSource {
+    identity: SourceIdentity,
+    binding_id: String,
+    replayability: Replayability,
+    records: Box<[CanonicalRecord]>,
+    max_record_bytes: u64,
+    index: usize,
+    ended: bool,
+}
+
+impl RecordSliceSource {
+    /// Take ownership of already-materialized records and declare the stream
+    /// identity. The records are moved, not copied again.
+    pub fn new(
+        records: impl Into<Box<[CanonicalRecord]>>,
+        identity: SourceIdentity,
+        binding_id: impl Into<String>,
+        replayability: Replayability,
+    ) -> Result<Self, StreamError> {
+        let records = records.into();
+        let binding_id = binding_id.into();
+        if !is_opaque_token(&binding_id) {
+            return Err(StreamError::PolicyExceeded(
+                "source binding is empty or outside the opaque alphabet".to_owned(),
+            ));
+        }
+        let max_record_bytes = records.iter().fold(0_u64, |largest, record| {
+            let length = u64::try_from(record.bytes.len()).unwrap_or(u64::MAX);
+            largest.max(length)
+        });
+        Ok(Self {
+            identity,
+            binding_id,
+            replayability,
+            records,
+            max_record_bytes,
+            index: 0,
+            ended: false,
+        })
+    }
+}
+
+impl ArtifactRecordSource for RecordSliceSource {
+    fn source_identity(&self) -> SourceIdentity {
+        self.identity.clone()
+    }
+
+    fn source_binding_id(&self) -> String {
+        self.binding_id.clone()
+    }
+
+    fn replayability(&self) -> Replayability {
+        self.replayability
+    }
+
+    fn write_next_record(&mut self, sink: &mut RecordSink<'_>) -> Result<bool, StreamError> {
+        if self.ended {
+            return Err(StreamError::InvalidRecord(
+                self.index,
+                "record requested after end of stream".to_owned(),
+            ));
+        }
+        let Some(record) = self.records.get(self.index) else {
+            self.ended = true;
+            return Ok(false);
+        };
+        sink.push(&record.bytes)?;
+        self.index = self.index.saturating_add(1);
+        Ok(true)
+    }
+
+    fn max_record_bytes(&self) -> u64 {
+        self.max_record_bytes
+    }
+}
+
+/// Bounded framer over a byte reader. Bytes are written into the core sink;
+/// no unbounded line read or adapter-owned record buffer is used.
 pub struct BoundedRecordFramer<R: IoRead> {
     reader: R,
     identity: SourceIdentity,
     binding_id: String,
     replayability: Replayability,
     max_record_bytes: u64,
-    buffer: Vec<u8>,
     ended: bool,
     index: usize,
 }
@@ -549,7 +715,6 @@ impl<R: IoRead> BoundedRecordFramer<R> {
             binding_id,
             replayability,
             max_record_bytes,
-            buffer: Vec::new(),
             ended: false,
             index: 0,
         })
@@ -569,7 +734,7 @@ impl<R: IoRead> ArtifactRecordSource for BoundedRecordFramer<R> {
         self.replayability
     }
 
-    fn next_record(&mut self) -> Result<Option<CanonicalRecord>, StreamError> {
+    fn write_next_record(&mut self, sink: &mut RecordSink<'_>) -> Result<bool, StreamError> {
         if self.ended {
             return Err(StreamError::InvalidRecord(
                 self.index,
@@ -580,9 +745,9 @@ impl<R: IoRead> ArtifactRecordSource for BoundedRecordFramer<R> {
         loop {
             match self.reader.read(&mut byte) {
                 Ok(0) => {
-                    if self.buffer.is_empty() {
+                    if sink.is_empty() {
                         self.ended = true;
-                        return Ok(None);
+                        return Ok(false);
                     }
                     return Err(StreamError::InvalidRecord(
                         self.index,
@@ -591,24 +756,16 @@ impl<R: IoRead> ArtifactRecordSource for BoundedRecordFramer<R> {
                 }
                 Ok(1) => {
                     if byte[0] == b'\n' {
-                        if self.buffer.is_empty() {
+                        if sink.is_empty() {
                             return Err(StreamError::InvalidRecord(
                                 self.index,
                                 "empty record".to_owned(),
                             ));
                         }
-                        let bytes = std::mem::take(&mut self.buffer);
                         self.index = self.index.saturating_add(1);
-                        return Ok(Some(CanonicalRecord { bytes }));
+                        return Ok(true);
                     }
-                    let length = u64::try_from(self.buffer.len()).unwrap_or(u64::MAX);
-                    if length >= self.max_record_bytes {
-                        return Err(StreamError::PolicyExceeded(format!(
-                            "record {} exceeds max_record_bytes {}",
-                            self.index, self.max_record_bytes
-                        )));
-                    }
-                    self.buffer.push(byte[0]);
+                    sink.push(&byte)?;
                 }
                 Ok(_) => {
                     return Err(StreamError::Io(
@@ -920,44 +1077,6 @@ impl IoWrite for StoredSink<'_> {
     }
 }
 
-/// Fixed-capacity handoff between the bounded source and the byte validator.
-/// The queue is sized from the profile and holds at most one record slot per
-/// entry; no queue grows with the record count of the artifact.
-struct RecordHandoff {
-    queue: VecDeque<CanonicalRecord>,
-    capacity: u64,
-}
-
-impl RecordHandoff {
-    fn new(limits: &ProfileLimits) -> Result<Self, StreamError> {
-        let capacity = limits
-            .queue_capacity_records()
-            .min(limits.max_records_per_artifact());
-        let slots = usize::try_from(capacity)
-            .map_err(|_| StreamError::PolicyExceeded("queue capacity overflow".to_owned()))?;
-        Ok(Self {
-            queue: VecDeque::with_capacity(slots),
-            capacity,
-        })
-    }
-
-    fn push(&mut self, record: CanonicalRecord) -> Result<(), StreamError> {
-        let length = u64::try_from(self.queue.len())
-            .map_err(|_| StreamError::PolicyExceeded("queue length overflow".to_owned()))?;
-        enforce(
-            length,
-            self.capacity.saturating_sub(1),
-            "queue_capacity_records",
-        )?;
-        self.queue.push_back(record);
-        Ok(())
-    }
-
-    fn pop(&mut self) -> Option<CanonicalRecord> {
-        self.queue.pop_front()
-    }
-}
-
 /// Inputs to one artifact streaming pass.
 struct ArtifactStreamInput<'a> {
     source: &'a mut dyn ArtifactRecordSource,
@@ -1033,32 +1152,45 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
         limits,
     };
     let mut tracker = OrderTracker::new(input.plan)?;
-    let mut handoff = RecordHandoff::new(limits)?;
     let mut content_hasher = Sha256::new();
     let mut record_count = 0_u64;
+    let mut record_buffer = Vec::new();
     let mut written = match input.plan.compression {
         CompressionMode::None => GzipWriter::Plain(sink),
         CompressionMode::Gzip => GzipWriter::Gzip(GzEncoder::new(sink, GzipCompression::default())),
     };
-    while let Some(record) = input.source.next_record()? {
-        input.evidence.stage = FaultStage::SourceRead.as_str();
-        injected(input.faults, FaultStage::SourceRead)?;
-        handoff.push(record)?;
-        let record = handoff.pop().ok_or_else(|| {
-            StreamError::PolicyExceeded("record handoff lost its queued record".to_owned())
-        })?;
-        input.cancellation.check("record")?;
-        check_duration(input.started, limits)?;
+    loop {
+        record_buffer.clear();
         let index = usize::try_from(record_count)
             .map_err(|_| StreamError::PolicyExceeded("record index overflow".to_owned()))?;
-        tracker.observe(&input.plan.path, &record.bytes, index, &policy)?;
+        let written_record = {
+            let mut sink = RecordSink::new(&mut record_buffer, limits.max_record_bytes(), index);
+            let result = input.source.write_next_record(&mut sink);
+            if sink.exceeded() {
+                return Err(StreamError::PolicyExceeded(format!(
+                    "record {index} exceeds max_record_bytes {}",
+                    limits.max_record_bytes()
+                )));
+            }
+            result
+        };
+        if !written_record? {
+            break;
+        }
+        input.evidence.stage = FaultStage::SourceRead.as_str();
+        injected(input.faults, FaultStage::SourceRead)?;
+        let bytes = &record_buffer[..];
+        input.cancellation.check("record")?;
+        check_duration(input.started, limits)?;
+        tracker.observe(&input.plan.path, bytes, index, &policy)?;
         input.evidence.stage = FaultStage::RecordValidation.as_str();
         injected(input.faults, FaultStage::RecordValidation)?;
-        let mut emitted = Vec::with_capacity(record.bytes.len().saturating_add(1));
-        emitted.extend_from_slice(&record.bytes);
-        emitted.push(b'\n');
-        let next = u64::try_from(emitted.len())
-            .map_err(|_| StreamError::PolicyExceeded("record length overflow".to_owned()))?;
+        let next = u64::try_from(bytes.len())
+            .map_err(|_| StreamError::PolicyExceeded("record length overflow".to_owned()))?
+            .checked_add(1)
+            .ok_or_else(|| {
+                StreamError::PolicyExceeded("framed record length overflow".to_owned())
+            })?;
         enforce(
             next,
             limits.max_record_bytes().saturating_add(1),
@@ -1076,14 +1208,18 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
             limits.max_expanded_bytes_per_release(),
             "max_expanded_bytes_per_release",
         )?;
-        written.update_expanded(&emitted);
-        written.write_expanded(&emitted)?;
+        written.update_expanded(bytes);
+        written.write_expanded(bytes)?;
+        written.update_expanded(b"\n");
+        written.write_expanded(b"\n")?;
         input.evidence.stage = FaultStage::ArtifactWrite.as_str();
         injected(input.faults, FaultStage::ArtifactWrite)?;
         written.set_expanded(expanded);
         *input.release_expanded = release;
-        content_hasher.update(&emitted);
-        input.dataset_hasher.update(&emitted);
+        content_hasher.update(bytes);
+        content_hasher.update(b"\n");
+        input.dataset_hasher.update(bytes);
+        input.dataset_hasher.update(b"\n");
         record_count = checked_total(record_count, 1, "record count")?;
         enforce(
             record_count,
@@ -1198,8 +1334,9 @@ impl<'a> GzipWriter<'a> {
 }
 
 /// Check the fixed-state ceiling against the role memory budget. The bound
-/// covers one active record, the bounded handoff queue and one I/O chunk; it
-/// is computed from the profile before any source is opened.
+/// covers one core-owned record buffer, the profile-declared handoff slots as
+/// a conservative ceiling and one I/O chunk; it is computed from the profile
+/// before any source is opened.
 fn check_memory_budget(limits: &ProfileLimits) -> Result<(), StreamError> {
     let slots = limits
         .queue_capacity_records()
@@ -1735,12 +1872,33 @@ pub fn spool_non_replayable(
     let mut first = String::new();
     let mut last = String::new();
     let mut tracker = OrderTracker::new(plan)?;
-    while let Some(record) = source.next_record()? {
+    let mut record_buffer = Vec::new();
+    loop {
+        record_buffer.clear();
         let index = usize::try_from(records)
             .map_err(|_| StreamError::PolicyExceeded("spool record index overflow".to_owned()))?;
-        tracker.observe(&plan.path, &record.bytes, index, &policy)?;
-        let next = u64::try_from(record.bytes.len().saturating_add(1))
-            .map_err(|_| StreamError::PolicyExceeded("spool record length overflow".to_owned()))?;
+        let written_record = {
+            let mut sink = RecordSink::new(&mut record_buffer, limits.max_record_bytes(), index);
+            let result = source.write_next_record(&mut sink);
+            if sink.exceeded() {
+                return Err(StreamError::PolicyExceeded(format!(
+                    "record {index} exceeds max_record_bytes {}",
+                    limits.max_record_bytes()
+                )));
+            }
+            result
+        };
+        if !written_record? {
+            break;
+        }
+        let bytes = &record_buffer[..];
+        tracker.observe(&plan.path, bytes, index, &policy)?;
+        let next = u64::try_from(bytes.len())
+            .map_err(|_| StreamError::PolicyExceeded("spool record length overflow".to_owned()))?
+            .checked_add(1)
+            .ok_or_else(|| {
+                StreamError::PolicyExceeded("spool framed length overflow".to_owned())
+            })?;
         stored_bytes = checked_total(stored_bytes, next, "spool bytes")?;
         enforce(stored_bytes, spool_plan.max_spool_bytes, "max_spool_bytes")?;
         reserve_temp_bytes(
@@ -1749,11 +1907,11 @@ pub fn spool_non_replayable(
             "spool temp disk bytes",
             limits.temp_disk_bytes(),
         )?;
-        file.write_all(&record.bytes)
+        file.write_all(bytes)
             .map_err(|error| io_error("write spool record", error))?;
         file.write_all(b"\n")
             .map_err(|error| io_error("write spool terminator", error))?;
-        hasher.update(&record.bytes);
+        hasher.update(bytes);
         hasher.update(b"\n");
         records = checked_total(records, 1, "spool records")?;
         enforce(
@@ -3800,12 +3958,55 @@ mod tests {
         Ok(())
     }
 
+    /// Test-only reader that reproduces the core handoff and returns a copy
+    /// for assertions; production code keeps only the core-owned buffer.
+    struct TestReader {
+        buffer: Vec<u8>,
+        max_record_bytes: u64,
+        index: usize,
+    }
+
     fn quarantined_report(
         result: Result<StreamingOutcome, StreamError>,
     ) -> PreparationQuarantineReport {
         match result {
             Err(StreamError::PreparationQuarantined(report)) => report,
             other => panic!("a pre-seal failure must be quarantined: {other:?}"),
+        }
+    }
+
+    impl TestReader {
+        fn new(max_record_bytes: u64) -> Self {
+            Self {
+                buffer: Vec::new(),
+                max_record_bytes,
+                index: 0,
+            }
+        }
+
+        fn next(
+            &mut self,
+            source: &mut dyn ArtifactRecordSource,
+        ) -> Result<Option<CanonicalRecord>, StreamError> {
+            self.buffer.clear();
+            let result = {
+                let mut sink = RecordSink::new(&mut self.buffer, self.max_record_bytes, self.index);
+                let result = source.write_next_record(&mut sink);
+                if sink.exceeded() {
+                    return Err(StreamError::PolicyExceeded(format!(
+                        "record {} exceeds max_record_bytes {}",
+                        self.index, self.max_record_bytes
+                    )));
+                }
+                result
+            };
+            if !result? {
+                return Ok(None);
+            }
+            self.index = self.index.saturating_add(1);
+            Ok(Some(CanonicalRecord {
+                bytes: self.buffer.clone(),
+            }))
         }
     }
 
@@ -4432,6 +4633,209 @@ mod tests {
         Ok(())
     }
 
+    /// Adversarial adapter that supplies record bytes only through the core
+    /// sink. `ignore_write_error` models an adapter that discards sink refusals.
+    struct SinkWriterSource {
+        identity: SourceIdentity,
+        binding_id: String,
+        replayability: Replayability,
+        max_record_bytes: u64,
+        chunks: Vec<Vec<u8>>,
+        ignore_write_error: bool,
+        ended: bool,
+    }
+
+    impl SinkWriterSource {
+        fn new(
+            plan: &ArtifactPlan,
+            chunks: Vec<Vec<u8>>,
+            ignore_write_error: bool,
+        ) -> TestResult<Self> {
+            Ok(Self {
+                identity: plan.source_identity()?,
+                binding_id: plan.source_binding_id.clone(),
+                replayability: plan.replayability,
+                max_record_bytes: test_profile()?.limits().max_record_bytes(),
+                chunks,
+                ignore_write_error,
+                ended: false,
+            })
+        }
+    }
+
+    impl ArtifactRecordSource for SinkWriterSource {
+        fn source_identity(&self) -> SourceIdentity {
+            self.identity.clone()
+        }
+
+        fn source_binding_id(&self) -> String {
+            self.binding_id.clone()
+        }
+
+        fn replayability(&self) -> Replayability {
+            self.replayability
+        }
+
+        fn write_next_record(&mut self, sink: &mut RecordSink<'_>) -> Result<bool, StreamError> {
+            if self.ended {
+                return Err(StreamError::InvalidRecord(
+                    0,
+                    "record requested after end of stream".to_owned(),
+                ));
+            }
+            for chunk in &self.chunks {
+                if self.ignore_write_error {
+                    let _ = sink.push(chunk);
+                } else {
+                    sink.push(chunk)?;
+                }
+            }
+            self.ended = true;
+            Ok(true)
+        }
+
+        fn max_record_bytes(&self) -> u64 {
+            self.max_record_bytes
+        }
+    }
+
+    fn publish_chunks(
+        fixture: &Fixture,
+        chunks: Vec<Vec<u8>>,
+        ignore_write_error: bool,
+        operation_id: &str,
+    ) -> TestResult<Result<StreamingOutcome, StreamError>> {
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        let source = SinkWriterSource::new(&plan, chunks, ignore_write_error)?;
+        publish_with_limits(
+            fixture,
+            test_limits(),
+            operation_id,
+            vec![plan],
+            vec![Box::new(source)],
+        )
+    }
+
+    fn record_of_length(target: usize) -> TestResult<CanonicalRecord> {
+        let base_length = sequenced_record("x", 1)?.bytes.len();
+        assert!(target >= base_length, "target length must fit the envelope");
+        let text = "a".repeat(target.saturating_sub(base_length).saturating_add(1));
+        let policy = test_profile()?.limits().to_resource_policy();
+        let value = json!({
+            "envelope_schema_version": "envelope-abstract-1",
+            "event_type": "event-type-abstract",
+            "ordering": {
+                "kind": "sequenced",
+                "sequence_domain_id": "domain-a",
+                "sequence_epoch": "epoch-1",
+                "sequence_number": "1"
+            },
+            "payload": {
+                "fields": [
+                    {
+                        "field_name": "abstract-field",
+                        "kind": "string",
+                        "value": text
+                    }
+                ]
+            }
+        });
+        let parsed = parse_jcs_value(&value.to_string())?;
+        Ok(CanonicalRecord {
+            bytes: canonicalize_strict(&parsed, &policy)?,
+        })
+    }
+
+    /// Plan for one long record. Order keys come from a short record with the
+    /// same byte-derived position; the content digest covers the long bytes.
+    fn plan_for_long_record(
+        record: &CanonicalRecord,
+        path: &str,
+        binding_id: &str,
+    ) -> TestResult<ArtifactPlan> {
+        let short = [sequenced_record("x", 1)?];
+        let mut plan = make_plan("partition-long", 0, path, CompressionMode::None, &short)?;
+        plan.source_binding_id = binding_id.to_owned();
+        plan.path = path.to_owned();
+        let mut hasher = Sha256::new();
+        hasher.update(&record.bytes);
+        hasher.update(b"\n");
+        plan.source_content_digest = hex_encode(&hasher.finalize());
+        plan.expected_record_count = 1;
+        Ok(plan)
+    }
+
+    /// Build a plan whose declared ordering profile is the reference profile.
+    fn make_reference_plan(
+        partition: &str,
+        shard: u32,
+        path: &str,
+        records: &[CanonicalRecord],
+        binding_id: &str,
+    ) -> TestResult<ArtifactPlan> {
+        let mut hasher = Sha256::new();
+        for record in records {
+            hasher.update(&record.bytes);
+            hasher.update(b"\n");
+        }
+        let mut plan = ArtifactPlan {
+            logical_partition_id: partition.to_owned(),
+            shard_ordinal: shard,
+            path: path.to_owned(),
+            record_order_profile: RecordOrderProfile::Reference,
+            encoding: ENCODING_NDJSON.to_owned(),
+            compression: CompressionMode::None,
+            compression_profile_id: COMPRESSION_VERSION_NONE.to_owned(),
+            source_snapshot_id: "SNAPSHOT_A".to_owned(),
+            source_revision: "rev-1".to_owned(),
+            source_binding_id: binding_id.to_owned(),
+            replayability: Replayability::Replayable,
+            source_content_digest: hex_encode(&hasher.finalize()),
+            expected_record_count: u64::try_from(records.len())?,
+            first_order_key: String::new(),
+            last_order_key: String::new(),
+        };
+        let proof = proof_for_records(&plan, records)?;
+        plan.first_order_key = proof.first_order_key;
+        plan.last_order_key = proof.last_order_key;
+        Ok(plan)
+    }
+
+    fn reference_record(object_id: &str, revision: u64, time: u64) -> TestResult<CanonicalRecord> {
+        let policy = test_profile()?.limits().to_resource_policy();
+        let value = json!({
+            "envelope_schema_version": "envelope-abstract-1",
+            "event_type": "event-type-abstract",
+            "ordering": {
+                "kind": "reference",
+                "object_id": object_id,
+                "revision": revision.to_string(),
+                "knowledge_time_ns": time.to_string(),
+                "assertion_id": "assertion-a"
+            },
+            "payload": {
+                "fields": [
+                    {
+                        "field_name": "abstract-field",
+                        "kind": "string",
+                        "value": "abstract-reference"
+                    }
+                ]
+            }
+        });
+        let parsed = parse_jcs_value(&value.to_string())?;
+        Ok(CanonicalRecord {
+            bytes: canonicalize_strict(&parsed, &policy)?,
+        })
+    }
+
     #[test]
     fn framer_yields_one_record_at_a_time_and_reports_end_of_stream() -> TestResult {
         let policy = test_profile()?.limits().to_resource_policy();
@@ -4449,21 +4853,33 @@ mod tests {
             Replayability::Replayable,
             policy.max_record_bytes,
         )?;
-        let first_read = framer.next_record()?.expect("the first record is present");
+        let mut reader = TestReader::new(policy.max_record_bytes);
+        let first_read = reader
+            .next(&mut framer)?
+            .expect("the first record is present");
         assert_eq!(
             first_read.bytes, first.bytes,
             "the first record is unchanged"
         );
-        let second_read = framer.next_record()?.expect("the second record is present");
+        let second_read = reader
+            .next(&mut framer)?
+            .expect("the second record is present");
         assert_eq!(
             second_read.bytes, second.bytes,
             "the second record is unchanged"
         );
-        assert!(framer.next_record()?.is_none(), "end of stream is explicit");
         assert!(
-            matches!(framer.next_record(), Err(StreamError::InvalidRecord(_, _))),
-            "a read after end of stream is a typed state error"
+            reader.next(&mut framer)?.is_none(),
+            "end of stream is explicit"
         );
+        let state_error = matches!(
+            reader.next(&mut framer),
+            Err(StreamError::InvalidRecord(_, _))
+        );
+        assert!(
+            state_error,
+            "a core-sink read after end of stream is a typed state error"
+        ); // the sink carries the typed state error after end of stream
         Ok(())
     }
 
@@ -4494,7 +4910,9 @@ mod tests {
             Replayability::Replayable,
             4_096,
         )?;
-        let observed = framer.next_record()?.expect("the framed record is present");
+        let observed = TestReader::new(4_096)
+            .next(&mut framer)?
+            .expect("the framed record is present");
         assert_eq!(
             observed.bytes, record.bytes,
             "one-byte reads reconstruct the record"
@@ -4517,7 +4935,10 @@ mod tests {
             16,
         )?;
         assert!(
-            matches!(framer.next_record(), Err(StreamError::PolicyExceeded(_))),
+            matches!(
+                TestReader::new(16).next(&mut framer),
+                Err(StreamError::PolicyExceeded(_))
+            ),
             "a record above the bound is refused before allocation grows"
         );
         let mut exact = BoundedRecordFramer::new(
@@ -4531,10 +4952,8 @@ mod tests {
             Replayability::Replayable,
             16,
         )?;
-        assert!(
-            exact.next_record()?.is_some(),
-            "a record ending exactly at the bound is accepted"
-        );
+        let exact_read = TestReader::new(16).next(&mut exact)?.is_some();
+        assert!(exact_read, "exact bound record is accepted");
         let mut trailing = BoundedRecordFramer::new(
             Cursor::new(b"incomplete".to_vec()),
             identity,
@@ -4544,12 +4963,496 @@ mod tests {
         )?;
         assert!(
             matches!(
-                trailing.next_record(),
+                TestReader::new(16).next(&mut trailing),
                 Err(StreamError::InvalidRecord(_, _))
             ),
             "a trailing record without LF is refused"
         );
         Ok(())
+    }
+
+    #[test]
+    fn core_sink_accepts_a_write_at_the_record_limit() {
+        let mut buffer = Vec::new();
+        let mut sink = RecordSink::new(&mut buffer, 16, 0);
+        sink.push(&[b'a'; 16])
+            .expect("a write at the bound is accepted");
+        assert_eq!(sink.len(), 16, "the core buffer holds exactly the bound");
+        assert!(!sink.exceeded(), "no bound breach is recorded at the limit");
+    }
+
+    #[test]
+    fn core_sink_rejects_one_write_past_the_record_limit() {
+        let mut buffer = Vec::new();
+        let mut sink = RecordSink::new(&mut buffer, 16, 0);
+        let error = sink
+            .push(&[b'a'; 17])
+            .expect_err("one write past the bound is refused");
+        assert!(
+            matches!(&error, StreamError::PolicyExceeded(message) if message == "record 0 exceeds max_record_bytes 16"),
+            "the typed refusal names the record and the bound"
+        );
+        assert!(sink.exceeded(), "the core observes the bound breach");
+        assert!(
+            buffer.is_empty(),
+            "no part of the refused chunk is appended"
+        );
+    }
+
+    #[test]
+    fn core_sink_rejects_incremental_writes_with_the_same_refusal() {
+        let mut single_buffer = Vec::new();
+        let mut single = RecordSink::new(&mut single_buffer, 16, 0);
+        let single_error = single
+            .push(&[b'a'; 17])
+            .expect_err("one oversized write is refused");
+        let mut gradual_buffer = Vec::new();
+        let mut gradual = RecordSink::new(&mut gradual_buffer, 16, 0);
+        for _ in 0..16 {
+            gradual
+                .push(b"b")
+                .expect("bytes up to the bound are accepted");
+        }
+        let gradual_error = gradual
+            .push(b"b")
+            .expect_err("the byte past the bound is refused");
+        assert_eq!(
+            single_error.to_string(),
+            gradual_error.to_string(),
+            "one large write and incremental writes produce one refusal message"
+        );
+        assert_eq!(
+            single_error.code(),
+            gradual_error.code(),
+            "both write patterns share the typed policy code"
+        );
+        assert_eq!(
+            gradual_buffer.len(),
+            16,
+            "the incremental buffer stops at the bound"
+        );
+    }
+
+    #[test]
+    fn malicious_adapter_one_oversized_write_is_refused_before_seal() -> TestResult {
+        let fixture = fixture()?;
+        let result = publish_chunks(
+            &fixture,
+            vec![vec![b'a'; 4_097]],
+            false,
+            "operation-oversized-single",
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_POLICY_EXCEEDED",
+            "a single oversized write is preserved as a bound failure"
+        );
+        assert_eq!(
+            report.first_failure,
+            "stream resource bound exceeded: record 0 exceeds max_record_bytes 4096",
+            "a single oversized write names the core bound"
+        );
+        assert!(
+            preparation_file(&fixture.ledger, "operation-oversized-single").exists(),
+            "preparation is durable before the source is consumed"
+        );
+        assert!(
+            load_sealed_intent(&fixture.ledger, "operation-oversized-single")?.is_none(),
+            "no seal follows an oversized write"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malicious_adapter_incremental_oversized_writes_are_refused_before_seal() -> TestResult {
+        let fixture = fixture()?;
+        let chunks = (0..4_097).map(|_| vec![b'a']).collect();
+        let result = publish_chunks(&fixture, chunks, false, "operation-oversized-incremental")?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_POLICY_EXCEEDED",
+            "incremental writes past the bound are preserved as a bound failure"
+        );
+        assert_eq!(
+            report.first_failure,
+            "stream resource bound exceeded: record 0 exceeds max_record_bytes 4096",
+            "incremental writes past the bound meet the same refusal as one write"
+        );
+        assert!(
+            load_sealed_intent(&fixture.ledger, "operation-oversized-incremental")?.is_none(),
+            "no seal follows incremental oversized writes"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malicious_adapter_ignoring_sink_errors_is_still_refused() -> TestResult {
+        let fixture = fixture()?;
+        let result = publish_chunks(
+            &fixture,
+            vec![vec![b'a'; 4_097]],
+            true,
+            "operation-ignored-sink-error",
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_POLICY_EXCEEDED",
+            "a discarded sink error is preserved as a bound failure"
+        );
+        assert_eq!(
+            report.first_failure,
+            "stream resource bound exceeded: record 0 exceeds max_record_bytes 4096",
+            "discarding the sink error does not bypass the core check"
+        );
+        assert!(
+            load_sealed_intent(&fixture.ledger, "operation-ignored-sink-error")?.is_none(),
+            "a discarding adapter cannot reach the seal"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn record_slice_adapter_writes_through_the_core_sink() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![
+            sequenced_record("abstract-slice", 1)?,
+            sequenced_record("abstract-slice-next", 2)?,
+        ];
+        let plan = make_plan(
+            "partition-slice",
+            0,
+            "artifacts/slice.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        let source = RecordSliceSource::new(
+            records.clone(),
+            plan.source_identity()?,
+            plan.source_binding_id.clone(),
+            plan.replayability,
+        )?;
+        let outcome = publish_with_limits(
+            &fixture,
+            test_limits(),
+            "operation-slice",
+            vec![plan],
+            vec![Box::new(source)],
+        )??;
+        assert_eq!(
+            outcome.descriptors[0].record_count, 2,
+            "the compatibility adapter emits both records through the sink"
+        );
+        assert_eq!(
+            outcome.replay_proofs[0].source_content_digest,
+            stream_digest(&records),
+            "the compatibility adapter preserves the emitted byte digest"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_json_is_rejected_from_core_held_bytes() -> TestResult {
+        let fixture = fixture()?;
+        let mut text = String::from("null");
+        for _ in 0..20 {
+            text = format!("{{\"a\":{text}}}");
+        }
+        let result = publish_chunks(
+            &fixture,
+            vec![text.into_bytes()],
+            false,
+            "operation-nested-json",
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_INVALID_RECORD",
+            "deeply nested JSON is preserved as an invalid record"
+        );
+        assert!(
+            report.first_failure.contains("nesting depth"),
+            "deeply nested JSON is refused after core validation"
+        );
+        assert!(
+            load_sealed_intent(&fixture.ledger, "operation-nested-json")?.is_none(),
+            "a nested JSON refusal leaves no seal"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_json_is_rejected_from_core_held_bytes() -> TestResult {
+        let fixture = fixture()?;
+        let cases = [b"{\"a\": 1}".to_vec(), b"{broken".to_vec(), Vec::new()];
+        for (index, bytes) in cases.into_iter().enumerate() {
+            let operation_id = format!("operation-malformed-{index}");
+            let result = publish_chunks(&fixture, vec![bytes], false, &operation_id)?;
+            let report = quarantined_report(result);
+            assert_eq!(
+                report.failure_code, "STREAM_INVALID_RECORD",
+                "malformed case {index} is preserved as an invalid record"
+            );
+            assert!(
+                load_sealed_intent(&fixture.ledger, &operation_id)?.is_none(),
+                "malformed case {index} leaves no seal"
+            );
+        }
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn record_at_exact_limit_passes_through_the_core_sink() -> TestResult {
+        let fixture = fixture()?;
+        let record = record_of_length(4_096)?;
+        assert_eq!(
+            record.bytes.len(),
+            4_096,
+            "the fixture record is at the core bound"
+        );
+        let plan = plan_for_long_record(&record, "artifacts/exact.jsonl", "binding-exact")?;
+        let source = RecordSliceSource::new(
+            vec![record],
+            plan.source_identity()?,
+            plan.source_binding_id.clone(),
+            plan.replayability,
+        )?;
+        let mut limits = test_limits();
+        limits.max_string_bytes = 4_096;
+        let outcome = publish_with_limits(
+            &fixture,
+            limits,
+            "operation-exact-limit",
+            vec![plan],
+            vec![Box::new(source)],
+        )??;
+        assert_eq!(
+            outcome.descriptors[0].record_count, 1,
+            "a record at the core bound is emitted"
+        );
+        assert!(
+            sealed_file(&fixture.ledger, "operation-exact-limit").exists(),
+            "a record at the bound reaches the seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn record_one_byte_past_limit_is_rejected_by_the_core_sink() -> TestResult {
+        let fixture = fixture()?;
+        let record = record_of_length(4_097)?;
+        assert_eq!(
+            record.bytes.len(),
+            4_097,
+            "the fixture record is one byte past the core bound"
+        );
+        let plan = plan_for_long_record(&record, "artifacts/over.jsonl", "binding-over")?;
+        let source = SinkWriterSource::new(&plan, vec![record.bytes.clone()], false)?;
+        let mut limits = test_limits();
+        limits.max_string_bytes = 4_096;
+        let result = publish_with_limits(
+            &fixture,
+            limits,
+            "operation-max-plus-one",
+            vec![plan],
+            vec![Box::new(source)],
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_POLICY_EXCEEDED",
+            "the byte past the bound is preserved as a bound failure"
+        );
+        assert_eq!(
+            report.first_failure,
+            "stream resource bound exceeded: record 0 exceeds max_record_bytes 4096",
+            "the byte past the bound is refused by the core sink"
+        );
+        assert!(
+            load_sealed_intent(&fixture.ledger, "operation-max-plus-one")?.is_none(),
+            "no seal follows a max-plus-one record"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn sequenced_and_reference_profiles_both_stream_through_the_core_sink() -> TestResult {
+        let sequenced_fixture = fixture()?;
+        let sequenced_records = vec![
+            sequenced_record("abstract-seq-1", 1)?,
+            sequenced_record("abstract-seq-2", 2)?,
+        ];
+        let sequenced_plan = make_plan(
+            "partition-profile",
+            0,
+            "artifacts/seq.jsonl",
+            CompressionMode::None,
+            &sequenced_records,
+        )?;
+        let sequenced_source = RecordSliceSource::new(
+            sequenced_records,
+            sequenced_plan.source_identity()?,
+            sequenced_plan.source_binding_id.clone(),
+            sequenced_plan.replayability,
+        )?;
+        let sequenced_outcome = publish_with_limits(
+            &sequenced_fixture,
+            test_limits(),
+            "operation-profile-seq",
+            vec![sequenced_plan],
+            vec![Box::new(sequenced_source)],
+        )??;
+        assert_eq!(
+            sequenced_outcome.replay_proofs[0].record_count, 2,
+            "the sequenced profile streams two records"
+        );
+
+        let reference_fixture = fixture()?;
+        let reference_records = vec![
+            reference_record("object-a", 1, 10)?,
+            reference_record("object-b", 2, 20)?,
+        ];
+        let reference_plan = make_reference_plan(
+            "partition-profile",
+            1,
+            "artifacts/ref.jsonl",
+            &reference_records,
+            "binding-profile-ref",
+        )?;
+        let reference_source = RecordSliceSource::new(
+            reference_records,
+            reference_plan.source_identity()?,
+            reference_plan.source_binding_id.clone(),
+            reference_plan.replayability,
+        )?;
+        let reference_outcome = publish_with_limits(
+            &reference_fixture,
+            test_limits(),
+            "operation-profile-ref",
+            vec![reference_plan],
+            vec![Box::new(reference_source)],
+        )??;
+        assert_eq!(
+            reference_outcome.replay_proofs[0].record_count, 2,
+            "the reference profile streams two records"
+        );
+        assert_ne!(
+            reference_outcome.replay_proofs[0].first_order_key,
+            reference_outcome.replay_proofs[0].last_order_key,
+            "the reference profile derives distinct byte-derived keys"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reference_profile_out_of_order_is_rejected_from_core_held_bytes() -> TestResult {
+        let fixture = fixture()?;
+        let ordered = vec![
+            reference_record("object-a", 1, 10)?,
+            reference_record("object-b", 2, 20)?,
+        ];
+        let plan = make_reference_plan(
+            "partition-ref-order",
+            0,
+            "artifacts/ref-ordered.jsonl",
+            &ordered,
+            "binding-ref-order",
+        )?;
+        let records = vec![
+            reference_record("object-b", 2, 20)?,
+            reference_record("object-a", 1, 10)?,
+        ];
+        let source = RecordSliceSource::new(
+            records,
+            plan.source_identity()?,
+            plan.source_binding_id.clone(),
+            plan.replayability,
+        )?;
+        let result = publish_with_limits(
+            &fixture,
+            test_limits(),
+            "operation-ref-reversed",
+            vec![plan],
+            vec![Box::new(source)],
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_INVALID_ORDER",
+            "a decreasing reference position is preserved as an order failure"
+        );
+        assert!(
+            load_sealed_intent(&fixture.ledger, "operation-ref-reversed")?.is_none(),
+            "an out-of-order reference stream reaches no seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn profile_digest_is_unchanged_by_the_bounded_record_port() -> TestResult {
+        assert_eq!(
+            hex_encode(test_profile()?.digest()),
+            "fd9ed2d5e618b94cb829b824d2531f4857efbdede7901c475245a90ca80f28ce",
+            "the role profile digest predates the bounded record port"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spool_refuses_an_oversized_write_from_an_adapter() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let mut plan = make_plan(
+            "partition-spool",
+            0,
+            "artifacts/spooled.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let planned = spool_plan_for("operation-spool-oversized", 0, &plan)?;
+        let mut source = SinkWriterSource::new(&plan, vec![vec![b'a'; 4_097]], false)?;
+        let mut disk = 0_u64;
+        let result = spool_non_replayable(
+            &mut source,
+            &plan,
+            &planned,
+            &fixture.spool,
+            &fixture.ledger,
+            "test-preparation-digest",
+            &test_profile()?,
+            &mut disk,
+            SpoolFault::None,
+        );
+        assert!(
+            matches!(result, Err(StreamError::PolicyExceeded(_))),
+            "the spool path uses the same core bound as the artifact path"
+        );
+        assert!(
+            !spool_evidence_file(&fixture.ledger, &planned.spool_file_id).exists(),
+            "no spool seal exists after an oversized write"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn core_owns_the_only_record_handoff() {
+        let source = include_str!("ndc_stream.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        assert!(
+            !production.contains("fn next_record("),
+            "the pre-materialized record method is absent from the source port"
+        );
+        assert!(
+            !production.contains("VecDeque"),
+            "the adapter-owned record queue is removed from the streaming path"
+        );
+        assert!(
+            production.contains("RecordSink"),
+            "the core sink is the one record handoff"
+        );
     }
 
     #[test]
@@ -5342,7 +6245,9 @@ mod tests {
             &records,
         )?;
         let mut source = source_for(&plan, &records)?;
-        let record = source.next_record()?.expect("the source has one record");
+        let record = TestReader::new(4_096)
+            .next(source.as_mut())?
+            .expect("the source has one record");
         let mut wrong = plan.clone();
         wrong.source_revision = "rev-2".to_owned();
         let wrong_source = BoundedRecordFramer::new(
@@ -5608,15 +6513,15 @@ mod tests {
             self.inner.replayability()
         }
 
-        fn next_record(&mut self) -> Result<Option<CanonicalRecord>, StreamError> {
+        fn write_next_record(&mut self, sink: &mut RecordSink<'_>) -> Result<bool, StreamError> {
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let record = self.inner.next_record()?;
-            if record.is_none() && !self.completed {
+            let written = self.inner.write_next_record(sink)?;
+            if !written && !self.completed {
                 self.completed = true;
                 self.completions
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            Ok(record)
+            Ok(written)
         }
 
         fn max_record_bytes(&self) -> u64 {
@@ -7025,9 +7930,10 @@ mod tests {
         plan.replayability = Replayability::NonReplayable;
         let (evidence, _) = spool_for_test(&fixture, "operation-reader", &plan, &records)?;
         let mut framer = verify_spool(&fixture.spool, &evidence, &test_profile()?)?;
+        let mut reader = TestReader::new(test_profile()?.limits().max_record_bytes());
         let mut hasher = Sha256::new();
         let mut count = 0_u64;
-        while let Some(record) = framer.next_record()? {
+        while let Some(record) = reader.next(&mut framer)? {
             hasher.update(&record.bytes);
             hasher.update(b"\n");
             count = checked_total(count, 1, "verified reader records")?;

@@ -123,6 +123,9 @@ rather than a rewrite of history.
 - [Multi-artifact non-replayable spooling](docs/fb-spool-001-multi-source-spool-2026-11-24.md)
   — FB-SPOOL-001 per-artifact spool plans and evidence, descriptor-relative
   verification, ordered durability barriers and shared temp-disk budget.
+- [Core-owned bounded record port](docs/fb-source-001-bounded-record-port-2026-11-24.md)
+  — FB-SOURCE-001 core-owned record sink, checked write bound and typed
+  adapter refusal.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)
