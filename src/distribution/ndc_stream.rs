@@ -712,6 +712,33 @@ fn enforce(current: u64, maximum: u64, label: &str) -> Result<(), StreamError> {
     Ok(())
 }
 
+/// Check one artifact's codec expansion ratio against its stored size.
+///
+/// The admissible expanded size is `stored_bytes * max_expansion_ratio`,
+/// widened to `u128` so a product of two `u64` profile values cannot wrap. A
+/// stream with zero stored bytes admits zero expanded bytes: the empty
+/// artifact has no bytes on either side of the codec. The check runs after the
+/// codec is finished and before any replay proof, manifest or seal is built.
+fn enforce_expansion_ratio(
+    expanded_bytes: u64,
+    stored_bytes: u64,
+    max_expansion_ratio: u64,
+) -> Result<(), StreamError> {
+    if stored_bytes == 0 && expanded_bytes != 0 {
+        return Err(StreamError::PolicyExceeded(
+            "max_expansion_ratio zero stored bytes with expanded bytes".to_owned(),
+        ));
+    }
+    let allowed = u128::from(stored_bytes) * u128::from(max_expansion_ratio);
+    let observed = u128::from(expanded_bytes);
+    if observed > allowed {
+        return Err(StreamError::PolicyExceeded(format!(
+            "max_expansion_ratio {observed} exceeds {allowed} for {stored_bytes} stored bytes at ratio {max_expansion_ratio}"
+        )));
+    }
+    Ok(())
+}
+
 /// Stored-byte sink that digests and bounds bytes on their way to the staging
 /// file. The compressor writes into this sink; no whole-artifact buffer exists.
 struct StoredSink<'a> {
@@ -933,13 +960,11 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
     )?;
     *input.release_records = release_records;
     let sink = written.finish()?;
-    if sink.stored_bytes > 0 {
-        let allowed = sink
-            .expanded_bytes
-            .checked_mul(limits.max_expansion_ratio())
-            .ok_or_else(|| StreamError::PolicyExceeded("expansion ratio overflow".to_owned()))?;
-        enforce(sink.expanded_bytes, allowed, "max_expansion_ratio")?;
-    }
+    enforce_expansion_ratio(
+        sink.expanded_bytes,
+        sink.stored_bytes,
+        limits.max_expansion_ratio(),
+    )?;
     let proof = ReplayProof {
         source_binding_id: input.plan.source_binding_id.clone(),
         source_content_digest: hex_encode(&content_hasher.finalize()),
@@ -2386,6 +2411,62 @@ mod tests {
             cancellation,
             faults,
         }))
+    }
+
+    fn publish_with_limits(
+        fixture: &Fixture,
+        limits: LimitInputs,
+        operation_id: &str,
+        plans: Vec<ArtifactPlan>,
+        sources: Vec<Box<dyn ArtifactRecordSource>>,
+    ) -> TestResult<Result<StreamingOutcome, StreamError>> {
+        let profile = ResourceProfile::new_test_only(
+            ResourceProfileId::new("STREAM_B15_TEST_ONLY_RATIO_V1", 1)?,
+            ProcessingRole::Producer,
+            ProfileLimits::new(limits)?,
+        )?;
+        let manifest = test_manifest()?;
+        let evidence = test_evidence()?;
+        let observed = BTreeSet::new();
+        let (signing, verifying) = test_keys();
+        let mut selection = ProfileSelection::new();
+        selection.insert_test_only(profile.clone())?;
+        Ok(publish_streaming(StreamingBuildRequest {
+            release_root: &fixture.root,
+            ledger_dir: &fixture.ledger,
+            spool_dir: &fixture.spool,
+            operation_id,
+            commit_position: "commit-b15",
+            manifest: &manifest,
+            evidence: &evidence,
+            observed_event_types: &observed,
+            signature: SignatureConfig {
+                signing_key: &signing,
+                verifying_key: &verifying,
+                key_id: &manifest.publication_identity.signing_key_id,
+            },
+            sources,
+            plans: &plans,
+            profile: &profile,
+            profile_selection: &selection,
+            context: InvocationContext::TestHarness,
+            cancellation: Cancellation::new(),
+            faults: StreamFaults::default(),
+        }))
+    }
+
+    fn varied_text(seed: u64, length: usize) -> String {
+        let alphabet = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let mut state = seed;
+        let mut text = String::with_capacity(length);
+        for _ in 0..length {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let slot = usize::try_from(state >> 58).expect("six high bits fit in usize");
+            text.push(char::from(alphabet[slot % alphabet.len()]));
+        }
+        text
     }
 
     fn assert_no_availability(fixture: &Fixture) -> TestResult {
@@ -4236,6 +4317,344 @@ mod tests {
                 "descriptors stay in canonical partition and shard order"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_ratio_at_limit_is_accepted() {
+        assert!(
+            enforce_expansion_ratio(48, 16, 3).is_ok(),
+            "expanded bytes at stored bytes times ratio satisfy the bound"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_one_byte_over_limit_is_rejected() {
+        let error = enforce_expansion_ratio(49, 16, 3)
+            .expect_err("one expanded byte above the bound is refused");
+        assert!(
+            matches!(&error, StreamError::PolicyExceeded(message) if message.contains("max_expansion_ratio")),
+            "the typed refusal names the expansion ratio bound"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_zero_stored_and_zero_expanded_is_accepted() {
+        assert!(
+            enforce_expansion_ratio(0, 0, 7).is_ok(),
+            "an empty artifact has no bytes on either side of the codec"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_zero_stored_with_expanded_bytes_is_rejected() {
+        let error = enforce_expansion_ratio(1, 0, 7)
+            .expect_err("expanded bytes without stored bytes are refused");
+        assert!(
+            matches!(&error, StreamError::PolicyExceeded(message) if message.contains("zero stored bytes")),
+            "the refusal names the explicit zero-stored-byte rule"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_tautological_calculation_is_replaced() {
+        let error = enforce_expansion_ratio(1_000, 10, 10)
+            .expect_err("the stored-based relation refuses a case the old calculation admitted");
+        assert!(
+            matches!(&error, StreamError::PolicyExceeded(message) if message.contains("max_expansion_ratio")),
+            "the regression case is reported as a ratio bound breach"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_u64_max_product_is_overflow_safe() {
+        assert!(
+            enforce_expansion_ratio(u64::MAX, u64::MAX, u64::MAX).is_ok(),
+            "the u64 product fits in u128 and is accepted"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_large_product_rejects_without_overflow() {
+        let error = enforce_expansion_ratio((1_u64 << 63) + 1, 1_u64 << 62, 2)
+            .expect_err("a wide product above the bound is refused in u128");
+        assert!(
+            matches!(&error, StreamError::PolicyExceeded(message) if message.contains("max_expansion_ratio")),
+            "the wide case reports the ratio bound instead of an arithmetic error"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_single_stored_byte_boundary_is_enforced() {
+        assert!(
+            enforce_expansion_ratio(32, 1, 32).is_ok(),
+            "one stored byte admits ratio-many expanded bytes"
+        );
+        let error = enforce_expansion_ratio(33, 1, 32)
+            .expect_err("one byte past the single-stored-byte bound is refused");
+        assert!(
+            matches!(&error, StreamError::PolicyExceeded(message) if message.contains("max_expansion_ratio")),
+            "the single-stored-byte breach names the bound"
+        );
+    }
+
+    #[test]
+    fn expansion_ratio_pipeline_plain_at_ratio_one_passes() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        let sources = vec![source_for(&plan, &records)?];
+        let mut limits = test_limits();
+        limits.max_expansion_ratio = 1;
+        let outcome = publish_with_limits(
+            &fixture,
+            limits,
+            "operation-ratio-plain",
+            vec![plan],
+            sources,
+        )??;
+        let descriptor = &outcome.descriptors[0];
+        assert_eq!(
+            descriptor.uncompressed_bytes, descriptor.stored_bytes,
+            "an uncompressed artifact sits at the ratio-one boundary"
+        );
+        assert!(
+            sealed_file(&fixture.ledger, "operation-ratio-plain").exists(),
+            "an artifact at the ratio bound reaches the seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_ratio_pipeline_incompressible_gzip_passes() -> TestResult {
+        let fixture = fixture()?;
+        let records = (0..24)
+            .map(|index| sequenced_record(&varied_text(index + 1, 512), index + 1))
+            .collect::<TestResult<Vec<_>>>()?;
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl.gz",
+            CompressionMode::Gzip,
+            &records,
+        )?;
+        let sources = vec![source_for(&plan, &records)?];
+        let mut limits = test_limits();
+        limits.max_expansion_ratio = 2;
+        let outcome = publish_with_limits(
+            &fixture,
+            limits,
+            "operation-ratio-incompressible",
+            vec![plan],
+            sources,
+        )??;
+        let descriptor = &outcome.descriptors[0];
+        assert!(
+            descriptor.uncompressed_bytes > descriptor.stored_bytes,
+            "the gzip framing and varied content remain distinguishable"
+        );
+        assert!(
+            descriptor.uncompressed_bytes <= descriptor.stored_bytes * 2,
+            "high-entropy content stays within a ratio of two"
+        );
+        assert!(
+            sealed_file(&fixture.ledger, "operation-ratio-incompressible").exists(),
+            "an artifact within the ratio reaches the seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_ratio_pipeline_highly_compressible_rejects() -> TestResult {
+        let fixture = fixture()?;
+        let repeated = "a".repeat(2_048);
+        let records = (0..40)
+            .map(|index| sequenced_record(&repeated, index + 1))
+            .collect::<TestResult<Vec<_>>>()?;
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl.gz",
+            CompressionMode::Gzip,
+            &records,
+        )?;
+        let sources = vec![source_for(&plan, &records)?];
+        let outcome = publish_with_limits(
+            &fixture,
+            test_limits(),
+            "operation-ratio-compressible",
+            vec![plan],
+            sources,
+        )?;
+        assert!(
+            matches!(outcome, Err(StreamError::PolicyExceeded(message)) if message.contains("max_expansion_ratio")),
+            "a compressed stream above the ratio is refused before the seal"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_ratio_rejection_leaves_no_sealed_intent_or_receipt() -> TestResult {
+        let fixture = fixture()?;
+        let repeated = "a".repeat(1_024);
+        let records = (0..32)
+            .map(|index| sequenced_record(&repeated, index + 1))
+            .collect::<TestResult<Vec<_>>>()?;
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl.gz",
+            CompressionMode::Gzip,
+            &records,
+        )?;
+        let sources = vec![source_for(&plan, &records)?];
+        let mut limits = test_limits();
+        limits.max_expansion_ratio = 4;
+        let result = publish_with_limits(
+            &fixture,
+            limits,
+            "operation-ratio-evidence",
+            vec![plan],
+            sources,
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::PolicyExceeded(_))),
+            "the ratio breach is a typed policy refusal"
+        );
+        assert!(
+            preparation_file(&fixture.ledger, "operation-ratio-evidence").exists(),
+            "the preparation intent is durable before the artifact is consumed"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-ratio-evidence").exists(),
+            "no sealed intent follows a ratio refusal"
+        );
+        assert!(
+            load_sealed_intent(&fixture.ledger, "operation-ratio-evidence")?.is_none(),
+            "no recoverable seal exists after a ratio refusal"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_ratio_pipeline_empty_uncompressed_artifact_passes() -> TestResult {
+        let fixture = fixture()?;
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl",
+            CompressionMode::None,
+            &[],
+        )?;
+        let sources = vec![source_for(&plan, &[])?];
+        let outcome = publish_with_limits(
+            &fixture,
+            test_limits(),
+            "operation-ratio-empty-plain",
+            vec![plan],
+            sources,
+        )??;
+        let descriptor = &outcome.descriptors[0];
+        assert_eq!(
+            descriptor.stored_bytes, 0,
+            "an empty uncompressed artifact stores zero bytes"
+        );
+        assert_eq!(
+            descriptor.uncompressed_bytes, 0,
+            "an empty uncompressed artifact expands to zero bytes"
+        );
+        assert!(
+            sealed_file(&fixture.ledger, "operation-ratio-empty-plain").exists(),
+            "the zero-stored-byte case reaches the seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_ratio_pipeline_empty_gzip_artifact_passes() -> TestResult {
+        let fixture = fixture()?;
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl.gz",
+            CompressionMode::Gzip,
+            &[],
+        )?;
+        let sources = vec![source_for(&plan, &[])?];
+        let outcome = publish_with_limits(
+            &fixture,
+            test_limits(),
+            "operation-ratio-empty-gzip",
+            vec![plan],
+            sources,
+        )??;
+        let descriptor = &outcome.descriptors[0];
+        assert_eq!(
+            descriptor.uncompressed_bytes, 0,
+            "an empty gzip artifact expands to zero bytes"
+        );
+        assert!(
+            descriptor.stored_bytes > 0,
+            "the gzip framing stores bytes for an empty artifact"
+        );
+        assert!(
+            sealed_file(&fixture.ledger, "operation-ratio-empty-gzip").exists(),
+            "a gzip artifact with stored framing and zero expanded bytes reaches the seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expansion_ratio_rejection_in_second_artifact_precedes_seal() -> TestResult {
+        let fixture = fixture()?;
+        let plain_records = vec![sequenced_record("abstract-1", 1)?];
+        let plain_plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/a.jsonl",
+            CompressionMode::None,
+            &plain_records,
+        )?;
+        let repeated = "a".repeat(2_048);
+        let packed_records = (0..40)
+            .map(|index| sequenced_record(&repeated, index + 1))
+            .collect::<TestResult<Vec<_>>>()?;
+        let packed_plan = make_plan(
+            "partition-b",
+            1,
+            "artifacts/b.jsonl.gz",
+            CompressionMode::Gzip,
+            &packed_records,
+        )?;
+        let plans = vec![packed_plan, plain_plan];
+        let sources = vec![
+            source_for(&plans[0], &packed_records)?,
+            source_for(&plans[1], &plain_records)?,
+        ];
+        let result = publish_with_limits(
+            &fixture,
+            test_limits(),
+            "operation-ratio-second-artifact",
+            plans,
+            sources,
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::PolicyExceeded(message)) if message.contains("max_expansion_ratio")),
+            "the second canonical artifact's ratio breach is refused"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-ratio-second-artifact").exists(),
+            "a multi-artifact ratio breach also precedes the seal"
+        );
+        assert_no_availability(&fixture)?;
         Ok(())
     }
 }
