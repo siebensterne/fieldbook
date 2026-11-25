@@ -120,6 +120,9 @@ rather than a rewrite of history.
 - [Preparation quarantine for bounded streaming](docs/fb-stream-002-preparation-quarantine-2026-11-24.md)
   — FB-STREAM-002 typed quarantine record, explicit pre-seal states, durable
   recovery evidence and fault-injection record.
+- [Multi-artifact non-replayable spooling](docs/fb-spool-001-multi-source-spool-2026-11-24.md)
+  — FB-SPOOL-001 per-artifact spool plans and evidence, descriptor-relative
+  verification, ordered durability barriers and shared temp-disk budget.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)

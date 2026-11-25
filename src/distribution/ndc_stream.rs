@@ -22,6 +22,8 @@
 
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::ffi::CString;
 use std::fmt;
 use std::fs;
 use std::fs::File;
@@ -30,6 +32,12 @@ use std::io;
 use std::io::BufReader;
 use std::io::Read as IoRead;
 use std::io::Write as IoWrite;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::mem::ManuallyDrop;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::FromRawFd;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -320,6 +328,27 @@ impl Replayability {
         match self {
             Self::Replayable => "REPLAYABLE",
             Self::NonReplayable => "NON_REPLAYABLE",
+        }
+    }
+}
+
+/// Durable state recorded in one spool evidence record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SpoolState {
+    /// Spool bytes were written and the spool file was synced.
+    Written,
+    /// The spool directory entry and its ledger evidence are durable.
+    Sealed,
+}
+
+impl SpoolState {
+    /// Stable wire literal.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Written => "WRITTEN",
+            Self::Sealed => "SEALED",
         }
     }
 }
@@ -1224,22 +1253,93 @@ pub struct PreparationIntent {
     pub compression_profile_id: String,
     /// Exact planned release-relative file set.
     pub planned_paths: Vec<String>,
-    /// Spool plan for non-replayable sources.
-    pub spool_plan: Option<SpoolPlan>,
+    /// Complete ordered inventory of spool plans, one per non-replayable
+    /// artifact in canonical artifact order. Empty when no source needs a
+    /// spool.
+    pub spool_plan: Vec<SpoolPlan>,
     /// Invocation context that admitted the profile.
     pub invocation_context: String,
     /// Digest of canonical bytes with this member excluded.
     pub intent_sha256: String,
 }
 
-/// Operation-scoped spool declaration for a non-replayable source.
+/// One operation-scoped spool declaration for one non-replayable artifact.
+///
+/// The plan is fixed in the preparation intent before any source is consumed.
+/// The spool file identity depends on the operation, the canonical artifact
+/// ordinal and the opaque binding; the artifact path is evidence only and is
+/// excluded from spool file naming and resolution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpoolPlan {
-    /// Spool file name within the caller-configured trusted spool directory.
-    pub file_name: String,
-    /// Profile temp-disk bound applied to this spool.
-    pub max_bytes: u64,
+    /// Operation whose preparation intent carries this plan.
+    pub operation_id: String,
+    /// Opaque stream binding of the non-replayable artifact.
+    pub artifact_binding_id: String,
+    /// Release-relative artifact path carried as evidence, not as a name.
+    pub artifact_path: String,
+    /// Snapshot identifier declared by the artifact plan.
+    pub source_snapshot_id: String,
+    /// Immutable revision declared by the artifact plan.
+    pub source_revision: String,
+    /// Safe spool file name within the caller-configured spool directory.
+    pub spool_file_id: String,
+    /// Per-spool byte bound drawn from the shared temp-disk budget.
+    pub max_spool_bytes: u64,
+}
+
+/// Derive one path-independent spool file identity.
+///
+/// The name combines the opaque operation identity, the canonical artifact
+/// ordinal and a digest of the opaque binding. No part of the artifact path
+/// reaches the file name, and both caller-supplied tokens are checked against
+/// the opaque alphabet before use.
+pub fn spool_file_id(
+    operation_id: &str,
+    artifact_ordinal: usize,
+    binding_id: &str,
+) -> Result<String, StreamError> {
+    if !is_opaque_token(operation_id) {
+        return Err(StreamError::PolicyExceeded(
+            "operation id is empty or outside the opaque alphabet".to_owned(),
+        ));
+    }
+    if !is_opaque_token(binding_id) {
+        return Err(StreamError::PolicyExceeded(
+            "spool binding id is empty or outside the opaque alphabet".to_owned(),
+        ));
+    }
+    let ordinal = u64::try_from(artifact_ordinal)
+        .map_err(|_| StreamError::PolicyExceeded("spool artifact ordinal overflow".to_owned()))?;
+    let material = format!("{operation_id}\0{ordinal}\0{binding_id}");
+    let digest = hex_encode(&sha256_bytes(material.as_bytes()));
+    Ok(format!(
+        "{operation_id}-{ordinal:08}-{}.spool",
+        &digest[..16]
+    ))
+}
+
+/// Build the preparation-time plan for one non-replayable artifact.
+fn build_spool_plan(
+    operation_id: &str,
+    artifact_ordinal: usize,
+    plan: &ArtifactPlan,
+    max_spool_bytes: u64,
+) -> Result<SpoolPlan, StreamError> {
+    if plan.replayability != Replayability::NonReplayable {
+        return Err(StreamError::PolicyExceeded(
+            "a replayable artifact has no spool plan".to_owned(),
+        ));
+    }
+    Ok(SpoolPlan {
+        operation_id: operation_id.to_owned(),
+        artifact_binding_id: plan.source_binding_id.clone(),
+        artifact_path: plan.path.clone(),
+        source_snapshot_id: plan.source_snapshot_id.clone(),
+        source_revision: plan.source_revision.clone(),
+        spool_file_id: spool_file_id(operation_id, artifact_ordinal, &plan.source_binding_id)?,
+        max_spool_bytes,
+    })
 }
 
 /// Immutable, self-digested seal written only after all artifacts are complete.
@@ -1278,6 +1378,8 @@ pub struct SealedPublicationIntent {
     pub resource_profile_id: String,
     /// Resource profile digest bound at production.
     pub resource_profile_digest: String,
+    /// Complete ordered inventory of independent spool evidence records.
+    pub spool_evidence: Vec<SpoolEvidence>,
     /// Digest of canonical bytes with this member excluded.
     pub intent_sha256: String,
 }
@@ -1339,8 +1441,8 @@ fn sealed_file(ledger: &Path, operation_id: &str) -> PathBuf {
     ledger.join(format!("{operation_id}.sealed.json"))
 }
 
-fn spool_evidence_file(ledger: &Path, operation_id: &str, binding_id: &str) -> PathBuf {
-    ledger.join(format!("{operation_id}.{binding_id}.{SPOOL_SEALED}.json"))
+fn spool_evidence_file(ledger: &Path, spool_file_id: &str) -> PathBuf {
+    ledger.join(format!("{spool_file_id}.{SPOOL_SEALED}.json"))
 }
 
 fn commit_ledger_record(path: &Path, bytes: &[u8], ledger: &Path) -> Result<(), StreamError> {
@@ -1349,9 +1451,27 @@ fn commit_ledger_record(path: &Path, bytes: &[u8], ledger: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Ledger records use their own caller-bounded budget and are outside the
+/// operation temp-disk budget. Each record length is checked against its
+/// profile maximum before the write allocates or commits anything.
+fn commit_bounded_ledger_record(
+    path: &Path,
+    bytes: &[u8],
+    ledger: &Path,
+    maximum: u64,
+    label: &str,
+) -> Result<(), StreamError> {
+    let length = u64::try_from(bytes.len()).map_err(|_| {
+        StreamError::PolicyExceeded(format!("{label} length exceeds addressable length"))
+    })?;
+    enforce(length, maximum, label)?;
+    commit_ledger_record(path, bytes, ledger)
+}
+
 fn write_preparation_intent(
     ledger: &Path,
     intent: &PreparationIntent,
+    maximum: u64,
 ) -> Result<String, StreamError> {
     let digest = ledger_digest(intent)?;
     let complete = PreparationIntent {
@@ -1359,10 +1479,12 @@ fn write_preparation_intent(
         ..intent.clone()
     };
     let bytes = canonical_ledger_bytes(&complete)?;
-    commit_ledger_record(
+    commit_bounded_ledger_record(
         &preparation_file(ledger, &complete.operation_id),
         &bytes,
         ledger,
+        maximum,
+        "max_preparation_intent_bytes",
     )?;
     Ok(digest)
 }
@@ -1397,6 +1519,7 @@ fn load_preparation_intent(
 fn write_sealed_intent(
     ledger: &Path,
     intent: &SealedPublicationIntent,
+    maximum: u64,
 ) -> Result<String, StreamError> {
     let digest = ledger_digest(intent)?;
     let complete = SealedPublicationIntent {
@@ -1404,7 +1527,13 @@ fn write_sealed_intent(
         ..intent.clone()
     };
     let bytes = canonical_ledger_bytes(&complete)?;
-    commit_ledger_record(&sealed_file(ledger, &complete.operation_id), &bytes, ledger)?;
+    commit_bounded_ledger_record(
+        &sealed_file(ledger, &complete.operation_id),
+        &bytes,
+        ledger,
+        maximum,
+        "max_sealed_intent_bytes",
+    )?;
     Ok(digest)
 }
 
@@ -1435,36 +1564,149 @@ fn load_sealed_intent(
     Ok(Some(intent))
 }
 
-/// Sealed spool evidence retained for recovery and explicit cleanup.
+/// Independent, self-digested evidence for one durable spool.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SpoolEvidence {
-    /// Spool file name.
-    pub file_name: String,
-    /// Digest of exact spool bytes.
-    pub spool_sha256: String,
-    /// Exact spool byte count.
-    pub spool_bytes: u64,
+    /// Safe spool file name derived from operation, ordinal and binding.
+    pub spool_file_id: String,
+    /// Operation whose preparation chain binds this spool.
+    pub operation_id: String,
+    /// Opaque binding of the artifact whose source was spooled.
+    pub artifact_binding_id: String,
+    /// Snapshot identity reported by the spooled source.
+    pub source_identity: SourceIdentity,
+    /// Exact stored spool byte count.
+    pub stored_bytes: u64,
+    /// SHA-256 of the exact stored spool bytes.
+    pub stored_sha256: String,
     /// Record count written to the spool.
     pub record_count: u64,
-    /// First derived key in the spool.
+    /// First byte-derived key in the spool.
     pub first_order_key: String,
-    /// Last derived key in the spool.
+    /// Last byte-derived key in the spool.
     pub last_order_key: String,
+    /// Durability state committed with this evidence.
+    pub spool_state: SpoolState,
+    /// Per-spool byte bound copied from the preparation plan.
+    pub max_spool_bytes: u64,
+    /// Preparation digest bound into this evidence.
+    pub preparation_intent_sha256: String,
+    /// Digest of canonical bytes with this member excluded.
+    pub evidence_sha256: String,
 }
 
-/// Write a non-replayable source once into an operation-scoped spool, seal the
-/// spool evidence with a ledger sync, and return a bounded reader over it.
+/// Injected failure at one spool durability boundary. Production callers pass
+/// `None`; the named points let a harness exercise crash boundaries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpoolFault {
+    /// No injected failure.
+    #[default]
+    None,
+    /// Fail while syncing the spool file, before any directory barrier.
+    FailFileSync,
+    /// Fail while syncing the spool directory, after the file sync.
+    FailDirectorySync,
+    /// Fail after the spool directory sync, before evidence is committed.
+    FailEvidenceCommit,
+}
+
+impl SpoolFault {
+    /// Stable label for typed failure messages.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::FailFileSync => "spool file sync",
+            Self::FailDirectorySync => "spool directory sync",
+            Self::FailEvidenceCommit => "spool evidence commit",
+        }
+    }
+}
+
+fn seal_spool_evidence(evidence: &SpoolEvidence) -> Result<SpoolEvidence, StreamError> {
+    let mut complete = evidence.clone();
+    complete.evidence_sha256 = String::new();
+    complete.evidence_sha256 = ledger_digest(&complete)?;
+    Ok(complete)
+}
+
+/// Load and verify one on-disk spool evidence record.
+pub fn load_spool_evidence(
+    ledger: &Path,
+    spool_file_id: &str,
+) -> Result<Option<SpoolEvidence>, StreamError> {
+    let path = spool_evidence_file(ledger, spool_file_id);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(StreamError::Io("read spool evidence".to_owned(), error)),
+    };
+    let evidence: SpoolEvidence = serde_json::from_slice(&bytes).map_err(|error| {
+        StreamError::Publication(ProducerError::PublicationEvidence(format!(
+            "invalid spool evidence: {error}"
+        )))
+    })?;
+    if seal_spool_evidence(&evidence)? != evidence {
+        return Err(StreamError::Publication(
+            ProducerError::PublicationEvidence("spool evidence digest mismatch".to_owned()),
+        ));
+    }
+    Ok(Some(evidence))
+}
+
+/// Charge one temporary-file write against the single operation-scoped disk
+/// budget. Every spool, staged artifact, manifest and sidecar uses this helper.
+fn reserve_temp_bytes(
+    used: &mut u64,
+    amount: u64,
+    label: &str,
+    maximum: u64,
+) -> Result<u64, StreamError> {
+    let next = checked_total(*used, amount, label)?;
+    enforce(next, maximum, "temp_disk_bytes")?;
+    *used = next;
+    Ok(next)
+}
+
+/// Write a non-replayable source once into its planned spool and commit
+/// independent evidence. The order is write, sync file, sync spool directory,
+/// commit evidence and sync the ledger directory; no seal precedes that chain.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit spool durability inputs"
+)]
 pub fn spool_non_replayable(
     source: &mut dyn ArtifactRecordSource,
     plan: &ArtifactPlan,
+    spool_plan: &SpoolPlan,
     spool_dir: &Path,
     ledger: &Path,
-    operation_id: &str,
+    preparation_digest: &str,
     profile: &ResourceProfile,
+    temp_disk_used: &mut u64,
+    fault: SpoolFault,
 ) -> Result<(SpoolEvidence, BoundedRecordFramer<BufReader<File>>), StreamError> {
     let limits = profile.limits();
     let policy = limits.to_resource_policy();
+    if spool_plan.artifact_binding_id != plan.source_binding_id
+        || !is_opaque_token(&spool_plan.operation_id)
+    {
+        return Err(StreamError::SourceBindingMismatch(
+            plan.path.clone(),
+            plan.source_binding_id.clone(),
+            spool_plan.artifact_binding_id.clone(),
+        ));
+    }
+    if spool_plan.artifact_path != plan.path
+        || spool_plan.source_snapshot_id != plan.source_snapshot_id
+        || spool_plan.source_revision != plan.source_revision
+    {
+        return Err(StreamError::SpoolEvidenceMismatch(
+            spool_plan.spool_file_id.clone(),
+            "spool plan does not describe this artifact".to_owned(),
+        ));
+    }
     let identity = source.source_identity();
     if identity != plan.source_identity()? {
         return Err(StreamError::SourceIdentityMismatch(
@@ -1481,15 +1723,14 @@ pub fn spool_non_replayable(
             observed_binding,
         ));
     }
-    let file_name = format!("{operation_id}-{}-spool.spool", plan.source_binding_id);
-    let path = spool_dir.join(&file_name);
+    let path = spool_dir.join(&spool_plan.spool_file_id);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .map_err(|error| io_error("create spool", error))?;
     let mut hasher = Sha256::new();
-    let mut bytes = 0_u64;
+    let mut stored_bytes = 0_u64;
     let mut records = 0_u64;
     let mut first = String::new();
     let mut last = String::new();
@@ -1500,8 +1741,14 @@ pub fn spool_non_replayable(
         tracker.observe(&plan.path, &record.bytes, index, &policy)?;
         let next = u64::try_from(record.bytes.len().saturating_add(1))
             .map_err(|_| StreamError::PolicyExceeded("spool record length overflow".to_owned()))?;
-        bytes = checked_total(bytes, next, "spool bytes")?;
-        enforce(bytes, limits.temp_disk_bytes(), "temp_disk_bytes")?;
+        stored_bytes = checked_total(stored_bytes, next, "spool bytes")?;
+        enforce(stored_bytes, spool_plan.max_spool_bytes, "max_spool_bytes")?;
+        reserve_temp_bytes(
+            temp_disk_used,
+            next,
+            "spool temp disk bytes",
+            limits.temp_disk_bytes(),
+        )?;
         file.write_all(&record.bytes)
             .map_err(|error| io_error("write spool record", error))?;
         file.write_all(b"\n")
@@ -1519,26 +1766,53 @@ pub fn spool_non_replayable(
         }
         last = tracker.last.clone().unwrap_or_default();
     }
+    if fault == SpoolFault::FailFileSync {
+        return Err(StreamError::Io(
+            "injected spool file sync failure".to_owned(),
+            io::Error::other(SpoolFault::FailFileSync.label()),
+        ));
+    }
     file.sync_all()
-        .map_err(|error| io_error("sync spool", error))?;
+        .map_err(|error| io_error("sync spool file", error))?;
     drop(file);
-    let evidence = SpoolEvidence {
-        file_name,
-        spool_sha256: hex_encode(&hasher.finalize()),
-        spool_bytes: bytes,
+    if fault == SpoolFault::FailDirectorySync {
+        return Err(StreamError::Io(
+            "injected spool directory sync failure".to_owned(),
+            io::Error::other(SpoolFault::FailDirectorySync.label()),
+        ));
+    }
+    sync_directory(spool_dir)?;
+    if fault == SpoolFault::FailEvidenceCommit {
+        return Err(StreamError::Io(
+            "injected spool evidence commit failure".to_owned(),
+            io::Error::other(SpoolFault::FailEvidenceCommit.label()),
+        ));
+    }
+    let evidence = seal_spool_evidence(&SpoolEvidence {
+        spool_file_id: spool_plan.spool_file_id.clone(),
+        operation_id: spool_plan.operation_id.clone(),
+        artifact_binding_id: plan.source_binding_id.clone(),
+        source_identity: identity,
+        stored_bytes,
+        stored_sha256: hex_encode(&hasher.finalize()),
         record_count: records,
         first_order_key: first,
         last_order_key: last,
-    };
+        spool_state: SpoolState::Sealed,
+        max_spool_bytes: spool_plan.max_spool_bytes,
+        preparation_intent_sha256: preparation_digest.to_owned(),
+        evidence_sha256: String::new(),
+    })?;
     let bytes = canonical_ledger_bytes(&evidence)?;
-    commit_ledger_record(
-        &spool_evidence_file(ledger, operation_id, &plan.source_binding_id),
+    commit_bounded_ledger_record(
+        &spool_evidence_file(ledger, &evidence.spool_file_id),
         &bytes,
         ledger,
+        limits.max_journal_record_bytes(),
+        "max_journal_record_bytes",
     )?;
-    let reader = BufReader::new(File::open(&path).map_err(|error| io_error("open spool", error))?);
     let framer = BoundedRecordFramer::new(
-        reader,
+        BufReader::new(File::open(&path).map_err(|error| io_error("open spool", error))?),
         plan.source_identity()?,
         plan.source_binding_id.clone(),
         Replayability::Replayable,
@@ -1547,42 +1821,210 @@ pub fn spool_non_replayable(
     Ok((evidence, framer))
 }
 
-/// Verify a sealed spool before adopting it. Any difference quarantines the
-/// operation; a partial spool is not completed by rewriting bytes.
+/// A descriptor owned for the duration of one spool verification. The
+/// directory and its named child are opened without following a final symlink.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct SpoolDescriptor {
+    raw: libc::c_int,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl SpoolDescriptor {
+    /// Open the spool directory itself without following a symlink.
+    #[expect(
+        unsafe_code,
+        reason = "the spool directory boundary uses the libc open system call"
+    )]
+    fn open_directory(path: &Path, label: &str) -> Result<Self, StreamError> {
+        let name = CString::new(path.as_os_str().as_bytes()).map_err(|error| {
+            StreamError::SpoolEvidenceMismatch(
+                label.to_owned(),
+                format!("spool directory path is not NUL-free: {error}"),
+            )
+        })?;
+        // SAFETY: `name` owns a NUL-terminated buffer that outlives this call.
+        // `O_NOFOLLOW` rejects a symlink at the final component, `O_DIRECTORY`
+        // requires a directory and `O_CLOEXEC` keeps the fd out of children.
+        let raw = unsafe {
+            libc::open(
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(StreamError::Io(
+                format!("open {label} directory"),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Open a named child relative to the directory descriptor.
+    #[expect(
+        unsafe_code,
+        reason = "children are opened relative to a descriptor with the libc openat system call"
+    )]
+    fn open_child(&self, name: &str, label: &str) -> Result<Self, StreamError> {
+        let child = CString::new(name).map_err(|error| {
+            StreamError::SpoolEvidenceMismatch(
+                label.to_owned(),
+                format!("spool file name is not NUL-free: {error}"),
+            )
+        })?;
+        // SAFETY: `self.raw` is a live directory descriptor and `child` is a
+        // NUL-terminated buffer that outlives the call. `O_NOFOLLOW` rejects a
+        // symlink at the named child.
+        let raw = unsafe {
+            libc::openat(
+                self.raw,
+                child.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(StreamError::Io(
+                format!("open {label} without following links"),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(Self { raw })
+    }
+
+    /// Classify the object behind this descriptor without following links.
+    #[expect(
+        unsafe_code,
+        reason = "fstat classifies the object behind an already opened descriptor"
+    )]
+    fn stat(&self, label: &str) -> Result<libc::stat, StreamError> {
+        // SAFETY: `libc::stat` is a plain data struct whose zero bit pattern
+        // is valid before the system call fills it.
+        let mut info: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: `info` has the platform stat layout and `raw` is live.
+        let status = unsafe { libc::fstat(self.raw, &mut info) };
+        if status != 0 {
+            return Err(StreamError::Io(
+                format!("fstat {label}"),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(info)
+    }
+
+    /// Read one chunk directly through the verified descriptor.
+    #[expect(
+        unsafe_code,
+        reason = "bytes are read from an already opened descriptor with libc read"
+    )]
+    fn read_chunk(&mut self, buffer: &mut [u8], label: &str) -> Result<usize, StreamError> {
+        // SAFETY: `raw` is a live file descriptor and `buffer` is writable for
+        // the length passed to the system call.
+        let count = unsafe { libc::read(self.raw, buffer.as_mut_ptr().cast(), buffer.len()) };
+        if count < 0 {
+            return Err(StreamError::Io(
+                format!("read {label}"),
+                io::Error::last_os_error(),
+            ));
+        }
+        usize::try_from(count).map_err(|_| {
+            StreamError::PolicyExceeded("spool read length exceeds addressable length".to_owned())
+        })
+    }
+
+    /// Return the verified descriptor to its first byte.
+    #[expect(
+        unsafe_code,
+        reason = "rewinding a regular-file descriptor uses the libc lseek system call"
+    )]
+    fn rewind(&self, label: &str) -> Result<(), StreamError> {
+        // SAFETY: `raw` is a live regular-file descriptor held by this value.
+        let position = unsafe { libc::lseek(self.raw, 0, libc::SEEK_SET) };
+        if position < 0 {
+            return Err(StreamError::Io(
+                format!("rewind {label}"),
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Transfer the verified descriptor into a standard file reader.
+    #[expect(
+        unsafe_code,
+        reason = "an owned raw descriptor is transferred into a standard File"
+    )]
+    fn into_file(self) -> File {
+        let raw = ManuallyDrop::new(self).raw;
+        // SAFETY: `raw` is an owned descriptor with no remaining owner.
+        unsafe { File::from_raw_fd(raw) }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Drop for SpoolDescriptor {
+    #[expect(
+        unsafe_code,
+        reason = "closing an owned raw descriptor uses the libc close system call"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: `raw` is an owned descriptor that is not used after close.
+        unsafe {
+            libc::close(self.raw);
+        }
+    }
+}
+
+/// Verify a sealed spool through its directory descriptor and return the
+/// bounded reader over the same verified bytes. A symlink, a non-regular
+/// object, an altered digest, a changed byte count or a changed record count
+/// refuses the operation before any seal is written.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn verify_spool(
     spool_dir: &Path,
     evidence: &SpoolEvidence,
-    expected_bytes: u64,
     profile: &ResourceProfile,
-) -> Result<(), StreamError> {
-    let path = spool_dir.join(&evidence.file_name);
-    let observed = fs::metadata(&path)
-        .map_err(|error| io_error("stat spool", error))?
-        .len();
-    if observed != evidence.spool_bytes {
+) -> Result<BoundedRecordFramer<BufReader<File>>, StreamError> {
+    let limits = profile.limits();
+    let label = &evidence.spool_file_id;
+    let directory = SpoolDescriptor::open_directory(spool_dir, label)?;
+    let mut file = directory.open_child(label, label)?;
+    let info = file.stat(label)?;
+    if info.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(StreamError::SpoolEvidenceMismatch(
-            evidence.file_name.clone(),
+            label.clone(),
+            "spool is not a regular file".to_owned(),
+        ));
+    }
+    if info.st_nlink != 1 {
+        return Err(StreamError::SpoolEvidenceMismatch(
+            label.clone(),
+            "spool has an external hard link".to_owned(),
+        ));
+    }
+    let observed = u64::try_from(info.st_size).map_err(|_| {
+        StreamError::SpoolEvidenceMismatch(label.clone(), "spool size is negative".to_owned())
+    })?;
+    if observed != evidence.stored_bytes {
+        return Err(StreamError::SpoolEvidenceMismatch(
+            label.clone(),
             "spool byte count differs from the sealed evidence".to_owned(),
         ));
     }
-    enforce(
-        observed,
-        profile.limits().temp_disk_bytes(),
-        "temp_disk_bytes",
-    )?;
+    enforce(observed, evidence.max_spool_bytes, "max_spool_bytes")?;
+    enforce(observed, limits.temp_disk_bytes(), "temp_disk_bytes")?;
+    let chunk = usize::try_from(limits.io_chunk_bytes()).map_err(|_| {
+        StreamError::PolicyExceeded("io chunk exceeds addressable length".to_owned())
+    })?;
+    let mut buffer = vec![0_u8; chunk];
     let mut hasher = Sha256::new();
-    let mut buffer = vec![
-        0_u8;
-        usize::try_from(profile.limits().io_chunk_bytes()).map_err(|_| {
-            StreamError::PolicyExceeded("io chunk exceeds addressable length".to_owned())
-        })?
-    ];
-    let mut file = File::open(&path).map_err(|error| io_error("open spool for verify", error))?;
     let mut read = 0_u64;
-    loop {
-        let count = file
-            .read(&mut buffer)
-            .map_err(|error| io_error("read spool for verify", error))?;
+    let mut terminators = 0_u64;
+    while read < evidence.stored_bytes {
+        let remaining = evidence.stored_bytes.saturating_sub(read);
+        let allowed = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let count = file.read_chunk(&mut buffer[..allowed], label)?;
         if count == 0 {
             break;
         }
@@ -1593,16 +2035,71 @@ pub fn verify_spool(
             })?,
             "spool read",
         )?;
-        enforce(read, expected_bytes, "spool read")?;
+        enforce(read, evidence.stored_bytes, "spool verify read")?;
         hasher.update(&buffer[..count]);
+        let seen = u64::try_from(
+            buffer[..count]
+                .iter()
+                .filter(|&&byte| byte == b'\n')
+                .count(),
+        )
+        .map_err(|_| StreamError::PolicyExceeded("spool terminator count overflow".to_owned()))?;
+        terminators = checked_total(terminators, seen, "spool verify records")?;
+        enforce(terminators, evidence.record_count, "spool verify records")?;
+        enforce(
+            terminators,
+            limits.max_records_per_artifact(),
+            "max_records_per_artifact",
+        )?;
     }
-    if hex_encode(&hasher.finalize()) != evidence.spool_sha256 {
+    if read != evidence.stored_bytes {
         return Err(StreamError::SpoolEvidenceMismatch(
-            evidence.file_name.clone(),
+            label.clone(),
+            "spool byte count differs from the sealed evidence".to_owned(),
+        ));
+    }
+    if terminators != evidence.record_count {
+        return Err(StreamError::SpoolEvidenceMismatch(
+            label.clone(),
+            "spool record count differs from the sealed evidence".to_owned(),
+        ));
+    }
+    let mut extra = [0_u8; 1];
+    if file.read_chunk(&mut extra, label)? != 0 {
+        return Err(StreamError::SpoolEvidenceMismatch(
+            label.clone(),
+            "spool grew past its sealed byte count".to_owned(),
+        ));
+    }
+    if hex_encode(&hasher.finalize()) != evidence.stored_sha256 {
+        return Err(StreamError::SpoolEvidenceMismatch(
+            label.clone(),
             "spool digest differs from the sealed evidence".to_owned(),
         ));
     }
-    Ok(())
+    file.rewind(label)?;
+    BoundedRecordFramer::new(
+        BufReader::new(file.into_file()),
+        evidence.source_identity.clone(),
+        evidence.artifact_binding_id.clone(),
+        Replayability::Replayable,
+        limits.max_record_bytes(),
+    )
+}
+
+/// Descriptor-relative verification is unavailable on this target; the
+/// streaming path fails closed rather than falling back to path-based reads.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn verify_spool(
+    spool_dir: &Path,
+    evidence: &SpoolEvidence,
+    profile: &ResourceProfile,
+) -> Result<BoundedRecordFramer<BufReader<File>>, StreamError> {
+    let _ = (spool_dir, profile);
+    Err(StreamError::SpoolEvidenceMismatch(
+        evidence.spool_file_id.clone(),
+        "descriptor-relative spool verification is unavailable on this target".to_owned(),
+    ))
 }
 
 /// Explicit cancellation signal checked at each durable boundary.
@@ -1713,6 +2210,8 @@ pub(crate) struct StreamFaults {
     pub(crate) fail_after: Option<FaultStage>,
     /// Refuse the quarantine ledger write to exercise the pending state.
     pub(crate) quarantine_commit_fails: bool,
+    /// Injected failure at one of the spool durability boundaries.
+    pub(crate) spool_fault: SpoolFault,
 }
 
 fn injected(faults: &StreamFaults, stage: FaultStage) -> Result<(), StreamError> {
@@ -1783,6 +2282,8 @@ pub struct StreamingOutcome {
     pub sealed_intent_sha256: String,
     /// Replay proofs verified for each artifact in canonical order.
     pub replay_proofs: Vec<ReplayProof>,
+    /// Independent sealed spool evidence in the same order as the plans.
+    pub spool_evidence: Vec<SpoolEvidence>,
 }
 
 fn select_profile(request: &StreamingBuildRequest<'_>) -> Result<(), StreamError> {
@@ -2006,6 +2507,7 @@ struct PreparedPublication {
     sealed: SealedPublicationIntent,
     sealed_digest: String,
     replay_proofs: Vec<ReplayProof>,
+    spool_evidence: Vec<SpoolEvidence>,
 }
 
 /// Outcome of a quarantine commit attempt reported apart from a failure.
@@ -2064,6 +2566,19 @@ pub fn publish_streaming(
         .map(|pair| pair.plan.source_binding())
         .collect();
     let planned_paths = planned_file_set(&plans);
+    let spool_plans: Vec<SpoolPlan> = pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, pair)| pair.plan.replayability == Replayability::NonReplayable)
+        .map(|(ordinal, pair)| {
+            build_spool_plan(
+                request.operation_id,
+                ordinal,
+                &pair.plan,
+                limits.temp_disk_bytes(),
+            )
+        })
+        .collect::<Result<_, _>>()?;
 
     provision_directory(request.ledger_dir, "stream ledger", &RealPublicationFs)?;
     provision_directory(request.spool_dir, "trusted spool", &RealPublicationFs)?;
@@ -2082,17 +2597,7 @@ pub fn publish_streaming(
             .map(|plan| plan.compression_profile_id.clone())
             .unwrap_or_default(),
         planned_paths,
-        spool_plan: plans
-            .iter()
-            .filter(|plan| plan.replayability == Replayability::NonReplayable)
-            .map(|plan| SpoolPlan {
-                file_name: format!(
-                    "{}-{}-spool.spool",
-                    request.operation_id, plan.source_binding_id
-                ),
-                max_bytes: limits.temp_disk_bytes(),
-            })
-            .next(),
+        spool_plan: spool_plans.clone(),
         invocation_context: match request.context {
             InvocationContext::Production => "PRODUCTION".to_owned(),
             #[cfg(test)]
@@ -2100,7 +2605,11 @@ pub fn publish_streaming(
         },
         intent_sha256: String::new(),
     };
-    let preparation_digest = write_preparation_intent(request.ledger_dir, &preparation)?;
+    let preparation_digest = write_preparation_intent(
+        request.ledger_dir,
+        &preparation,
+        limits.max_preparation_intent_bytes(),
+    )?;
 
     let expected_bytes = planned_expected_bytes(&plans, limits.max_record_bytes());
     let mut evidence = PreparationEvidence::new(request.operation_id, expected_bytes);
@@ -2155,6 +2664,19 @@ fn run_preparation<'a>(
     let limits = request.profile.limits();
     let policy = limits.to_resource_policy();
     let plans: Vec<ArtifactPlan> = pairs.iter().map(|pair| pair.plan.clone()).collect();
+    let spool_plans: Vec<SpoolPlan> = pairs
+        .iter()
+        .enumerate()
+        .filter(|(_, pair)| pair.plan.replayability == Replayability::NonReplayable)
+        .map(|(ordinal, pair)| {
+            build_spool_plan(
+                request.operation_id,
+                ordinal,
+                &pair.plan,
+                limits.temp_disk_bytes(),
+            )
+        })
+        .collect::<Result<_, _>>()?;
 
     if request.faults.crash_before_seal {
         evidence.stage = FaultStage::PreparationIntent.as_str();
@@ -2198,40 +2720,45 @@ fn run_preparation<'a>(
     let mut release_records = 0_u64;
     let mut disk_bytes = 0_u64;
     evidence.source_consumption_state = SourceConsumptionState::Consuming;
+    let mut spooled: Vec<SpoolEvidence> = Vec::new();
     for pair in pairs.iter_mut() {
         request.cancellation.check("artifact-start")?;
         let plan = &pair.plan;
         let source = pair.source.as_mut();
         let mut spool = None;
         if plan.replayability == Replayability::NonReplayable {
-            let file_name = format!(
-                "{}-{}-spool.spool",
-                request.operation_id, plan.source_binding_id
-            );
-            if !evidence.spool_inventory.contains(&file_name) {
-                evidence.spool_inventory.push(file_name);
+            let planned = spool_plans
+                .iter()
+                .find(|planned| planned.artifact_binding_id == plan.source_binding_id)
+                .ok_or_else(|| {
+                    StreamError::SpoolEvidenceMismatch(
+                        plan.path.clone(),
+                        "no preparation spool plan for this artifact".to_owned(),
+                    )
+                })?;
+            if !evidence.spool_inventory.contains(&planned.spool_file_id) {
+                evidence.spool_inventory.push(planned.spool_file_id.clone());
             }
             evidence.stage = FaultStage::SpoolWrite.as_str();
-            let (spool_evidence, framer) = spool_non_replayable(
+            let (spool_evidence, _) = spool_non_replayable(
                 source,
                 plan,
+                planned,
                 request.spool_dir,
                 request.ledger_dir,
-                request.operation_id,
+                preparation_digest,
                 request.profile,
+                &mut disk_bytes,
+                request.faults.spool_fault,
             )?;
             evidence.observed_bytes = evidence
                 .observed_bytes
-                .saturating_add(spool_evidence.spool_bytes);
+                .saturating_add(spool_evidence.stored_bytes);
             injected(&request.faults, FaultStage::SpoolWrite)?;
             evidence.stage = FaultStage::SpoolVerify.as_str();
-            verify_spool(
-                request.spool_dir,
-                &spool_evidence,
-                spool_evidence.spool_bytes,
-                request.profile,
-            )?;
+            let framer = verify_spool(request.spool_dir, &spool_evidence, request.profile)?;
             injected(&request.faults, FaultStage::SpoolVerify)?;
+            spooled.push(spool_evidence);
             spool = Some(framer);
         }
         let target = staging.join(&plan.path);
@@ -2301,6 +2828,22 @@ fn run_preparation<'a>(
     )?;
     injected(&request.faults, FaultStage::ReceiptBuild)?;
     evidence.stage = FaultStage::ManifestWrite.as_str();
+    let manifest_len = u64::try_from(sealed_manifest.manifest_bytes.len())
+        .map_err(|_| StreamError::PolicyExceeded("manifest length overflow".to_owned()))?;
+    reserve_temp_bytes(
+        &mut disk_bytes,
+        manifest_len,
+        "manifest temp disk bytes",
+        limits.temp_disk_bytes(),
+    )?;
+    let sidecar_len = u64::try_from(sealed_manifest.sidecar_bytes.len())
+        .map_err(|_| StreamError::PolicyExceeded("sidecar length overflow".to_owned()))?;
+    reserve_temp_bytes(
+        &mut disk_bytes,
+        sidecar_len,
+        "sidecar temp disk bytes",
+        limits.temp_disk_bytes(),
+    )?;
     write_new_file(
         &staging.join(crate::distribution::ndc_release::MANIFEST_FILE_NAME),
         &sealed_manifest.manifest_bytes,
@@ -2342,9 +2885,14 @@ fn run_preparation<'a>(
         wire_profile_id: INTENT_WIRE_PROFILE.to_owned(),
         resource_profile_id: request.profile.id().as_literal(),
         resource_profile_digest: hex_encode(request.profile.digest()),
+        spool_evidence: spooled.clone(),
         intent_sha256: String::new(),
     };
-    let sealed_digest = write_sealed_intent(request.ledger_dir, &sealed)?;
+    let sealed_digest = write_sealed_intent(
+        request.ledger_dir,
+        &sealed,
+        limits.max_sealed_intent_bytes(),
+    )?;
     evidence.state = PreparationState::Sealed;
     Ok(PreparedPublication {
         staging,
@@ -2356,6 +2904,7 @@ fn run_preparation<'a>(
         sealed,
         sealed_digest,
         replay_proofs,
+        spool_evidence: spooled,
     })
 }
 
@@ -2414,6 +2963,7 @@ fn finalize_prepared_publication(
         preparation_intent_sha256: prepared.sealed.preparation_intent_sha256,
         sealed_intent_sha256: prepared.sealed_digest,
         replay_proofs: prepared.replay_proofs,
+        spool_evidence: prepared.spool_evidence,
     })
 }
 
@@ -2672,7 +3222,7 @@ fn enumerate_spool_objects(
         let entry = entry
             .map_err(|error| StreamError::Io("read spool directory entry".to_owned(), error))?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(&prefix) && name.ends_with("-spool.spool") {
+        if name.starts_with(&prefix) && name.ends_with(".spool") {
             inventory.push(name);
             if inventory.len() > maximum {
                 return Err(StreamError::PolicyExceeded(
@@ -2706,6 +3256,54 @@ pub enum StreamRecoveryOutcome {
     PreparationOnlyQuarantined(PreparationState),
     /// A verified seal exists and the publication core completed reconciliation.
     Recovered(RecoveryOutcome),
+}
+
+/// Check that the sealed spool inventory matches the preparation plan and the
+/// independently durable evidence records before recovery may proceed.
+fn verify_spool_inventory(
+    ledger: &Path,
+    preparation: &PreparationIntent,
+    sealed: &SealedPublicationIntent,
+) -> Result<(), StreamError> {
+    let plans = &preparation.spool_plan;
+    let evidence = &sealed.spool_evidence;
+    if plans.len() != evidence.len() {
+        return Err(StreamError::Publication(
+            ProducerError::PublicationEvidence(
+                "sealed spool inventory differs from the preparation inventory".to_owned(),
+            ),
+        ));
+    }
+    for (plan, item) in plans.iter().zip(evidence.iter()) {
+        if item.spool_file_id != plan.spool_file_id
+            || item.operation_id != plan.operation_id
+            || item.artifact_binding_id != plan.artifact_binding_id
+            || item.source_identity.snapshot_id != plan.source_snapshot_id
+            || item.source_identity.revision != plan.source_revision
+            || item.max_spool_bytes != plan.max_spool_bytes
+            || item.preparation_intent_sha256 != preparation.intent_sha256
+            || item.spool_state != SpoolState::Sealed
+        {
+            return Err(StreamError::Publication(
+                ProducerError::PublicationEvidence(
+                    "spool evidence does not match its preparation plan".to_owned(),
+                ),
+            ));
+        }
+        let durable = load_spool_evidence(ledger, &plan.spool_file_id)?.ok_or_else(|| {
+            StreamError::Publication(ProducerError::PublicationEvidence(
+                "sealed spool evidence record is missing".to_owned(),
+            ))
+        })?;
+        if &durable != item {
+            return Err(StreamError::Publication(
+                ProducerError::PublicationEvidence(
+                    "durable spool evidence differs from the sealed inventory".to_owned(),
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Recover one streaming operation from durable evidence alone. A preparation
@@ -2790,6 +3388,7 @@ pub fn recover_streaming(
                     ),
                 ));
             }
+            verify_spool_inventory(ledger, &preparation, &sealed)?;
             let outcome = recover_interrupted(release_root, ledger, operation_id, policy)?;
             Ok(StreamRecoveryOutcome::Recovered(outcome))
         }
@@ -3015,6 +3614,43 @@ mod tests {
             test_profile()?.limits().max_record_bytes(),
         )?;
         Ok(Box::new(framer))
+    }
+
+    fn spool_plan_for(
+        operation_id: &str,
+        ordinal: usize,
+        plan: &ArtifactPlan,
+    ) -> TestResult<SpoolPlan> {
+        Ok(build_spool_plan(
+            operation_id,
+            ordinal,
+            plan,
+            test_profile()?.limits().temp_disk_bytes(),
+        )?)
+    }
+
+    fn spool_for_test(
+        fixture: &Fixture,
+        operation_id: &str,
+        plan: &ArtifactPlan,
+        records: &[CanonicalRecord],
+    ) -> TestResult<(SpoolEvidence, u64)> {
+        let planned = spool_plan_for(operation_id, 0, plan)?;
+        let profile = test_profile()?;
+        let mut disk = 0_u64;
+        let mut source = source_for(plan, records)?;
+        let (evidence, _) = spool_non_replayable(
+            source.as_mut(),
+            plan,
+            &planned,
+            &fixture.spool,
+            &fixture.ledger,
+            "test-preparation-digest",
+            &profile,
+            &mut disk,
+            SpoolFault::None,
+        )?;
+        Ok((evidence, disk))
     }
 
     struct Fixture {
@@ -3715,11 +4351,16 @@ mod tests {
                 .any(|name| name == "artifacts/spooled.jsonl"),
             "the partial artifact path is retained"
         );
+        let planned_ids: Vec<String> = preparation
+            .spool_plan
+            .iter()
+            .map(|plan| plan.spool_file_id.clone())
+            .collect();
         assert!(
-            record.spool_inventory.iter().any(|name| {
-                name.starts_with("operation-b15-") && name.ends_with("-spool.spool")
-            }),
-            "the spool object is retained"
+            planned_ids
+                .iter()
+                .all(|name| record.spool_inventory.contains(name)),
+            "the operation's spool objects are retained"
         );
         assert!(
             record.observed_bytes > 0,
@@ -4764,40 +5405,21 @@ mod tests {
             &records,
         )?;
         plan.replayability = Replayability::NonReplayable;
-        let mut source = source_for(&plan, &records)?;
-        let (evidence, _) = spool_non_replayable(
-            source.as_mut(),
-            &plan,
-            &fixture.spool,
-            &fixture.ledger,
-            "operation-spool",
-            &test_profile()?,
-        )?;
-        verify_spool(
-            &fixture.spool,
-            &evidence,
-            evidence.spool_bytes,
-            &test_profile()?,
-        )?;
-        let path = fixture.spool.join(&evidence.file_name);
+        let (evidence, _) = spool_for_test(&fixture, "operation-spool", &plan, &records)?;
+        let _verified = verify_spool(&fixture.spool, &evidence, &test_profile()?)?;
+        let path = fixture.spool.join(&evidence.spool_file_id);
         let mut bytes = fs::read(&path)?;
         bytes.truncate(bytes.len().saturating_sub(1));
         fs::write(&path, bytes)?;
         assert!(
             matches!(
-                verify_spool(
-                    &fixture.spool,
-                    &evidence,
-                    evidence.spool_bytes,
-                    &test_profile()?
-                ),
+                verify_spool(&fixture.spool, &evidence, &test_profile()?),
                 Err(StreamError::SpoolEvidenceMismatch(..))
             ),
             "a truncated spool is retained as quarantine evidence, not adopted"
         );
         assert!(
-            spool_evidence_file(&fixture.ledger, "operation-spool", &plan.source_binding_id)
-                .exists(),
+            spool_evidence_file(&fixture.ledger, &evidence.spool_file_id).exists(),
             "the spool seal survives a mismatch"
         );
         Ok(())
@@ -5258,21 +5880,21 @@ mod tests {
             .filter_map(|entry| entry.ok())
             .filter_map(|entry| entry.file_name().into_string().ok())
             .collect();
-        for plan in case
-            .plans
+        let expected = canonical_expectation(&case.plans, &case.records);
+        for (ordinal, (plan, _)) in expected
             .iter()
-            .filter(|plan| plan.replayability == Replayability::NonReplayable)
+            .enumerate()
+            .filter(|(_, (plan, _))| plan.replayability == Replayability::NonReplayable)
         {
-            let expected = format!("operation-b15-{}-spool.spool", plan.source_binding_id);
+            let spool_id = spool_file_id("operation-b15", ordinal, &plan.source_binding_id)?;
             let file_context = format!("binding {} has its own spool file", plan.source_binding_id);
-            assert!(files.contains(&expected), "{file_context}");
+            assert!(files.contains(&spool_id), "{file_context}");
             let evidence_context = format!(
                 "binding {} has its own sealed spool evidence",
                 plan.source_binding_id
             );
             assert!(
-                spool_evidence_file(&fixture.ledger, "operation-b15", &plan.source_binding_id)
-                    .exists(),
+                spool_evidence_file(&fixture.ledger, &spool_id).exists(),
                 "{evidence_context}"
             );
         }
@@ -5452,14 +6074,9 @@ mod tests {
             0,
             "the spool did not consume the misbound source"
         );
+        let spool_id = spool_file_id("operation-b15", 0, &plan.source_binding_id)?;
         assert!(
-            !fixture
-                .spool
-                .join(format!(
-                    "operation-b15-{}-spool.spool",
-                    plan.source_binding_id
-                ))
-                .exists(),
+            !fixture.spool.join(spool_id).exists(),
             "no spool bytes were written for the refused source"
         );
         Ok(())
@@ -6008,6 +6625,667 @@ mod tests {
             "a multi-artifact ratio breach also precedes the seal"
         );
         assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    fn assert_quarantined_failure(
+        result: &Result<StreamingOutcome, StreamError>,
+        code: &str,
+        context: &str,
+    ) {
+        assert!(
+            matches!(result, Err(StreamError::PreparationQuarantined(report))
+                if report.failure_code == code),
+            "{context}: {result:?}"
+        );
+    }
+
+    fn assert_failed_spool_has_no_seal(fixture: &Fixture, operation_id: &str) -> TestResult {
+        assert!(
+            !sealed_file(&fixture.ledger, operation_id).exists(),
+            "a failed spool precedes the seal"
+        );
+        assert_no_availability(fixture)?;
+        let preparation = load_preparation_intent(&fixture.ledger, operation_id)?
+            .ok_or_else(|| io::Error::other("preparation intent is missing"))?;
+        for planned in &preparation.spool_plan {
+            assert!(
+                !spool_evidence_file(&fixture.ledger, &planned.spool_file_id).exists(),
+                "a failed spool has no SPOOL_SEALED evidence"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn two_non_replayable_sources_have_distinct_prepared_spool_plans() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("preparation intent is missing"))?;
+        assert_eq!(
+            preparation.spool_plan.len(),
+            2,
+            "two non-replayable sources produce two prepared spool plans"
+        );
+        assert_ne!(
+            preparation.spool_plan[0].spool_file_id, preparation.spool_plan[1].spool_file_id,
+            "prepared spool ids are distinct"
+        );
+        for planned in &preparation.spool_plan {
+            assert!(
+                planned.spool_file_id.ends_with(".spool"),
+                "a planned spool id keeps the safe extension"
+            );
+            assert!(
+                !planned.spool_file_id.contains('/'),
+                "a planned spool id carries no path separator"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spool_plan_fields_bind_artifact_ordinal_and_identity() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("preparation intent is missing"))?;
+        let expected = canonical_expectation(&case.plans, &case.records);
+        for (ordinal, (plan, _)) in expected
+            .iter()
+            .enumerate()
+            .filter(|(_, (plan, _))| plan.replayability == Replayability::NonReplayable)
+        {
+            let planned = preparation
+                .spool_plan
+                .iter()
+                .find(|item| item.artifact_binding_id == plan.source_binding_id)
+                .ok_or_else(|| io::Error::other("spool plan is missing for a source"))?;
+            assert_eq!(
+                planned.operation_id, "operation-b15",
+                "the spool plan carries the operation identity"
+            );
+            assert_eq!(
+                planned.artifact_path, plan.path,
+                "the spool plan carries the artifact path as evidence"
+            );
+            assert_eq!(
+                planned.source_snapshot_id, plan.source_snapshot_id,
+                "the spool plan carries the source snapshot"
+            );
+            assert_eq!(
+                planned.source_revision, plan.source_revision,
+                "the spool plan carries the source revision"
+            );
+            assert_eq!(
+                planned.spool_file_id,
+                spool_file_id("operation-b15", ordinal, &plan.source_binding_id)?,
+                "the spool id follows the canonical ordinal and binding"
+            );
+            assert_eq!(
+                planned.max_spool_bytes,
+                test_profile()?.limits().temp_disk_bytes(),
+                "the spool plan carries the profile disk bound"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spool_ids_ignore_artifact_path_and_reject_unsafe_tokens() -> TestResult {
+        let first = spool_file_id("operation-path-a", 3, "binding-a")?;
+        let second = spool_file_id("operation-path-a", 3, "binding-a")?;
+        assert_eq!(first, second, "the same identity and ordinal derive one id");
+        assert!(
+            !first.contains("artifacts"),
+            "no artifact path reaches the spool id"
+        );
+        assert!(
+            matches!(
+                spool_file_id("../escape", 0, "binding-a"),
+                Err(StreamError::PolicyExceeded(..))
+            ),
+            "an operation id with a path separator is refused"
+        );
+        assert!(
+            matches!(
+                spool_file_id("operation-path-a", 0, "../binding"),
+                Err(StreamError::PolicyExceeded(..))
+            ),
+            "a binding id with a path separator is refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_non_replayable_sources_have_independent_spool_evidence() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        assert_eq!(
+            outcome.spool_evidence.len(),
+            2,
+            "each non-replayable source has its own evidence"
+        );
+        assert_ne!(
+            outcome.spool_evidence[0].spool_file_id, outcome.spool_evidence[1].spool_file_id,
+            "spool evidence names are distinct"
+        );
+        assert_ne!(
+            outcome.spool_evidence[0].stored_sha256, outcome.spool_evidence[1].stored_sha256,
+            "spool evidence digests are independent"
+        );
+        for item in &outcome.spool_evidence {
+            assert_eq!(
+                item.operation_id, "operation-b15",
+                "spool evidence carries the operation"
+            );
+            assert_eq!(
+                item.spool_state,
+                SpoolState::Sealed,
+                "spool evidence records the sealed state"
+            );
+            assert_eq!(
+                item.preparation_intent_sha256, outcome.preparation_intent_sha256,
+                "spool evidence binds the preparation digest"
+            );
+            assert!(
+                !item.first_order_key.is_empty(),
+                "spool evidence records the first byte-derived key"
+            );
+            assert!(
+                !item.last_order_key.is_empty(),
+                "spool evidence records the last byte-derived key"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn each_spool_evidence_record_is_individually_durable() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        for item in &outcome.spool_evidence {
+            let loaded = load_spool_evidence(&fixture.ledger, &item.spool_file_id)?
+                .ok_or_else(|| io::Error::other("spool evidence record is missing"))?;
+            assert_eq!(
+                &loaded, item,
+                "the durable record equals the outcome evidence"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sealed_intent_binds_the_complete_spool_inventory() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("preparation intent is missing"))?;
+        let sealed = load_sealed_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("sealed intent is missing"))?;
+        assert_eq!(
+            sealed.spool_evidence, outcome.spool_evidence,
+            "the seal carries the complete spool inventory"
+        );
+        verify_spool_inventory(&fixture.ledger, &preparation, &sealed)?;
+        Ok(())
+    }
+
+    #[test]
+    fn tampered_spool_evidence_stops_recovery() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let outcome = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults::default(),
+            Cancellation::new(),
+        )??;
+        let item = &outcome.spool_evidence[0];
+        let path = spool_evidence_file(&fixture.ledger, &item.spool_file_id);
+        let mut record: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        record["stored_sha256"] = serde_json::Value::String("0".repeat(64));
+        fs::write(&path, serde_json::to_vec(&record)?)?;
+        let policy = test_profile()?.limits().to_resource_policy();
+        assert!(
+            matches!(
+                recover_streaming(
+                    &fixture.root,
+                    &fixture.ledger,
+                    &fixture.spool,
+                    "operation-b15",
+                    &policy,
+                ),
+                Err(StreamError::Publication(..))
+            ),
+            "a changed spool evidence digest stops recovery"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_spool_bytes_are_refused_before_adoption() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let mut plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/corrupt.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let (evidence, _) = spool_for_test(&fixture, "operation-corrupt", &plan, &records)?;
+        let path = fixture.spool.join(&evidence.spool_file_id);
+        let mut bytes = fs::read(&path)?;
+        let middle = bytes.len() / 2;
+        bytes[middle] = bytes[middle].wrapping_add(1);
+        fs::write(&path, bytes)?;
+        assert!(
+            matches!(
+                verify_spool(&fixture.spool, &evidence, &test_profile()?),
+                Err(StreamError::SpoolEvidenceMismatch(..))
+            ),
+            "altered spool bytes differ from the sealed digest"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spool_record_count_mismatch_is_refused_before_adoption() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let mut plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/count.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let (evidence, _) = spool_for_test(&fixture, "operation-count", &plan, &records)?;
+        let mut changed = evidence.clone();
+        changed.record_count = evidence.record_count.saturating_add(1);
+        assert!(
+            matches!(
+                verify_spool(&fixture.spool, &changed, &test_profile()?),
+                Err(StreamError::SpoolEvidenceMismatch(..))
+            ),
+            "a changed record count is refused during the bounded read"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_replaced_spool_path_is_refused() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let mut plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/linked.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let (evidence, _) = spool_for_test(&fixture, "operation-link", &plan, &records)?;
+        let original = fixture.spool.join(&evidence.spool_file_id);
+        let copy = fixture
+            .spool
+            .join(format!("{}-copy", evidence.spool_file_id));
+        fs::rename(&original, &copy)?;
+        symlink(&copy, &original)?;
+        assert!(
+            verify_spool(&fixture.spool, &evidence, &test_profile()?).is_err(),
+            "a symlink at the spool file name is refused by the no-follow open"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_spool_directory_is_refused() -> TestResult {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let mut plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/linked-dir.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let (evidence, _) = spool_for_test(&fixture, "operation-link-dir", &plan, &records)?;
+        let real = fixture.root.join("spool-real");
+        fs::rename(&fixture.spool, &real)?;
+        symlink(&real, &fixture.spool)?;
+        assert!(
+            verify_spool(&fixture.spool, &evidence, &test_profile()?).is_err(),
+            "a symlink at the spool directory is refused by the no-follow open"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verified_reader_consumes_the_sealed_spool_bytes() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![
+            sequenced_record("abstract-1", 1)?,
+            sequenced_record("abstract-2", 2)?,
+        ];
+        let mut plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/reader.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let (evidence, _) = spool_for_test(&fixture, "operation-reader", &plan, &records)?;
+        let mut framer = verify_spool(&fixture.spool, &evidence, &test_profile()?)?;
+        let mut hasher = Sha256::new();
+        let mut count = 0_u64;
+        while let Some(record) = framer.next_record()? {
+            hasher.update(&record.bytes);
+            hasher.update(b"\n");
+            count = checked_total(count, 1, "verified reader records")?;
+        }
+        assert_eq!(
+            count, evidence.record_count,
+            "the bounded reader sees the sealed record count"
+        );
+        assert_eq!(
+            hex_encode(&hasher.finalize()),
+            evidence.stored_sha256,
+            "the bounded reader hashes the sealed spool bytes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spool_file_sync_failure_leaves_no_seal_or_publication() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let result = publish(
+            &fixture,
+            case.plans,
+            case.sources,
+            StreamFaults {
+                spool_fault: SpoolFault::FailFileSync,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        assert_quarantined_failure(
+            &result,
+            "STREAM_IO",
+            "a spool file sync failure is quarantined with a typed filesystem code",
+        );
+        assert_failed_spool_has_no_seal(&fixture, "operation-b15")?;
+        Ok(())
+    }
+
+    #[test]
+    fn spool_directory_sync_failure_leaves_file_without_evidence() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let result = publish(
+            &fixture,
+            case.plans.clone(),
+            case.sources,
+            StreamFaults {
+                spool_fault: SpoolFault::FailDirectorySync,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        assert_quarantined_failure(
+            &result,
+            "STREAM_IO",
+            "a spool directory sync failure is quarantined",
+        );
+        let expected = canonical_expectation(&case.plans, &case.records);
+        let (ordinal, plan) = expected
+            .iter()
+            .enumerate()
+            .find(|(_, (plan, _))| plan.replayability == Replayability::NonReplayable)
+            .ok_or_else(|| io::Error::other("a non-replayable source is required"))?;
+        let spool_id = spool_file_id("operation-b15", ordinal, &plan.0.source_binding_id)?;
+        assert!(
+            fixture.spool.join(&spool_id).exists(),
+            "the synced spool file remains as quarantine evidence"
+        );
+        assert_failed_spool_has_no_seal(&fixture, "operation-b15")?;
+        Ok(())
+    }
+
+    #[test]
+    fn spool_evidence_commit_failure_precedes_the_seal() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let result = publish(
+            &fixture,
+            case.plans,
+            case.sources,
+            StreamFaults {
+                spool_fault: SpoolFault::FailEvidenceCommit,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        assert_quarantined_failure(
+            &result,
+            "STREAM_IO",
+            "a spool evidence commit failure is quarantined",
+        );
+        assert_failed_spool_has_no_seal(&fixture, "operation-b15")?;
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_after_file_sync_before_spool_directory_sync_is_preparation_only() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _result = publish(
+            &fixture,
+            case.plans,
+            case.sources,
+            StreamFaults {
+                spool_fault: SpoolFault::FailDirectorySync,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        let policy = test_profile()?.limits().to_resource_policy();
+        assert!(
+            matches!(
+                recover_streaming(
+                    &fixture.root,
+                    &fixture.ledger,
+                    &fixture.spool,
+                    "operation-b15",
+                    &policy,
+                ),
+                Ok(StreamRecoveryOutcome::PreparationOnlyQuarantined(
+                    PreparationState::QuarantinedDurable
+                ))
+            ),
+            "a synced file without a durable directory entry is not recovered"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_after_spool_directory_sync_before_evidence_commit_is_preparation_only() -> TestResult
+    {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let _result = publish(
+            &fixture,
+            case.plans,
+            case.sources,
+            StreamFaults {
+                spool_fault: SpoolFault::FailEvidenceCommit,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        let policy = test_profile()?.limits().to_resource_policy();
+        assert!(
+            matches!(
+                recover_streaming(
+                    &fixture.root,
+                    &fixture.ledger,
+                    &fixture.spool,
+                    "operation-b15",
+                    &policy,
+                ),
+                Ok(StreamRecoveryOutcome::PreparationOnlyQuarantined(
+                    PreparationState::QuarantinedDurable
+                ))
+            ),
+            "a durable directory entry without evidence is not recovered"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn aggregate_temp_disk_quota_is_shared_by_all_spools() -> TestResult {
+        let fixture = fixture()?;
+        let case = shuffled_case()?;
+        let pairs: Vec<(ArtifactPlan, Box<dyn ArtifactRecordSource>)> = case
+            .plans
+            .into_iter()
+            .zip(case.sources)
+            .filter(|(plan, _)| plan.replayability == Replayability::NonReplayable)
+            .collect();
+        assert_eq!(pairs.len(), 2, "two non-replayable sources feed the test");
+        let plans = pairs.iter().map(|(plan, _)| plan.clone()).collect();
+        let sources = pairs.into_iter().map(|(_, source)| source).collect();
+        let mut limits = test_limits();
+        limits.temp_disk_bytes = 1;
+        let result = publish_with_limits(&fixture, limits, "operation-quota", plans, sources)?;
+        assert!(
+            matches!(&result, Err(StreamError::PreparationQuarantined(report))
+                if report.failure_code == "STREAM_POLICY_EXCEEDED"),
+            "one operation-scoped budget covers both non-replayable sources: {result:?}"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-quota").exists(),
+            "aggregate quota exhaustion precedes the seal"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn spool_bytes_consume_the_same_quota_as_staging_bytes() -> TestResult {
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let mut plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/shared.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        plan.replayability = Replayability::NonReplayable;
+        let measured = fixture()?;
+        let (evidence, _) = spool_for_test(&measured, "operation-shared", &plan, &records)?;
+        let mut limits = test_limits();
+        limits.temp_disk_bytes = evidence.stored_bytes.saturating_add(1);
+        let fixture = fixture()?;
+        let result = publish_with_limits(
+            &fixture,
+            limits,
+            "operation-shared",
+            vec![plan.clone()],
+            vec![source_for(&plan, &records)?],
+        )?;
+        assert!(
+            matches!(&result, Err(StreamError::PreparationQuarantined(report))
+                if report.failure_code == "PUB_CORE_FAILURE"
+                    && report.first_failure.contains("temp_disk_bytes")),
+            "staging is charged after the spool has used the shared budget: {result:?}"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-shared").exists(),
+            "the shared quota breach precedes the seal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ledger_intent_bytes_use_the_separately_bounded_ledger_budget() -> TestResult {
+        let fixture = fixture()?;
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let plan = make_plan(
+            "partition-a",
+            0,
+            "artifacts/ledger.jsonl",
+            CompressionMode::None,
+            &records,
+        )?;
+        let mut limits = test_limits();
+        limits.temp_disk_bytes = 1;
+        let result = publish_with_limits(
+            &fixture,
+            limits,
+            "operation-ledger-budget",
+            vec![plan.clone()],
+            vec![source_for(&plan, &records)?],
+        )?;
+        assert!(
+            matches!(&result, Err(StreamError::PreparationQuarantined(report))
+                if report.failure_code == "PUB_CORE_FAILURE"
+                    && report.first_failure.contains("temp_disk_bytes")),
+            "the staging write exceeds the one-byte temp budget: {result:?}"
+        );
+        assert!(
+            preparation_file(&fixture.ledger, "operation-ledger-budget").exists(),
+            "the preparation intent is bounded by the ledger budget instead"
+        );
         Ok(())
     }
 }
