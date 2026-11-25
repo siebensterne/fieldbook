@@ -38,7 +38,8 @@ standard.
 | Makefile | `scripts/check_style.py` | same checker | `cargo xtask style` |
 | JSON | `scripts/check_style.py` | same checker | `cargo xtask style` |
 | Markdown | `scripts/check_style.py --fix` | same checker | `cargo xtask style` |
-| q / kdb+ | none (scripts are short) | `scripts/check_q_style.py` (added lines) | `cargo xtask style` |
+| q / kdb+ | none (scripts are short) | `scripts/check_q_style.py` (added lines, `q-style.json`) | `cargo xtask style` |
+| C++20 | `.clang-format` 21.1.8 | `.clang-tidy` 21.1.8, `CMakeLists.txt` | `cmake --workflow --preset strict-gcc` |
 
 Versions are pinned in `requirements-dev.txt`. `make tools` installs them;
 CI installs the same file before running any gate.
