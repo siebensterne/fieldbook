@@ -2,37 +2,77 @@
 # SPDX-License-Identifier: Apache-2.0
 """Check added q / kdb+ lines for mechanical style violations.
 
-The rules mirror the sibling workspace so both repositories hold q code to the
-same standard: whitespace hygiene, the silent loader-stop bare ``/`` line, the
-``count x < n`` precedence bug, and dotted column access inside a lambda
-(``t.col`` is a global name in q; it must be ``t[`col]``).
+The binding rule set is ``q-style.json`` at the repository root. This checker
+loads it at import time, so editing the JSON changes enforcement and editing
+the checker's constants cannot silently diverge from the published contract.
+The rules cover whitespace hygiene, the silent loader-stop bare ``/`` line,
+the ``count x < n`` precedence bug, and dotted column access inside a lambda
+(``t.col`` is a global name in q; the required form is ``t[`col]``).
 
 Only lines added relative to the base ref are checked, so the existing corpus
 is not churned. There are no third-party dependencies; semantic checks stay in
-the q verification scripts under scripts/analytics/.
+the repository's q verification scripts.
 
-Run from the repository root. Set FIELDBOOK_STYLE_BASE to compare against a
-different ref (default: main). Use --self-test for adversarial unit tests.
+Run from the repository root. Set Q_STYLE_BASE (or a repository-specific
+STYLE_BASE variable) to compare against a different ref; the default is main.
+Use --self-test for adversarial unit tests.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import sys
 import unittest
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = ROOT / "q-style.json"
+
+
+def validate_config(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate the machine-readable q style contract."""
+    if data.get("schema_version") != 1:
+        raise ValueError("unsupported q-style.json schema_version")
+    if data.get("enforcement", {}).get("waivers") != "none":
+        raise ValueError("q-style.json must declare zero waivers")
+    if data.get("rules", {}).get("max_columns") != 100:
+        raise ValueError("q-style.json max_columns must remain 100")
+    return data
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    """Load and validate the machine-readable q style contract."""
+    return validate_config(json.loads(path.read_text(encoding="utf-8")))
+
+
+CONFIG = load_config()
+MAX_COLUMNS = CONFIG["rules"]["max_columns"]
+NAMESPACES = frozenset(CONFIG["namespaces"])
 
 FILE_HEADER = re.compile(r"^\+\+\+ b/")
 BARE_SLASH = re.compile(r"^/\s*$")
 COUNT_COMPARISON = re.compile(r"\bcount\s+\w+\s*(?:<|>|<=|>=|=|~)")
 # Dotted names inside lambdas: t.col where both sides are plain identifiers.
 DOT_COLUMN = re.compile(r"(?<![\w.])\b([a-z][a-z0-9]{0,3})\.([a-z][a-z0-9_]*)")
-MAX_COLUMNS = 100
 TAB = re.compile(r"\t")
 TRAILING_WS = re.compile(r"[ \t]+$")
-# Dotted globals that are namespaces, not column access.
-NAMESPACES = frozenset({".an", ".h", ".j", ".KU", ".m", ".pq", ".q", ".Q", ".z"})
+
+
+def base_ref() -> str:
+    """Return the configured comparison ref."""
+    for name in (
+        "Q_STYLE_BASE",
+        "FIELDBOOK_STYLE_BASE",
+        "STYLE_BASE",
+    ):
+        value = os.environ.get(name)
+        if value:
+            return value
+    return "main"
 
 
 def parse_added_lines(diff_text: str) -> dict[str, list[tuple[int, str]]]:
@@ -66,6 +106,7 @@ def collect_added_lines(base: str) -> dict[str, list[tuple[int, str]]]:
         check=False,
         capture_output=True,
         text=True,
+        cwd=ROOT,
     )
     if result.returncode != 0:
         return {}
@@ -119,7 +160,19 @@ def check_lines(by_file: dict[str, list[tuple[int, str]]]) -> list[str]:
 
 
 class QStyleTests(unittest.TestCase):
-    """Adversarial tests for the q style rules and diff parser."""
+    """Adversarial tests for the q style rules, config and diff parser."""
+
+    def test_config_is_binding(self) -> None:
+        """The JSON contract drives the checker's live constants."""
+        self.assertEqual(MAX_COLUMNS, 100)
+        self.assertEqual(CONFIG["enforcement"]["waivers"], "none")
+
+    def test_config_rejects_waivers(self) -> None:
+        """A contract with waivers is rejected at load time."""
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        data["enforcement"]["waivers"] = "allowed"
+        with self.assertRaises(ValueError):
+            validate_config(data)
 
     def test_bare_slash(self) -> None:
         """A bare slash silently stops a q loader."""
@@ -158,6 +211,7 @@ class QStyleTests(unittest.TestCase):
     def test_namespace_dotted_ok(self) -> None:
         """Known namespaces are not mistaken for column access."""
         self.assertEqual(check_q_line(".pq.pq[x]", in_lambda=True), [])
+        self.assertEqual(check_q_line(".h.h[x]", in_lambda=True), [])
 
     def test_number_dotted_ok(self) -> None:
         """Decimal literals are not mistaken for dotted names."""
@@ -165,8 +219,7 @@ class QStyleTests(unittest.TestCase):
 
     def test_comment_exempt(self) -> None:
         """Comment lines are exempt from the dotted-name rule."""
-        finding = check_q_line("/ t.recv_ns comment", in_lambda=True)
-        self.assertEqual(finding, [])
+        self.assertEqual(check_q_line("/ t.recv_ns comment", in_lambda=True), [])
 
     def test_clean_line(self) -> None:
         """An ordinary assignment is clean."""
@@ -206,7 +259,7 @@ def main() -> int:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(QStyleTests)
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if result.wasSuccessful() else 1
-    base = os.environ.get("FIELDBOOK_STYLE_BASE", "main")
+    base = base_ref()
     errors = check_lines(collect_added_lines(base))
     if errors:
         for error in errors:

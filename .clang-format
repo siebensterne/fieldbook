@@ -1,8 +1,8 @@
 ---
-# C++20 formatting policy, mirroring the sibling quant workspace.
-# Fieldbook has no C++ sources today; this file keeps the Google C++ guide
-# reference actionable if a C++ component is added. Formatter settings are
-# shared, not a substitute for the repository's binding checkers.
+# SPDX-License-Identifier: Apache-2.0
+# C++20 formatting policy shared byte-for-byte by all three repositories.
+# Pinned formatter: clang-format 21.1.8 (quality-contract.json and
+# WORKSPACE.lock.json). Formatter settings are binding, not advisory.
 Language: Cpp
 BasedOnStyle: LLVM
 Standard: c++20
