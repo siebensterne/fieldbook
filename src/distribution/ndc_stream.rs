@@ -5842,9 +5842,10 @@ mod tests {
             vec![plan],
             sources,
         )?;
+        let report = quarantined_report(outcome);
         assert!(
-            matches!(outcome, Err(StreamError::PolicyExceeded(message)) if message.contains("max_expansion_ratio")),
-            "a compressed stream above the ratio is refused before the seal"
+            report.first_failure.contains("max_expansion_ratio"),
+            "a compressed stream above the ratio is quarantined before the seal"
         );
         assert_no_availability(&fixture)?;
         Ok(())
@@ -5874,9 +5875,10 @@ mod tests {
             vec![plan],
             sources,
         )?;
+        let report = quarantined_report(result);
         assert!(
-            matches!(result, Err(StreamError::PolicyExceeded(_))),
-            "the ratio breach is a typed policy refusal"
+            report.first_failure.contains("max_expansion_ratio"),
+            "the ratio breach is preserved as a typed policy refusal in quarantine"
         );
         assert!(
             preparation_file(&fixture.ledger, "operation-ratio-evidence").exists(),
@@ -5996,9 +5998,10 @@ mod tests {
             plans,
             sources,
         )?;
+        let report = quarantined_report(result);
         assert!(
-            matches!(result, Err(StreamError::PolicyExceeded(message)) if message.contains("max_expansion_ratio")),
-            "the second canonical artifact's ratio breach is refused"
+            report.first_failure.contains("max_expansion_ratio"),
+            "the second canonical artifact's ratio breach is quarantined"
         );
         assert!(
             !sealed_file(&fixture.ledger, "operation-ratio-second-artifact").exists(),
