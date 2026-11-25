@@ -22,6 +22,7 @@
 
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -46,6 +47,7 @@ use sha2::Sha256;
 use thiserror::Error;
 
 use crate::distribution::ndc_release::ARTIFACT_DIRECTORY;
+use crate::distribution::ndc_release::ArtifactDescriptor;
 use crate::distribution::ndc_release::COMPRESSION_VERSION_GZIP;
 use crate::distribution::ndc_release::COMPRESSION_VERSION_NONE;
 use crate::distribution::ndc_release::CanonicalRecord;
@@ -65,6 +67,7 @@ use crate::distribution::ndc_release::RecordOrderKey;
 use crate::distribution::ndc_release::RecoveryOutcome;
 use crate::distribution::ndc_release::ReleaseManifest;
 use crate::distribution::ndc_release::SealRequest;
+use crate::distribution::ndc_release::SealedManifest;
 use crate::distribution::ndc_release::SignatureConfig;
 use crate::distribution::ndc_release::build_receipt_evidence;
 use crate::distribution::ndc_release::finalize_publication_v2;
@@ -152,6 +155,14 @@ pub enum StreamError {
     #[error("cancellation after seal at {0}; the operation must be reconciled")]
     CancellationAfterSeal(&'static str),
 
+    /// A pre-seal failure preserved with its quarantine disposition.
+    #[error(transparent)]
+    PreparationQuarantined(#[from] PreparationQuarantineReport),
+
+    /// Quarantine evidence could not be verified as a durable record.
+    #[error("quarantine evidence verification failed in `{0}`: {1}")]
+    QuarantineVerification(String, String),
+
     /// Trusted local policy could not select an approved profile.
     #[error("stream profile selection refused: {0}")]
     Profile(#[from] ProfileError),
@@ -187,6 +198,8 @@ impl StreamError {
             Self::SpoolEvidenceMismatch(..) => "STREAM_SPOOL_EVIDENCE",
             Self::PublicationCancelled(_) => "STREAM_CANCELLED_BEFORE_SEAL",
             Self::CancellationAfterSeal(_) => "STREAM_CANCELLED_AFTER_SEAL",
+            Self::PreparationQuarantined(_) => "STREAM_PREPARATION_QUARANTINED",
+            Self::QuarantineVerification(..) => "STREAM_QUARANTINE_VERIFICATION",
             Self::Profile(error) => error.code(),
             Self::CodecProfileUnregistered(_) => "STREAM_CODEC_UNREGISTERED",
             Self::WireMapping(_) => "STREAM_WIRE_MAPPING",
@@ -199,6 +212,95 @@ impl StreamError {
             Self::Io(..) => "STREAM_IO",
         }
     }
+}
+
+/// Explicit lifecycle states for one streaming preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PreparationState {
+    /// The preparation intent is synced and no source has been consumed.
+    PreparationIntentDurable,
+    /// Artifacts are being produced from bounded source reads.
+    Preparing,
+    /// The sealed intent is synced and no pre-seal failure was observed.
+    Sealed,
+    /// A first failure was observed after the preparation intent was durable.
+    PreparationFailed,
+    /// Quarantine evidence is being committed to durable storage.
+    QuarantineCommit,
+    /// A verifiable quarantine record is durable.
+    QuarantinedDurable,
+    /// The quarantine record could not be committed to durable storage.
+    QuarantinePending,
+}
+
+impl PreparationState {
+    /// Stable wire literal for ledger evidence.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PreparationIntentDurable => "PREPARATION_INTENT_DURABLE",
+            Self::Preparing => "PREPARING",
+            Self::Sealed => "SEALED",
+            Self::PreparationFailed => "PREPARATION_FAILED",
+            Self::QuarantineCommit => "QUARANTINE_COMMIT",
+            Self::QuarantinedDurable => "QUARANTINED_DURABLE",
+            Self::QuarantinePending => "QUARANTINE_PENDING",
+        }
+    }
+}
+
+impl fmt::Display for PreparationState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Source consumption disposition at the first pre-seal failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SourceConsumptionState {
+    /// No source was opened.
+    NotStarted,
+    /// A source is being read through bounded records.
+    Consuming,
+    /// Consumption was stopped at a failure.
+    Stopped,
+    /// Every planned source reached end of stream.
+    Complete,
+}
+
+impl SourceConsumptionState {
+    /// Stable wire literal for ledger evidence.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotStarted => "NOT_STARTED",
+            Self::Consuming => "CONSUMING",
+            Self::Stopped => "STOPPED",
+            Self::Complete => "COMPLETE",
+        }
+    }
+}
+
+/// First pre-seal failure paired with its quarantine disposition.
+#[derive(Debug, Error)]
+#[error(
+    "preparation failed at {failure_stage} with {failure_code}: {first_failure}; quarantine {quarantine_state}"
+)]
+pub struct PreparationQuarantineReport {
+    /// Explicit preparation state observed at the failure boundary.
+    pub observed_state: PreparationState,
+    /// Stable code of the preserved first failure.
+    pub failure_code: String,
+    /// Pipeline stage that reported the preserved first failure.
+    pub failure_stage: String,
+    /// Display text of the preserved first failure.
+    pub first_failure: String,
+    /// Quarantine disposition reported apart from the first failure.
+    pub quarantine_state: PreparationState,
+    /// Digest of the verified quarantine record when durable.
+    pub quarantine_record_digest: Option<String>,
 }
 
 /// Declaration of whether identical input can be reproduced after a restart.
@@ -840,6 +942,8 @@ struct ArtifactStreamInput<'a> {
     disk_bytes: &'a mut u64,
     profile: &'a ResourceProfile,
     cancellation: &'a Cancellation,
+    faults: &'a StreamFaults,
+    evidence: &'a mut PreparationEvidence,
     started: Instant,
 }
 
@@ -908,6 +1012,8 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
         CompressionMode::Gzip => GzipWriter::Gzip(GzEncoder::new(sink, GzipCompression::default())),
     };
     while let Some(record) = input.source.next_record()? {
+        input.evidence.stage = FaultStage::SourceRead.as_str();
+        injected(input.faults, FaultStage::SourceRead)?;
         handoff.push(record)?;
         let record = handoff.pop().ok_or_else(|| {
             StreamError::PolicyExceeded("record handoff lost its queued record".to_owned())
@@ -917,6 +1023,8 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
         let index = usize::try_from(record_count)
             .map_err(|_| StreamError::PolicyExceeded("record index overflow".to_owned()))?;
         tracker.observe(&input.plan.path, &record.bytes, index, &policy)?;
+        input.evidence.stage = FaultStage::RecordValidation.as_str();
+        injected(input.faults, FaultStage::RecordValidation)?;
         let mut emitted = Vec::with_capacity(record.bytes.len().saturating_add(1));
         emitted.extend_from_slice(&record.bytes);
         emitted.push(b'\n');
@@ -941,6 +1049,8 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
         )?;
         written.update_expanded(&emitted);
         written.write_expanded(&emitted)?;
+        input.evidence.stage = FaultStage::ArtifactWrite.as_str();
+        injected(input.faults, FaultStage::ArtifactWrite)?;
         written.set_expanded(expanded);
         *input.release_expanded = release;
         content_hasher.update(&emitted);
@@ -960,6 +1070,8 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
     )?;
     *input.release_records = release_records;
     let sink = written.finish()?;
+    input.evidence.stage = FaultStage::Compression.as_str();
+    injected(input.faults, FaultStage::Compression)?;
     enforce_expansion_ratio(
         sink.expanded_bytes,
         sink.stored_bytes,
@@ -985,6 +1097,8 @@ fn stream_artifact(input: ArtifactStreamInput<'_>) -> Result<ArtifactStreamResul
     let expanded_sha256 = hex_encode(&expanded_hasher.finalize());
     let _ = writer;
     sync_file(input.path)?;
+    input.evidence.stage = FaultStage::FileSync.as_str();
+    injected(input.faults, FaultStage::FileSync)?;
     let descriptor = crate::distribution::ndc_release::ArtifactDescriptor {
         logical_partition_id: input.plan.logical_partition_id.clone(),
         shard_ordinal: input.plan.shard_ordinal,
@@ -1166,6 +1280,43 @@ pub struct SealedPublicationIntent {
     pub resource_profile_digest: String,
     /// Digest of canonical bytes with this member excluded.
     pub intent_sha256: String,
+}
+
+/// Layout version of the typed streaming quarantine record.
+pub const QUARANTINE_SCHEMA_VERSION: u32 = 1;
+
+/// Versioned, self-digested evidence for one failed streaming preparation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuarantineRecord {
+    /// Quarantine layout version.
+    pub schema_version: u32,
+    /// Operation identity validated before any ledger path was formed.
+    pub operation_id: String,
+    /// Digest of the preparation intent that preceded the failure.
+    pub preparation_intent_digest: String,
+    /// Pipeline stage that observed the first failure.
+    pub failure_stage: String,
+    /// Stable code of the first failure.
+    pub failure_code: String,
+    /// Display text of the first failure.
+    pub first_failure: String,
+    /// Staging directory name retained for inspection.
+    pub staging_directory: String,
+    /// Spool object names retained for inspection.
+    pub spool_inventory: Vec<String>,
+    /// Partial artifact paths retained for inspection.
+    pub partial_artifact_inventory: Vec<String>,
+    /// Source consumption disposition at the first failure.
+    pub source_consumption_state: SourceConsumptionState,
+    /// Bytes observed in retained staging and spool objects.
+    pub observed_bytes: u64,
+    /// Plan-derived expected expanded byte total.
+    pub expected_bytes: u64,
+    /// Explicit quarantine state at commit time.
+    pub quarantine_state: PreparationState,
+    /// Digest of canonical bytes with this member excluded.
+    pub record_digest: String,
 }
 
 fn canonical_ledger_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, StreamError> {
@@ -1498,6 +1649,57 @@ pub enum InvocationContext {
     TestHarness,
 }
 
+/// Every operation between preparation intent durability and the seal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum FaultStage {
+    #[default]
+    None,
+    PreparationIntent,
+    StagingCreate,
+    StagingSync,
+    ArtifactRoot,
+    SpoolWrite,
+    SpoolVerify,
+    ArtifactParent,
+    SourceRead,
+    RecordValidation,
+    ArtifactWrite,
+    Compression,
+    FileSync,
+    ManifestSeal,
+    ReceiptBuild,
+    ManifestWrite,
+    SidecarWrite,
+    ArtifactDirSync,
+    StagingDirSync,
+}
+
+impl FaultStage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PreparationIntent => "preparation-intent",
+            Self::StagingCreate => "staging-create",
+            Self::StagingSync => "staging-sync",
+            Self::ArtifactRoot => "artifact-root",
+            Self::SpoolWrite => "spool-write",
+            Self::SpoolVerify => "spool-verify",
+            Self::ArtifactParent => "artifact-parent",
+            Self::SourceRead => "source-read",
+            Self::RecordValidation => "record-validation",
+            Self::ArtifactWrite => "artifact-write",
+            Self::Compression => "compression",
+            Self::FileSync => "file-sync",
+            Self::ManifestSeal => "manifest-seal",
+            Self::ReceiptBuild => "receipt-build",
+            Self::ManifestWrite => "manifest-write",
+            Self::SidecarWrite => "sidecar-write",
+            Self::ArtifactDirSync => "artifact-dir-sync",
+            Self::StagingDirSync => "staging-dir-sync",
+        }
+    }
+}
+
 /// Injected fault points used by cancellation and crash-boundary tests.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct StreamFaults {
@@ -1507,6 +1709,18 @@ pub(crate) struct StreamFaults {
     pub(crate) cancel_before_seal: bool,
     /// Request cancellation immediately after the sealed intent is written.
     pub(crate) cancel_after_seal: bool,
+    /// Fail after the named pre-seal operation with a typed fault.
+    pub(crate) fail_after: Option<FaultStage>,
+    /// Refuse the quarantine ledger write to exercise the pending state.
+    pub(crate) quarantine_commit_fails: bool,
+}
+
+fn injected(faults: &StreamFaults, stage: FaultStage) -> Result<(), StreamError> {
+    if faults.fail_after == Some(stage) {
+        let message = format!("injected failure after {}", stage.as_str());
+        return Err(StreamError::Io(message.clone(), io::Error::other(message)));
+    }
+    Ok(())
 }
 
 /// One streaming publication request. Sources are caller-owned and are
@@ -1749,12 +1963,75 @@ fn write_compatibility_stages(
     Ok(tree)
 }
 
-/// Execute one bounded streaming publication.
+/// Evidence gathered while the preparation state advances to the seal.
+#[derive(Debug)]
+struct PreparationEvidence {
+    state: PreparationState,
+    staging_directory: String,
+    spool_inventory: Vec<String>,
+    partial_artifact_inventory: Vec<String>,
+    source_consumption_state: SourceConsumptionState,
+    observed_bytes: u64,
+    expected_bytes: u64,
+    stage: &'static str,
+}
+
+impl PreparationEvidence {
+    fn new(operation_id: &str, expected_bytes: u64) -> Self {
+        Self {
+            state: PreparationState::PreparationIntentDurable,
+            staging_directory: staging_name(operation_id),
+            spool_inventory: Vec::new(),
+            partial_artifact_inventory: Vec::new(),
+            source_consumption_state: SourceConsumptionState::NotStarted,
+            observed_bytes: 0,
+            expected_bytes,
+            stage: FaultStage::PreparationIntent.as_str(),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.source_consumption_state = SourceConsumptionState::Stopped;
+    }
+}
+
+/// Durable state produced at the seal boundary.
+struct PreparedPublication {
+    staging: PathBuf,
+    sealed_manifest: SealedManifest,
+    descriptors: Vec<ArtifactDescriptor>,
+    source_bindings: Vec<ArtifactSourceBinding>,
+    receipt: PublicationReceipt,
+    recovery_evidence: PublicationEvidence,
+    sealed: SealedPublicationIntent,
+    sealed_digest: String,
+    replay_proofs: Vec<ReplayProof>,
+}
+
+/// Outcome of a quarantine commit attempt reported apart from a failure.
+struct QuarantineCommit {
+    state: PreparationState,
+    record_digest: Option<String>,
+}
+
+fn planned_expected_bytes(plans: &[ArtifactPlan], max_record_bytes: u64) -> u64 {
+    plans.iter().fold(0_u64, |total, plan| {
+        total.saturating_add(
+            plan.expected_record_count
+                .saturating_add(1)
+                .saturating_mul(max_record_bytes),
+        )
+    })
+}
+
+/// Execute one bounded streaming publication with a durable quarantine on
+/// every failure between the preparation intent and the seal.
 pub fn publish_streaming(
     mut request: StreamingBuildRequest<'_>,
 ) -> Result<StreamingOutcome, StreamError> {
     let started = Instant::now();
     select_profile(&request)?;
+    validate_operation_id(request.operation_id)?;
     if request.signature.key_id != request.manifest.publication_identity.signing_key_id {
         return Err(StreamError::Publication(
             ProducerError::InvalidSignatureConfig(
@@ -1770,7 +2047,6 @@ pub fn publish_streaming(
         ));
     }
     let limits = request.profile.limits();
-    let policy = limits.to_resource_policy();
     enforce(
         1,
         limits.max_concurrent_artifacts(),
@@ -1781,7 +2057,7 @@ pub fn publish_streaming(
     request.cancellation.check("operation-start")?;
     check_duration(started, limits)?;
     let sources = std::mem::take(&mut request.sources);
-    let mut pairs = validate_sources(&request, sources)?;
+    let pairs = validate_sources(&request, sources)?;
     let plans: Vec<ArtifactPlan> = pairs.iter().map(|pair| pair.plan.clone()).collect();
     let source_bindings: Vec<ArtifactSourceBinding> = pairs
         .iter()
@@ -1825,17 +2101,76 @@ pub fn publish_streaming(
         intent_sha256: String::new(),
     };
     let preparation_digest = write_preparation_intent(request.ledger_dir, &preparation)?;
+
+    let expected_bytes = planned_expected_bytes(&plans, limits.max_record_bytes());
+    let mut evidence = PreparationEvidence::new(request.operation_id, expected_bytes);
+    let prepared = match run_preparation(
+        &mut request,
+        started,
+        &preparation_digest,
+        pairs,
+        source_bindings,
+        &mut evidence,
+    ) {
+        Ok(prepared) => prepared,
+        Err(first_failure) => {
+            evidence.state = PreparationState::PreparationFailed;
+            evidence.stop();
+            evidence.state = PreparationState::QuarantineCommit;
+            let commit = ensure_quarantine_record(
+                request.ledger_dir,
+                request.operation_id,
+                &preparation_digest,
+                &evidence,
+                first_failure.code(),
+                &first_failure.to_string(),
+                request.faults.quarantine_commit_fails,
+            );
+            evidence.state = commit.state;
+            return Err(StreamError::PreparationQuarantined(
+                PreparationQuarantineReport {
+                    observed_state: evidence.state,
+                    failure_code: first_failure.code().to_owned(),
+                    failure_stage: evidence.stage.to_owned(),
+                    first_failure: first_failure.to_string(),
+                    quarantine_state: commit.state,
+                    quarantine_record_digest: commit.record_digest,
+                },
+            ));
+        }
+    };
+    finalize_prepared_publication(&request, prepared)
+}
+
+/// Advance from preparation intent durability to the sealed intent. Every
+/// error in this window is surfaced to the caller for durable quarantine.
+fn run_preparation<'a>(
+    request: &mut StreamingBuildRequest<'a>,
+    started: Instant,
+    preparation_digest: &str,
+    mut pairs: Vec<PlannedSource<'a>>,
+    source_bindings: Vec<ArtifactSourceBinding>,
+    evidence: &mut PreparationEvidence,
+) -> Result<PreparedPublication, StreamError> {
+    let limits = request.profile.limits();
+    let policy = limits.to_resource_policy();
+    let plans: Vec<ArtifactPlan> = pairs.iter().map(|pair| pair.plan.clone()).collect();
+
     if request.faults.crash_before_seal {
+        evidence.stage = FaultStage::PreparationIntent.as_str();
         return Err(StreamError::Publication(ProducerError::Io(
             "injected crash before seal".to_owned(),
             io::Error::other("injected crash before seal"),
         )));
     }
+    evidence.state = PreparationState::Preparing;
+    evidence.stage = PreparationState::Preparing.as_str();
 
     let staging = request
         .release_root
         .join(staging_name(request.operation_id));
     provision_directory(request.release_root, "release root", &RealPublicationFs)?;
+    evidence.stage = FaultStage::StagingCreate.as_str();
     fs::create_dir(&staging).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             StreamError::Publication(ProducerError::PublicationEvidence(
@@ -1845,10 +2180,15 @@ pub fn publish_streaming(
             io_error("create streaming staging directory", error).into()
         }
     })?;
+    injected(&request.faults, FaultStage::StagingCreate)?;
+    evidence.stage = FaultStage::StagingSync.as_str();
     sync_directory(request.release_root)?;
+    injected(&request.faults, FaultStage::StagingSync)?;
     let artifact_root = staging.join(ARTIFACT_DIRECTORY);
+    evidence.stage = FaultStage::ArtifactRoot.as_str();
     fs::create_dir(&artifact_root)
         .map_err(|error| io_error("create staging artifact directory", error))?;
+    injected(&request.faults, FaultStage::ArtifactRoot)?;
 
     let mut dataset_hasher = Sha256::new();
     let mut descriptors = Vec::with_capacity(plans.len());
@@ -1857,14 +2197,22 @@ pub fn publish_streaming(
     let mut release_stored = 0_u64;
     let mut release_records = 0_u64;
     let mut disk_bytes = 0_u64;
-    let mut spooled: Vec<(String, SpoolEvidence)> = Vec::new();
+    evidence.source_consumption_state = SourceConsumptionState::Consuming;
     for pair in pairs.iter_mut() {
         request.cancellation.check("artifact-start")?;
         let plan = &pair.plan;
         let source = pair.source.as_mut();
         let mut spool = None;
         if plan.replayability == Replayability::NonReplayable {
-            let (evidence, framer) = spool_non_replayable(
+            let file_name = format!(
+                "{}-{}-spool.spool",
+                request.operation_id, plan.source_binding_id
+            );
+            if !evidence.spool_inventory.contains(&file_name) {
+                evidence.spool_inventory.push(file_name);
+            }
+            evidence.stage = FaultStage::SpoolWrite.as_str();
+            let (spool_evidence, framer) = spool_non_replayable(
                 source,
                 plan,
                 request.spool_dir,
@@ -1872,20 +2220,31 @@ pub fn publish_streaming(
                 request.operation_id,
                 request.profile,
             )?;
+            evidence.observed_bytes = evidence
+                .observed_bytes
+                .saturating_add(spool_evidence.spool_bytes);
+            injected(&request.faults, FaultStage::SpoolWrite)?;
+            evidence.stage = FaultStage::SpoolVerify.as_str();
             verify_spool(
                 request.spool_dir,
-                &evidence,
-                evidence.spool_bytes,
+                &spool_evidence,
+                spool_evidence.spool_bytes,
                 request.profile,
             )?;
-            spooled.push((plan.path.clone(), evidence));
+            injected(&request.faults, FaultStage::SpoolVerify)?;
             spool = Some(framer);
         }
         let target = staging.join(&plan.path);
         if let Some(parent) = target.parent() {
+            evidence.stage = FaultStage::ArtifactParent.as_str();
             fs::create_dir_all(parent)
                 .map_err(|error| io_error("create artifact parent", error))?;
+            injected(&request.faults, FaultStage::ArtifactParent)?;
         }
+        if !evidence.partial_artifact_inventory.contains(&plan.path) {
+            evidence.partial_artifact_inventory.push(plan.path.clone());
+        }
+        evidence.stage = FaultStage::SourceRead.as_str();
         let expected_replayability = if spool.is_some() {
             Replayability::Replayable
         } else {
@@ -1907,15 +2266,22 @@ pub fn publish_streaming(
             disk_bytes: &mut disk_bytes,
             profile: request.profile,
             cancellation: &request.cancellation,
+            faults: &request.faults,
+            evidence,
             started,
         })?;
+        evidence.observed_bytes = evidence
+            .observed_bytes
+            .saturating_add(result.descriptor.stored_bytes);
         descriptors.push(result.descriptor);
         replay_proofs.push(result.proof);
     }
+    evidence.source_consumption_state = SourceConsumptionState::Complete;
     let data_sha256 = hex_encode(&dataset_hasher.finalize());
     let mut manifest = request.manifest.clone();
     manifest.artifacts = descriptors.clone();
     manifest.digests.data_sha256 = data_sha256.clone();
+    evidence.stage = FaultStage::ManifestSeal.as_str();
     let sealed_manifest = seal_manifest(SealRequest {
         manifest: &manifest,
         evidence: request.evidence,
@@ -1923,7 +2289,9 @@ pub fn publish_streaming(
         signature: request.signature,
         policy: &policy,
     })?;
-    let (receipt, evidence) = build_receipt_evidence(
+    injected(&request.faults, FaultStage::ManifestSeal)?;
+    evidence.stage = FaultStage::ReceiptBuild.as_str();
+    let (receipt, recovery_evidence) = build_receipt_evidence(
         &manifest,
         &descriptors,
         request.operation_id,
@@ -1931,33 +2299,36 @@ pub fn publish_streaming(
         &sealed_manifest,
         &policy,
     )?;
+    injected(&request.faults, FaultStage::ReceiptBuild)?;
+    evidence.stage = FaultStage::ManifestWrite.as_str();
     write_new_file(
         &staging.join(crate::distribution::ndc_release::MANIFEST_FILE_NAME),
         &sealed_manifest.manifest_bytes,
     )?;
+    injected(&request.faults, FaultStage::ManifestWrite)?;
+    evidence.stage = FaultStage::SidecarWrite.as_str();
     write_new_file(
         &staging.join(crate::distribution::ndc_release::SIDECAR_FILE_NAME),
         &sealed_manifest.sidecar_bytes,
     )?;
+    injected(&request.faults, FaultStage::SidecarWrite)?;
+    evidence.stage = FaultStage::ArtifactDirSync.as_str();
     sync_directory(&artifact_root)?;
+    injected(&request.faults, FaultStage::ArtifactDirSync)?;
+    evidence.stage = FaultStage::StagingDirSync.as_str();
     sync_directory(&staging)?;
+    injected(&request.faults, FaultStage::StagingDirSync)?;
 
     if request.faults.cancel_before_seal {
         request.cancellation.cancel();
     }
-    if request.cancellation.is_cancelled() {
-        quarantine(
-            request.ledger_dir,
-            request.operation_id,
-            "cancelled before seal",
-        )?;
-        return Err(StreamError::PublicationCancelled("before-seal"));
-    }
+    evidence.stage = "before-seal";
+    request.cancellation.check("before-seal")?;
 
     let sealed = SealedPublicationIntent {
         schema_version: STREAM_INTENT_SCHEMA_VERSION,
         operation_id: request.operation_id.to_owned(),
-        preparation_intent_sha256: preparation_digest.clone(),
+        preparation_intent_sha256: preparation_digest.to_owned(),
         manifest_sha256: sealed_manifest.manifest_sha256.clone(),
         sidecar_sha256: sealed_manifest.sidecar_sha256.clone(),
         data_sha256: data_sha256.clone(),
@@ -1967,15 +2338,35 @@ pub fn publish_streaming(
         expanded_bytes: release_expanded,
         record_count: release_records,
         expected_receipt: receipt.clone(),
-        expected_receipt_sha256: evidence.receipt_sha256.clone(),
+        expected_receipt_sha256: recovery_evidence.receipt_sha256.clone(),
         wire_profile_id: INTENT_WIRE_PROFILE.to_owned(),
         resource_profile_id: request.profile.id().as_literal(),
         resource_profile_digest: hex_encode(request.profile.digest()),
         intent_sha256: String::new(),
     };
     let sealed_digest = write_sealed_intent(request.ledger_dir, &sealed)?;
+    evidence.state = PreparationState::Sealed;
+    Ok(PreparedPublication {
+        staging,
+        sealed_manifest,
+        descriptors,
+        source_bindings,
+        receipt,
+        recovery_evidence,
+        sealed,
+        sealed_digest,
+        replay_proofs,
+    })
+}
+
+/// Reconcile a sealed publication through the existing publication core.
+fn finalize_prepared_publication(
+    request: &StreamingBuildRequest<'_>,
+    prepared: PreparedPublication,
+) -> Result<StreamingOutcome, StreamError> {
+    let policy = request.profile.limits().to_resource_policy();
     let recovery_intent_sha256 =
-        write_compatibility_publication_intent(request.ledger_dir, &sealed, &policy)?;
+        write_compatibility_publication_intent(request.ledger_dir, &prepared.sealed, &policy)?;
 
     if request.faults.cancel_after_seal {
         request.cancellation.cancel();
@@ -1986,42 +2377,43 @@ pub fn publish_streaming(
 
     let tree = write_compatibility_stages(
         request.ledger_dir,
-        &sealed,
+        &prepared.sealed,
         &recovery_intent_sha256,
-        &receipt,
-        &evidence,
+        &prepared.receipt,
+        &prepared.recovery_evidence,
         &policy,
     )?;
     validate_artifact_set(
-        &staging,
-        &evidence,
-        Some(&sealed_manifest.sidecar_sha256),
+        &prepared.staging,
+        &prepared.recovery_evidence,
+        Some(&prepared.sealed_manifest.sidecar_sha256),
         &policy,
     )?;
-    let final_dir = request.release_root.join(&evidence.release_id);
+    let final_dir = request
+        .release_root
+        .join(&prepared.recovery_evidence.release_id);
     finalize_publication_v2(
         request.release_root,
         request.ledger_dir,
         &tree,
-        &staging,
+        &prepared.staging,
         &final_dir,
-        &receipt,
+        &prepared.receipt,
         &policy,
         Default::default(),
         &RealPublicationFs,
     )?;
 
-    let _ = spooled;
     Ok(StreamingOutcome {
-        manifest_bytes: sealed_manifest.manifest_bytes,
-        sidecar_bytes: sealed_manifest.sidecar_bytes,
-        descriptors,
-        source_bindings,
-        receipt,
-        recovery_evidence: evidence,
-        preparation_intent_sha256: preparation_digest,
-        sealed_intent_sha256: sealed_digest,
-        replay_proofs,
+        manifest_bytes: prepared.sealed_manifest.manifest_bytes,
+        sidecar_bytes: prepared.sealed_manifest.sidecar_bytes,
+        descriptors: prepared.descriptors,
+        source_bindings: prepared.source_bindings,
+        receipt: prepared.receipt,
+        recovery_evidence: prepared.recovery_evidence,
+        preparation_intent_sha256: prepared.sealed.preparation_intent_sha256,
+        sealed_intent_sha256: prepared.sealed_digest,
+        replay_proofs: prepared.replay_proofs,
     })
 }
 
@@ -2071,16 +2463,237 @@ fn write_compatibility_publication_intent(
     Ok(digest)
 }
 
-/// Quarantine an unsealed operation with durable evidence and no acknowledgement.
-pub fn quarantine(ledger: &Path, operation_id: &str, reason: &str) -> Result<(), StreamError> {
-    let path = ledger.join(format!("{operation_id}.quarantine.json"));
-    if path.exists() {
-        return Ok(());
+fn quarantine_file(ledger: &Path, operation_id: &str) -> PathBuf {
+    ledger.join(format!("{operation_id}.quarantine.json"))
+}
+
+fn validate_operation_id(operation_id: &str) -> Result<(), StreamError> {
+    if is_opaque_token(operation_id) {
+        Ok(())
+    } else {
+        Err(StreamError::PolicyExceeded(
+            "operation id is empty, oversized or outside the opaque alphabet".to_owned(),
+        ))
     }
-    let body = format!(
-        "{{\"operation_id\":\"{operation_id}\",\"sealed\":false,\"reason\":\"{reason}\"}}\n"
-    );
-    commit_ledger_record(&path, body.as_bytes(), ledger)
+}
+
+fn quarantine_verification(message: String) -> StreamError {
+    StreamError::QuarantineVerification("quarantine evidence".to_owned(), message)
+}
+
+fn verify_quarantine_record(record: &QuarantineRecord) -> Result<(), StreamError> {
+    if record.schema_version != QUARANTINE_SCHEMA_VERSION {
+        return Err(quarantine_verification(
+            "schema version is not supported".to_owned(),
+        ));
+    }
+    if validate_operation_id(&record.operation_id).is_err() {
+        return Err(quarantine_verification(
+            "operation id is not a valid path token".to_owned(),
+        ));
+    }
+    if !matches!(
+        record.quarantine_state,
+        PreparationState::QuarantinedDurable | PreparationState::QuarantinePending
+    ) {
+        return Err(quarantine_verification(
+            "quarantine state is not a terminal state".to_owned(),
+        ));
+    }
+    let mut unsigned = record.clone();
+    unsigned.record_digest = String::new();
+    if ledger_digest(&unsigned)? != record.record_digest {
+        return Err(quarantine_verification("record digest mismatch".to_owned()));
+    }
+    Ok(())
+}
+
+fn load_verified_quarantine_record(
+    ledger: &Path,
+    operation_id: &str,
+    preparation_digest: &str,
+) -> Result<QuarantineRecord, StreamError> {
+    validate_operation_id(operation_id)?;
+    let bytes = fs::read(quarantine_file(ledger, operation_id))
+        .map_err(|error| StreamError::Io("read quarantine record".to_owned(), error))?;
+    let record: QuarantineRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| quarantine_verification(format!("invalid quarantine record: {error}")))?;
+    verify_quarantine_record(&record)?;
+    if record.operation_id != operation_id || record.preparation_intent_digest != preparation_digest
+    {
+        return Err(quarantine_verification(
+            "record does not match the operation chain".to_owned(),
+        ));
+    }
+    Ok(record)
+}
+
+fn ensure_quarantine_record(
+    ledger: &Path,
+    operation_id: &str,
+    preparation_digest: &str,
+    evidence: &PreparationEvidence,
+    failure_code: &str,
+    first_failure_text: &str,
+    refuse_commit: bool,
+) -> QuarantineCommit {
+    let pending = QuarantineCommit {
+        state: PreparationState::QuarantinePending,
+        record_digest: None,
+    };
+    if validate_operation_id(operation_id).is_err() || refuse_commit {
+        return pending;
+    }
+    if let Ok(record) = load_verified_quarantine_record(ledger, operation_id, preparation_digest) {
+        return QuarantineCommit {
+            state: record.quarantine_state,
+            record_digest: Some(record.record_digest),
+        };
+    }
+    let record = QuarantineRecord {
+        schema_version: QUARANTINE_SCHEMA_VERSION,
+        operation_id: operation_id.to_owned(),
+        preparation_intent_digest: preparation_digest.to_owned(),
+        failure_stage: evidence.stage.to_owned(),
+        failure_code: failure_code.to_owned(),
+        first_failure: first_failure_text.to_owned(),
+        staging_directory: evidence.staging_directory.clone(),
+        spool_inventory: evidence.spool_inventory.clone(),
+        partial_artifact_inventory: evidence.partial_artifact_inventory.clone(),
+        source_consumption_state: evidence.source_consumption_state,
+        observed_bytes: evidence.observed_bytes,
+        expected_bytes: evidence.expected_bytes,
+        quarantine_state: PreparationState::QuarantinedDurable,
+        record_digest: String::new(),
+    };
+    let digest = match ledger_digest(&record) {
+        Ok(digest) => digest,
+        Err(_) => return pending,
+    };
+    let complete = QuarantineRecord {
+        record_digest: digest,
+        ..record
+    };
+    let bytes = match canonical_ledger_bytes(&complete) {
+        Ok(bytes) => bytes,
+        Err(_) => return pending,
+    };
+    if commit_ledger_record(&quarantine_file(ledger, operation_id), &bytes, ledger).is_err() {
+        return pending;
+    }
+    match load_verified_quarantine_record(ledger, operation_id, preparation_digest) {
+        Ok(verified) => QuarantineCommit {
+            state: verified.quarantine_state,
+            record_digest: Some(verified.record_digest),
+        },
+        Err(_) => pending,
+    }
+}
+
+fn collect_directory_objects(
+    directory: &Path,
+    prefix: &str,
+    inventory: &mut Vec<String>,
+    depth: u8,
+    maximum: usize,
+) -> Result<(), StreamError> {
+    if depth > 4 {
+        return Err(StreamError::PolicyExceeded(
+            "quarantine inventory depth bound exceeded".to_owned(),
+        ));
+    }
+    let entries = fs::read_dir(directory)
+        .map_err(|error| StreamError::Io("read quarantine directory".to_owned(), error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            StreamError::Io("read quarantine directory entry".to_owned(), error)
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            continue;
+        }
+        let relative = if prefix.is_empty() {
+            name
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let is_directory = entry
+            .file_type()
+            .map_err(|error| StreamError::Io("stat quarantine entry".to_owned(), error))?
+            .is_dir();
+        if is_directory {
+            collect_directory_objects(&entry.path(), &relative, inventory, depth + 1, maximum)?;
+        }
+        inventory.push(relative);
+        if inventory.len() > maximum {
+            return Err(StreamError::PolicyExceeded(
+                "quarantine inventory bound exceeded".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn enumerate_staging_objects(
+    release_root: &Path,
+    staging_directory: &str,
+    policy: &crate::distribution::ndc_release::ResourcePolicy,
+) -> Result<Vec<String>, StreamError> {
+    let directory = release_root.join(staging_directory);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let maximum = usize::try_from(policy.max_artifact_count).unwrap_or(usize::MAX);
+    let mut inventory = Vec::new();
+    collect_directory_objects(&directory, "", &mut inventory, 0, maximum)?;
+    inventory.sort();
+    Ok(inventory)
+}
+
+fn enumerate_spool_objects(
+    spool_dir: &Path,
+    operation_id: &str,
+    policy: &crate::distribution::ndc_release::ResourcePolicy,
+) -> Result<Vec<String>, StreamError> {
+    if !spool_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let maximum = usize::try_from(policy.max_artifact_count).unwrap_or(usize::MAX);
+    let prefix = format!("{operation_id}-");
+    let entries = fs::read_dir(spool_dir)
+        .map_err(|error| StreamError::Io("read spool directory".to_owned(), error))?;
+    let mut inventory = Vec::new();
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| StreamError::Io("read spool directory entry".to_owned(), error))?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&prefix) && name.ends_with("-spool.spool") {
+            inventory.push(name);
+            if inventory.len() > maximum {
+                return Err(StreamError::PolicyExceeded(
+                    "spool quarantine inventory bound exceeded".to_owned(),
+                ));
+            }
+        }
+    }
+    inventory.sort();
+    Ok(inventory)
+}
+
+fn retained_object_bytes(base: &Path, names: &[String]) -> u64 {
+    names
+        .iter()
+        .map(|name| {
+            fs::metadata(base.join(name))
+                .map(|data| data.len())
+                .unwrap_or(0)
+        })
+        .fold(0_u64, u64::saturating_add)
 }
 
 /// Recovery outcome for the two streaming intents.
@@ -2088,25 +2701,77 @@ pub fn quarantine(ledger: &Path, operation_id: &str, reason: &str) -> Result<(),
 pub enum StreamRecoveryOutcome {
     /// No preparation record exists for this operation.
     NoPreparationEvidence,
-    /// A preparation record exists without a seal; nothing may be published.
-    PreparationOnlyQuarantined,
+    /// A preparation record was not sealed; the carried state is the verified
+    /// quarantine disposition, which may be pending.
+    PreparationOnlyQuarantined(PreparationState),
     /// A verified seal exists and the publication core completed reconciliation.
     Recovered(RecoveryOutcome),
 }
 
-/// Recover one streaming operation. A preparation record alone yields no
-/// receipt, marker or final rename.
+/// Recover one streaming operation from durable evidence alone. A preparation
+/// record without a seal yields no receipt, marker or final rename, and yields
+/// a preparation-only state only with verifiable quarantine evidence.
 pub fn recover_streaming(
     release_root: &Path,
     ledger: &Path,
+    spool_dir: &Path,
     operation_id: &str,
     policy: &crate::distribution::ndc_release::ResourcePolicy,
 ) -> Result<StreamRecoveryOutcome, StreamError> {
+    validate_operation_id(operation_id)?;
     let preparation = load_preparation_intent(ledger, operation_id)?;
     let sealed = load_sealed_intent(ledger, operation_id)?;
     match (preparation, sealed) {
         (None, None) => Ok(StreamRecoveryOutcome::NoPreparationEvidence),
-        (Some(_), None) => Ok(StreamRecoveryOutcome::PreparationOnlyQuarantined),
+        (Some(preparation), None) => {
+            let staging_directory = staging_name(operation_id);
+            let partial_artifact_inventory =
+                enumerate_staging_objects(release_root, &staging_directory, policy)?;
+            let spool_inventory = enumerate_spool_objects(spool_dir, operation_id, policy)?;
+            let observed_bytes = retained_object_bytes(
+                &release_root.join(&staging_directory),
+                &partial_artifact_inventory,
+            )
+            .saturating_add(retained_object_bytes(spool_dir, &spool_inventory));
+            let evidence = PreparationEvidence {
+                state: PreparationState::PreparationFailed,
+                staging_directory,
+                spool_inventory,
+                partial_artifact_inventory,
+                source_consumption_state: SourceConsumptionState::Stopped,
+                observed_bytes,
+                expected_bytes: planned_expected_bytes(
+                    &preparation.source_plan,
+                    policy.max_record_bytes,
+                ),
+                stage: "recovery",
+            };
+            let commit = match load_verified_quarantine_record(
+                ledger,
+                operation_id,
+                &preparation.intent_sha256,
+            ) {
+                Ok(record) => QuarantineCommit {
+                    state: record.quarantine_state,
+                    record_digest: Some(record.record_digest),
+                },
+                Err(StreamError::Io(_, error)) if error.kind() == io::ErrorKind::NotFound => {
+                    ensure_quarantine_record(
+                        ledger,
+                        operation_id,
+                        &preparation.intent_sha256,
+                        &evidence,
+                        "STREAM_PREPARATION_ONLY",
+                        "preparation intent without a durable seal",
+                        false,
+                    )
+                }
+                Err(error) => return Err(error),
+            };
+            Ok(StreamRecoveryOutcome::PreparationOnlyQuarantined(
+                commit.state,
+            ))
+        }
         (None, Some(_)) => Err(StreamError::Publication(
             ProducerError::PublicationEvidence(
                 "sealed intent lacks its preparation chain".to_owned(),
@@ -2476,6 +3141,653 @@ mod tests {
         assert!(!receipt.exists(), "a refused operation has no receipt");
         assert!(!marker.exists(), "a refused operation has no marker");
         assert!(!final_dir.exists(), "a refused operation has no final name");
+        Ok(())
+    }
+
+    fn assert_quarantine_record(fixture: &Fixture, operation_id: &str) -> TestResult {
+        let preparation = load_preparation_intent(&fixture.ledger, operation_id)?
+            .ok_or_else(|| io::Error::other("the preparation intent is missing"))?;
+        let record = load_verified_quarantine_record(
+            &fixture.ledger,
+            operation_id,
+            &preparation.intent_sha256,
+        )?;
+        assert_eq!(
+            record.operation_id, operation_id,
+            "the durable record belongs to this operation"
+        );
+        assert_eq!(
+            record.quarantine_state,
+            PreparationState::QuarantinedDurable,
+            "the durable record carries the terminal quarantine state"
+        );
+        Ok(())
+    }
+
+    fn quarantined_report(
+        result: Result<StreamingOutcome, StreamError>,
+    ) -> PreparationQuarantineReport {
+        match result {
+            Err(StreamError::PreparationQuarantined(report)) => report,
+            other => panic!("a pre-seal failure must be quarantined: {other:?}"),
+        }
+    }
+
+    fn one_record_plan(path: &str) -> TestResult<(ArtifactPlan, Vec<CanonicalRecord>)> {
+        let records = vec![sequenced_record("abstract-1", 1)?];
+        let plan = make_plan("partition-a", 0, path, CompressionMode::None, &records)?;
+        Ok((plan, records))
+    }
+
+    fn publish_with_fault(
+        fixture: &Fixture,
+        fault: FaultStage,
+    ) -> TestResult<Result<StreamingOutcome, StreamError>> {
+        let (plan, records) = one_record_plan("artifacts/a.jsonl")?;
+        let sources = vec![source_for(&plan, &records)?];
+        publish(
+            fixture,
+            vec![plan],
+            sources,
+            StreamFaults {
+                fail_after: Some(fault),
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )
+    }
+
+    fn assert_fault_quarantines(fixture: &Fixture, fault: FaultStage) -> TestResult {
+        let report = quarantined_report(publish_with_fault(fixture, fault)?);
+        assert_eq!(
+            report.quarantine_state,
+            PreparationState::QuarantinedDurable,
+            "the injected fault is recorded with durable quarantine"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-b15").exists(),
+            "a pre-seal fault writes no sealed intent"
+        );
+        assert_quarantine_record(fixture, "operation-b15")?;
+        assert_no_availability(fixture)?;
+        let policy = test_profile()?.limits().to_resource_policy();
+        let recovered = recover_streaming(
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.spool,
+            "operation-b15",
+            &policy,
+        )?;
+        assert_eq!(
+            recovered,
+            StreamRecoveryOutcome::PreparationOnlyQuarantined(PreparationState::QuarantinedDurable),
+            "a fresh recovery process reads the durable quarantine"
+        );
+        Ok(())
+    }
+
+    fn publish_plan_with_fault(
+        fixture: &Fixture,
+        plan: ArtifactPlan,
+        records: Vec<CanonicalRecord>,
+        fault: FaultStage,
+    ) -> TestResult<Result<StreamingOutcome, StreamError>> {
+        let sources = vec![source_for(&plan, &records)?];
+        publish(
+            fixture,
+            vec![plan],
+            sources,
+            StreamFaults {
+                fail_after: Some(fault),
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )
+    }
+
+    #[test]
+    fn fault_after_staging_create_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::StagingCreate)
+    }
+
+    #[test]
+    fn fault_after_staging_sync_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::StagingSync)
+    }
+
+    #[test]
+    fn fault_after_artifact_root_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::ArtifactRoot)
+    }
+
+    #[test]
+    fn fault_after_artifact_parent_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::ArtifactParent)
+    }
+
+    #[test]
+    fn fault_after_source_read_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::SourceRead)
+    }
+
+    #[test]
+    fn fault_after_record_validation_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::RecordValidation)
+    }
+
+    #[test]
+    fn fault_after_artifact_write_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::ArtifactWrite)
+    }
+
+    #[test]
+    fn fault_after_compression_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::Compression)
+    }
+
+    #[test]
+    fn fault_after_file_sync_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::FileSync)
+    }
+
+    #[test]
+    fn fault_after_manifest_seal_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::ManifestSeal)
+    }
+
+    #[test]
+    fn fault_after_receipt_build_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::ReceiptBuild)
+    }
+
+    #[test]
+    fn fault_after_manifest_write_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::ManifestWrite)
+    }
+
+    #[test]
+    fn fault_after_sidecar_write_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::SidecarWrite)
+    }
+
+    #[test]
+    fn fault_after_artifact_dir_sync_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::ArtifactDirSync)
+    }
+
+    #[test]
+    fn fault_after_staging_dir_sync_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        assert_fault_quarantines(&fixture, FaultStage::StagingDirSync)
+    }
+
+    fn non_replayable_plan(path: &str) -> TestResult<(ArtifactPlan, Vec<CanonicalRecord>)> {
+        let (mut plan, records) = one_record_plan(path)?;
+        plan.replayability = Replayability::NonReplayable;
+        Ok((plan, records))
+    }
+
+    #[test]
+    fn fault_after_spool_write_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        let (plan, records) = non_replayable_plan("artifacts/spooled.jsonl")?;
+        let report = quarantined_report(publish_plan_with_fault(
+            &fixture,
+            plan,
+            records,
+            FaultStage::SpoolWrite,
+        )?);
+        assert_eq!(
+            report.quarantine_state,
+            PreparationState::QuarantinedDurable,
+            "a spool write fault is quarantined durably"
+        );
+        assert_quarantine_record(&fixture, "operation-b15")?;
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fault_after_spool_verify_quarantines() -> TestResult {
+        let fixture = fixture()?;
+        let (plan, records) = non_replayable_plan("artifacts/spooled.jsonl")?;
+        let report = quarantined_report(publish_plan_with_fault(
+            &fixture,
+            plan,
+            records,
+            FaultStage::SpoolVerify,
+        )?);
+        assert_eq!(
+            report.quarantine_state,
+            PreparationState::QuarantinedDurable,
+            "a spool verify fault is quarantined durably"
+        );
+        assert_quarantine_record(&fixture, "operation-b15")?;
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    const ALL_PRE_SEAL_FAULTS: &[FaultStage] = &[
+        FaultStage::PreparationIntent,
+        FaultStage::StagingCreate,
+        FaultStage::StagingSync,
+        FaultStage::ArtifactRoot,
+        FaultStage::SpoolWrite,
+        FaultStage::SpoolVerify,
+        FaultStage::ArtifactParent,
+        FaultStage::SourceRead,
+        FaultStage::RecordValidation,
+        FaultStage::ArtifactWrite,
+        FaultStage::Compression,
+        FaultStage::FileSync,
+        FaultStage::ManifestSeal,
+        FaultStage::ReceiptBuild,
+        FaultStage::ManifestWrite,
+        FaultStage::SidecarWrite,
+        FaultStage::ArtifactDirSync,
+        FaultStage::StagingDirSync,
+    ];
+
+    #[test]
+    fn every_pre_seal_fault_leaves_no_availability() -> TestResult {
+        for fault in ALL_PRE_SEAL_FAULTS {
+            let fixture = fixture()?;
+            let (plan, records) =
+                if matches!(fault, FaultStage::SpoolWrite | FaultStage::SpoolVerify) {
+                    non_replayable_plan("artifacts/spooled.jsonl")?
+                } else {
+                    one_record_plan("artifacts/a.jsonl")?
+                };
+            let sources = vec![source_for(&plan, &records)?];
+            let faults = if *fault == FaultStage::PreparationIntent {
+                StreamFaults {
+                    crash_before_seal: true,
+                    ..StreamFaults::default()
+                }
+            } else {
+                StreamFaults {
+                    fail_after: Some(*fault),
+                    ..StreamFaults::default()
+                }
+            };
+            let result = publish(&fixture, vec![plan], sources, faults, Cancellation::new())?;
+            let report = quarantined_report(result);
+            assert!(
+                matches!(
+                    report.quarantine_state,
+                    PreparationState::QuarantinedDurable | PreparationState::QuarantinePending
+                ),
+                "fault {fault:?} reports a typed quarantine state"
+            );
+            assert!(
+                !sealed_file(&fixture.ledger, "operation-b15").exists(),
+                "fault {fault:?} writes no sealed intent"
+            );
+            assert_no_availability(&fixture)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_record_is_canonical_and_digest_verified() -> TestResult {
+        let fixture = fixture()?;
+        quarantined_report(publish_with_fault(&fixture, FaultStage::ManifestWrite)?);
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("the preparation intent is missing"))?;
+        let path = quarantine_file(&fixture.ledger, "operation-b15");
+        let bytes = fs::read(&path)?;
+        let record: QuarantineRecord = serde_json::from_slice(&bytes)?;
+        assert_eq!(
+            record.schema_version, QUARANTINE_SCHEMA_VERSION,
+            "the record carries the pinned schema version"
+        );
+        assert_eq!(
+            canonical_ledger_bytes(&record)?,
+            bytes,
+            "the durable record is the canonical ledger serialization"
+        );
+        let mut unsigned = record.clone();
+        unsigned.record_digest = String::new();
+        assert_eq!(
+            ledger_digest(&unsigned)?,
+            record.record_digest,
+            "the record digest covers every other member"
+        );
+        assert_eq!(
+            record.preparation_intent_digest, preparation.intent_sha256,
+            "the record binds the preparation intent"
+        );
+        assert_eq!(
+            record.failure_code, "STREAM_IO",
+            "the first failure code survives the commit"
+        );
+        assert_eq!(
+            record.source_consumption_state,
+            SourceConsumptionState::Stopped,
+            "consumption was stopped at the first failure"
+        );
+        assert!(
+            !record.partial_artifact_inventory.is_empty(),
+            "partial artifacts are enumerated"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn existing_quarantine_record_is_verified_not_replaced() -> TestResult {
+        let fixture = fixture()?;
+        quarantined_report(publish_with_fault(&fixture, FaultStage::ManifestWrite)?);
+        let path = quarantine_file(&fixture.ledger, "operation-b15");
+        let before = fs::read(&path)?;
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("the preparation intent is missing"))?;
+        let evidence = PreparationEvidence::new("operation-b15", 4_096);
+        let commit = ensure_quarantine_record(
+            &fixture.ledger,
+            "operation-b15",
+            &preparation.intent_sha256,
+            &evidence,
+            "STREAM_OTHER",
+            "another failure",
+            false,
+        );
+        assert_eq!(
+            commit.state,
+            PreparationState::QuarantinedDurable,
+            "an existing verified record is accepted"
+        );
+        assert_eq!(
+            fs::read(&path)?,
+            before,
+            "an existing record is verified rather than replaced"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corrupted_quarantine_record_is_refused_by_recovery() -> TestResult {
+        let fixture = fixture()?;
+        quarantined_report(publish_with_fault(&fixture, FaultStage::ManifestWrite)?);
+        let path = quarantine_file(&fixture.ledger, "operation-b15");
+        let mut bytes = fs::read(&path)?;
+        let last = bytes.len().saturating_sub(2);
+        bytes[last] = b'0';
+        fs::write(&path, bytes)?;
+        let policy = test_profile()?.limits().to_resource_policy();
+        let result = recover_streaming(
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.spool,
+            "operation-b15",
+            &policy,
+        );
+        assert!(
+            matches!(result, Err(StreamError::QuarantineVerification(..))),
+            "a corrupted record is not reported as successful quarantine"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_record_with_wrong_operation_is_refused() -> TestResult {
+        let fixture = fixture()?;
+        quarantined_report(publish_with_fault(&fixture, FaultStage::ManifestWrite)?);
+        let path = quarantine_file(&fixture.ledger, "operation-b15");
+        let mut record: QuarantineRecord = serde_json::from_slice(&fs::read(&path)?)?;
+        record.operation_id = "operation-other".to_owned();
+        let mut unsigned = record.clone();
+        unsigned.record_digest = String::new();
+        record.record_digest = ledger_digest(&unsigned)?;
+        fs::write(&path, canonical_ledger_bytes(&record)?)?;
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("the preparation intent is missing"))?;
+        let result = load_verified_quarantine_record(
+            &fixture.ledger,
+            "operation-b15",
+            &preparation.intent_sha256,
+        );
+        assert!(
+            matches!(result, Err(StreamError::QuarantineVerification(..))),
+            "a record for another operation is refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_id_path_validation_refuses_traversal() -> TestResult {
+        let fixture = fixture()?;
+        assert!(
+            matches!(
+                validate_operation_id("../escape"),
+                Err(StreamError::PolicyExceeded(_))
+            ),
+            "a traversal token is refused before path use"
+        );
+        assert!(
+            matches!(
+                recover_streaming(
+                    &fixture.root,
+                    &fixture.ledger,
+                    &fixture.spool,
+                    "../escape",
+                    &test_profile()?.limits().to_resource_policy(),
+                ),
+                Err(StreamError::PolicyExceeded(_))
+            ),
+            "recovery refuses a traversal operation id"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn operation_id_path_validation_refuses_empty_and_oversize() -> TestResult {
+        assert!(
+            matches!(
+                validate_operation_id(""),
+                Err(StreamError::PolicyExceeded(_))
+            ),
+            "an empty operation id is refused"
+        );
+        let oversized = "a".repeat(129);
+        assert!(
+            matches!(
+                validate_operation_id(&oversized),
+                Err(StreamError::PolicyExceeded(_))
+            ),
+            "an oversized operation id is refused"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_pending_when_durable_commit_is_refused() -> TestResult {
+        let fixture = fixture()?;
+        let (plan, records) = one_record_plan("artifacts/a.jsonl")?;
+        let sources = vec![source_for(&plan, &records)?];
+        let result = publish(
+            &fixture,
+            vec![plan],
+            sources,
+            StreamFaults {
+                fail_after: Some(FaultStage::SourceRead),
+                quarantine_commit_fails: true,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.quarantine_state,
+            PreparationState::QuarantinePending,
+            "a refused ledger write reports the pending state"
+        );
+        assert_eq!(
+            report.observed_state,
+            PreparationState::QuarantinePending,
+            "the explicit state machine ends in quarantine pending"
+        );
+        assert!(
+            report.quarantine_record_digest.is_none(),
+            "a pending commit carries no verifiable record digest"
+        );
+        assert!(
+            !quarantine_file(&fixture.ledger, "operation-b15").exists(),
+            "a refused commit leaves no record claiming success"
+        );
+        assert!(
+            !sealed_file(&fixture.ledger, "operation-b15").exists(),
+            "a pending quarantine writes no sealed intent"
+        );
+        assert_no_availability(&fixture)?;
+        Ok(())
+    }
+
+    #[test]
+    fn first_failure_survives_a_pending_quarantine_commit() -> TestResult {
+        let fixture = fixture()?;
+        let (plan, records) = one_record_plan("artifacts/a.jsonl")?;
+        let sources = vec![source_for(&plan, &records)?];
+        let result = publish(
+            &fixture,
+            vec![plan],
+            sources,
+            StreamFaults {
+                fail_after: Some(FaultStage::SourceRead),
+                quarantine_commit_fails: true,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_IO",
+            "the first failure code is preserved when quarantine is pending"
+        );
+        assert_eq!(
+            report.failure_stage,
+            FaultStage::SourceRead.as_str(),
+            "the first failure stage is preserved"
+        );
+        assert!(
+            report
+                .first_failure
+                .contains("injected failure after source-read"),
+            "the first failure text is preserved"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_enumerates_residual_staging_and_spool_objects() -> TestResult {
+        let fixture = fixture()?;
+        let (plan, records) = non_replayable_plan("artifacts/spooled.jsonl")?;
+        quarantined_report(publish_plan_with_fault(
+            &fixture,
+            plan,
+            records,
+            FaultStage::ArtifactWrite,
+        )?);
+        let preparation = load_preparation_intent(&fixture.ledger, "operation-b15")?
+            .ok_or_else(|| io::Error::other("the preparation intent is missing"))?;
+        let record = load_verified_quarantine_record(
+            &fixture.ledger,
+            "operation-b15",
+            &preparation.intent_sha256,
+        )?;
+        assert!(
+            record
+                .partial_artifact_inventory
+                .iter()
+                .any(|name| name == "artifacts/spooled.jsonl"),
+            "the partial artifact path is retained"
+        );
+        assert!(
+            record.spool_inventory.iter().any(|name| {
+                name.starts_with("operation-b15-") && name.ends_with("-spool.spool")
+            }),
+            "the spool object is retained"
+        );
+        assert!(
+            record.observed_bytes > 0,
+            "observed bytes are retained with the evidence"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_consumption_stops_at_first_failure() -> TestResult {
+        let fixture = fixture()?;
+        let (plan, first_record) = one_record_plan("artifacts/a.jsonl")?;
+        let records = vec![first_record[0].clone(), sequenced_record("abstract-2", 2)?];
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingSource {
+            inner: source_for(&plan, &records)?,
+            completions: Arc::new(AtomicUsize::new(0)),
+            reads: reads.clone(),
+            completed: false,
+        };
+        let result = publish(
+            &fixture,
+            vec![plan],
+            vec![Box::new(source) as Box<dyn ArtifactRecordSource>],
+            StreamFaults {
+                fail_after: Some(FaultStage::SourceRead),
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
+        )?;
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.quarantine_state,
+            PreparationState::QuarantinedDurable,
+            "a stopped source is quarantined durably"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "consumption stopped after the first record read"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn no_quarantine_before_preparation_intent_is_durable() -> TestResult {
+        let fixture = fixture()?;
+        let (plan, records) = one_record_plan("artifacts/a.jsonl")?;
+        let result = publish(
+            &fixture,
+            vec![plan],
+            vec![source_for(&plan_for_cancel(), &records)?],
+            StreamFaults::default(),
+            {
+                let cancellation = Cancellation::new();
+                cancellation.cancel();
+                cancellation
+            },
+        )?;
+        assert!(
+            matches!(result, Err(StreamError::PublicationCancelled(_))),
+            "a refusal before preparation intent stays a typed refusal"
+        );
+        assert!(
+            !quarantine_file(&fixture.ledger, "operation-b15").exists(),
+            "no preparation failure evidence exists before the intent is durable"
+        );
+        assert_no_availability(&fixture)?;
         Ok(())
     }
 
@@ -3064,8 +4376,13 @@ mod tests {
             cancellation: Cancellation::new(),
             faults: StreamFaults::default(),
         });
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_POLICY_EXCEEDED",
+            "the record bound failure is preserved"
+        );
         assert!(
-            matches!(result, Err(StreamError::PolicyExceeded(bound)) if bound.contains("max_records_per_artifact")),
+            report.first_failure.contains("max_records_per_artifact"),
             "the record count is checked on the second record"
         );
         assert_no_availability(&fixture)?;
@@ -3141,23 +4458,35 @@ mod tests {
             CompressionMode::None,
             &records,
         )?;
-        let cancellation = Cancellation::new();
-        cancellation.cancel();
+        let sources = vec![source_for(&plan, &records)?];
         let result = publish(
             &fixture,
             vec![plan],
-            vec![source_for(&plan_for_cancel(), &records)?],
-            StreamFaults::default(),
-            cancellation,
+            sources,
+            StreamFaults {
+                cancel_before_seal: true,
+                ..StreamFaults::default()
+            },
+            Cancellation::new(),
         )?;
-        assert!(
-            matches!(result, Err(StreamError::PublicationCancelled(_))),
-            "cancellation before consumption is typed"
-        );
+        let report = match result {
+            Err(StreamError::PreparationQuarantined(report)) => report,
+            other => panic!("cancellation before seal must quarantine: {other:?}"),
+        };
+        assert_eq!(
+            report.failure_code, "STREAM_CANCELLED_BEFORE_SEAL",
+            "the first failure code is preserved"
+        ); // cancellation is the preserved first failure
+        assert_eq!(
+            report.quarantine_state,
+            PreparationState::QuarantinedDurable,
+            "quarantine"
+        ); // cancellation before seal is quarantined
         assert!(
             !sealed_file(&fixture.ledger, "operation-b15").exists(),
             "cancellation before seal writes no sealed intent"
         );
+        assert_quarantine_record(&fixture, "operation-b15")?;
         assert_no_availability(&fixture)?;
         Ok(())
     }
@@ -3241,10 +4570,15 @@ mod tests {
             },
             Cancellation::new(),
         )?;
-        assert!(
-            matches!(result, Err(StreamError::Publication(_))),
-            "the injected crash stops before consumption"
-        );
+        let report = match result {
+            Err(StreamError::PreparationQuarantined(report)) => report,
+            other => panic!("an injected crash before seal must quarantine: {other:?}"),
+        };
+        assert_eq!(
+            report.quarantine_state,
+            PreparationState::QuarantinedDurable,
+            "quarantine"
+        ); // crash before seal is quarantined
         assert!(
             preparation_file(&fixture.ledger, "operation-b15").exists(),
             "the preparation intent is durable before consumption"
@@ -3254,13 +4588,19 @@ mod tests {
             "no sealed intent exists after a crash before seal"
         );
         let policy = test_profile()?.limits().to_resource_policy();
-        let recovered =
-            recover_streaming(&fixture.root, &fixture.ledger, "operation-b15", &policy)?;
+        let recovered = recover_streaming(
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.spool,
+            "operation-b15",
+            &policy,
+        )?;
         assert_eq!(
             recovered,
-            StreamRecoveryOutcome::PreparationOnlyQuarantined,
-            "recovery refuses a preparation record without a seal"
+            StreamRecoveryOutcome::PreparationOnlyQuarantined(PreparationState::QuarantinedDurable),
+            "recovery verifies the durable quarantine without a seal"
         );
+        assert_quarantine_record(&fixture, "operation-b15")?;
         assert_no_availability(&fixture)?;
         Ok(())
     }
@@ -3335,11 +4675,13 @@ mod tests {
                 StreamFaults::default(),
                 Cancellation::new(),
             )?;
+            let report = quarantined_report(result);
+            assert_eq!(
+                report.failure_code, "STREAM_REPLAY_MISMATCH",
+                "a differing {member} member is the preserved first failure"
+            );
             assert!(
-                matches!(
-                    result,
-                    Err(StreamError::SourceReplayMismatch(_, failed)) if failed == member
-                ),
+                report.first_failure.contains(member),
                 "a differing {member} member quarantines before availability"
             );
             assert_no_availability(&fixture)?;
@@ -3402,10 +4744,11 @@ mod tests {
             cancellation: Cancellation::new(),
             faults: StreamFaults::default(),
         });
-        assert!(
-            matches!(result, Err(StreamError::SourceIdentityMismatch(..))),
-            "a source that reports another snapshot is refused"
-        );
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_SOURCE_IDENTITY",
+            "identity refusal"
+        ); // identity mismatch is the preserved first failure
         Ok(())
     }
 
@@ -4002,8 +5345,13 @@ mod tests {
             Cancellation::new(),
         )??;
         let policy = test_profile()?.limits().to_resource_policy();
-        let recovered =
-            recover_streaming(&fixture.root, &fixture.ledger, "operation-b15", &policy)?;
+        let recovered = recover_streaming(
+            &fixture.root,
+            &fixture.ledger,
+            &fixture.spool,
+            "operation-b15",
+            &policy,
+        )?;
         assert!(
             matches!(recovered, StreamRecoveryOutcome::Recovered(_)),
             "a matching binding chain recovers the publication"
@@ -4043,10 +5391,11 @@ mod tests {
             StreamFaults::default(),
             Cancellation::new(),
         )?;
-        assert!(
-            matches!(result, Err(StreamError::SourceBindingMismatch(..))),
-            "a source with another binding is refused before consumption"
-        );
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_SOURCE_BINDING",
+            "binding refusal"
+        ); // binding mismatch is the preserved first failure
         assert_eq!(
             read.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -4093,10 +5442,11 @@ mod tests {
             StreamFaults::default(),
             Cancellation::new(),
         )?;
-        assert!(
-            matches!(result, Err(StreamError::SourceBindingMismatch(..))),
-            "a misbound non-replayable source is refused before spooling"
-        );
+        let report = quarantined_report(result);
+        assert_eq!(
+            report.failure_code, "STREAM_SOURCE_BINDING",
+            "spool binding refusal"
+        ); // spool binding mismatch is the preserved first failure
         assert_eq!(
             read.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -4492,9 +5842,10 @@ mod tests {
             vec![plan],
             sources,
         )?;
+        let report = quarantined_report(outcome);
         assert!(
-            matches!(outcome, Err(StreamError::PolicyExceeded(message)) if message.contains("max_expansion_ratio")),
-            "a compressed stream above the ratio is refused before the seal"
+            report.first_failure.contains("max_expansion_ratio"),
+            "a compressed stream above the ratio is quarantined before the seal"
         );
         assert_no_availability(&fixture)?;
         Ok(())
@@ -4524,9 +5875,10 @@ mod tests {
             vec![plan],
             sources,
         )?;
+        let report = quarantined_report(result);
         assert!(
-            matches!(result, Err(StreamError::PolicyExceeded(_))),
-            "the ratio breach is a typed policy refusal"
+            report.first_failure.contains("max_expansion_ratio"),
+            "the ratio breach is preserved as a typed policy refusal in quarantine"
         );
         assert!(
             preparation_file(&fixture.ledger, "operation-ratio-evidence").exists(),
@@ -4646,9 +5998,10 @@ mod tests {
             plans,
             sources,
         )?;
+        let report = quarantined_report(result);
         assert!(
-            matches!(result, Err(StreamError::PolicyExceeded(message)) if message.contains("max_expansion_ratio")),
-            "the second canonical artifact's ratio breach is refused"
+            report.first_failure.contains("max_expansion_ratio"),
+            "the second canonical artifact's ratio breach is quarantined"
         );
         assert!(
             !sealed_file(&fixture.ledger, "operation-ratio-second-artifact").exists(),

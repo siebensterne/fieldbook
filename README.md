@@ -117,6 +117,9 @@ rather than a rewrite of history.
 - [Producer expansion ratio against stored bytes](docs/fb-limit-001-expansion-ratio-2026-11-24.md)
   — FB-LIMIT-001 stored-based ratio check, `u128` arithmetic, zero-stored-byte
   rule and gate record.
+- [Preparation quarantine for bounded streaming](docs/fb-stream-002-preparation-quarantine-2026-11-24.md)
+  — FB-STREAM-002 typed quarantine record, explicit pre-seal states, durable
+  recovery evidence and fault-injection record.
 - [Canonical financial objects](docs/fb-ref-001-canonical-objects-2026-11-24.md)
   — FB-REF-001 object classes, identity, assertions and coverage record.
 - [Versioned identity derivation](docs/fb-ref-001a-versioned-identity-2026-11-24.md)
