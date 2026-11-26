@@ -19,3 +19,6 @@ tools/sbe-gen/target/
 # Generated rustdoc is a tracked deliverable, unlike the rest of target/.
 !/target/doc/
 !/target/doc/**
+
+# Generated Markdown from rustdoc is not project prose.
+/target/doc/**/*.md
