@@ -131,9 +131,7 @@ def check_generated(policy: dict) -> list[str]:
 
     errors: list[str] = []
     for path in git("ls-files", "-z").split("\0"):
-        if not path or any(
-            path == exc or path.startswith(exc + "/") for exc in exceptions
-        ):
+        if not path or any(path == exc or path.startswith(exc + "/") for exc in exceptions):
             continue
         parts = path.split("/")
         for part in parts:
