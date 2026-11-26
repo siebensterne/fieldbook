@@ -1,4 +1,4 @@
-/target/*
+/target/
 .DS_Store
 captures/
 
@@ -15,10 +15,3 @@ __pycache__/
 # Local performance experiments and tool scratch output
 .local/
 tools/sbe-gen/target/
-
-# Generated rustdoc is a tracked deliverable, unlike the rest of target/.
-!/target/doc/
-!/target/doc/**
-
-# Generated Markdown from rustdoc is not project prose.
-/target/doc/**/*.md

@@ -1,9 +1,0 @@
-(function() {
-    const implementors = Object.fromEntries([["fieldbook",[["impl&lt;'a, C: <a class=\"trait\" href=\"fieldbook/util/dtos/orderbook/sbe_rt/trait.GroupContext.html\" title=\"trait fieldbook::util::dtos::orderbook::sbe_rt::GroupContext\">GroupContext</a>&gt; <a class=\"trait\" href=\"https://doc.rust-lang.org/1.99.1/core/iter/traits/exact_size/trait.ExactSizeIterator.html\" title=\"trait core::iter::traits::exact_size::ExactSizeIterator\">ExactSizeIterator</a> for <a class=\"struct\" href=\"fieldbook/util/dtos/orderbook/struct.SnapshotAsksDecoder.html\" title=\"struct fieldbook::util::dtos::orderbook::SnapshotAsksDecoder\">SnapshotAsksDecoder</a>&lt;'a, C&gt;",0],["impl&lt;'a, C: <a class=\"trait\" href=\"fieldbook/util/dtos/orderbook/sbe_rt/trait.GroupContext.html\" title=\"trait fieldbook::util::dtos::orderbook::sbe_rt::GroupContext\">GroupContext</a>&gt; <a class=\"trait\" href=\"https://doc.rust-lang.org/1.99.1/core/iter/traits/exact_size/trait.ExactSizeIterator.html\" title=\"trait core::iter::traits::exact_size::ExactSizeIterator\">ExactSizeIterator</a> for <a class=\"struct\" href=\"fieldbook/util/dtos/orderbook/struct.SnapshotBidsDecoder.html\" title=\"struct fieldbook::util::dtos::orderbook::SnapshotBidsDecoder\">SnapshotBidsDecoder</a>&lt;'a, C&gt;",0]]]]);
-    if (window.register_implementors) {
-        window.register_implementors(implementors);
-    } else {
-        window.pending_implementors = implementors;
-    }
-})()
-//{"start":59,"fragment_lengths":[1237]}

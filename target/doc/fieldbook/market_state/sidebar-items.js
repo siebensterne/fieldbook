@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["collector","histogram","orderbook","protocol","recovery"]};

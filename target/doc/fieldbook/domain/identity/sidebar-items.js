@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["Relationship","Resolution"],"fn":["venue_mappings_from_markets"],"struct":["DataProviderId","FeedId","FeedInstrumentMapping","FeedSessionId","IdentifierScheme","InstrumentId","InstrumentIdentifier","ListingId","MarketSegmentId","OpaqueId","ReferenceCatalog","SerializationSymbol","VenueId","VenueInstrumentMapping","VenueOperatorId"]};

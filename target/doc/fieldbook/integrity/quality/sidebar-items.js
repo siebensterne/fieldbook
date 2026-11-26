@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["QualityReason","QualityState"],"fn":["transition"],"struct":["IllegalTransition","QualityRecord","QualityReport","Reconciliation"]};

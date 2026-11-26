@@ -83,8 +83,12 @@ def validate(root: Path) -> list[str]:
             reason = forbidden(path, policy)
             if reason is not None:
                 errors.append(f"{source} path `{path}` uses a {reason}")
+    for path in tracked:
+        if path == "target" or path.startswith("target/"):
+            errors.append(f"tracked generated path under target/: `{path}`")
     # Markdown is checked on every non-tracked path too, including ignored ones,
-    # so a hidden document cannot bypass the one-file rule.
+    # so a hidden document cannot bypass the one-file rule. Generated rustdoc
+    # output under target/doc/ is ignored build output, not project prose.
     errors.extend(markdown_errors(tracked + all_untracked))
     return sorted(errors)
 

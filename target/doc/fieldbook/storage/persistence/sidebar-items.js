@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["save_catalog"],"struct":["PersistenceHandle","PersistenceStatus"]};

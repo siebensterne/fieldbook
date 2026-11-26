@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"mod":["acquisition","distribution","domain","governance","integrity","market_state","storage","util"]};

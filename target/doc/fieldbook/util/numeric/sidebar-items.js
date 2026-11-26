@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["level_to_sbe","price_from_sbe","price_to_sbe","quantity_from_sbe","quantity_to_sbe"]};

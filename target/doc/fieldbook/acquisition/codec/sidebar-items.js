@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["CodecRegistrationError","DecodeStatus","NormalizationError"],"struct":["CodecRegistry","DecodeBatch","DecodedObservation","NormalizedEvent","RawRecordRef","TypedPayload"],"trait":["FeedCodec"]};

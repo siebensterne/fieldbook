@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["MAX_REPORTED_SYMBOLS"],"fn":["run"],"struct":["BoundedList","CoverageSummary"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["GLOBAL_SCOPE"],"enum":["BackpressureBehavior","DataProduct","HeartbeatMechanism","OrderingScope","PrecisionModel","ProductKind","RecoveryMode","SubscriptionError","SubscriptionState","SubscriptionTopology","UpdateModel"],"struct":["InvalidSubscriptionTransition","SourceCapabilities","SubscriptionEpoch","SubscriptionLease","SubscriptionSet"]};

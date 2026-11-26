@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["ProcessingRole","ProfileError"],"struct":["ParserProfile","ProfileLimits","ProfileSelection","ResourceProfile","ResourceProfileId","StorageCodec"]};

@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["AssetClass","DataCategory","DepthModel","Frequency","InstrumentKind","InvalidCode","TemporalStatus"],"struct":["CountryCode","CurrencyCode"]};

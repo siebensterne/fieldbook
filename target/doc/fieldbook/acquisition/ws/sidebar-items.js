@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["WsPayload"],"fn":["close","connect","http_status","next_payload","recheck_subscription","send_ping_with_payload","send_plan_subscription","send_subscription_authorized","send_text","session_checkpoint"],"struct":["ConnectOptions","DenialTransport","ProbeStage","ProbeTrace","WsRead","WsResponse"],"type":["WsStream"]};

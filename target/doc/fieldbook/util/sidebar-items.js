@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["hex_lower","sha256_hex"],"mod":["dtos","numeric"],"struct":["AlignedSbeReader","AlignedSbeWriter","OrderbookSchema"],"trait":["AlignedSbeSchema"],"type":["PrefetchTask"]};
