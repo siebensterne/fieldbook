@@ -15,20 +15,36 @@
 //!   replacement where the platform supports directory sync. Where it does
 //!   not, only file-content durability is claimed: a creation or rename can
 //!   still be lost on power failure.
-//! - Every handle for one path in one process shares one writer and one poison
-//!   state. Ownership of the path is guarded by a kernel-held exclusive lock on
-//!   a stable `.lock` file: a second live process cannot acquire the same
-//!   store, and the kernel releases ownership when the owner exits. There is
-//!   no PID file, heartbeat or stale-file takeover heuristic. An ambiguous
+//! - Every handle for one store in one process shares one writer and one
+//!   poison state. Ownership is guarded by kernel-held exclusive `flock`s on
+//!   the canonical containing directory and on the store inode itself: a
+//!   second live process cannot acquire the same store through a symlink or a
+//!   hard-link alias, and the kernel releases ownership when the owner exits.
+//!   The `.lock` file is an observable token, opened with `O_NOFOLLOW` and
+//!   checked by file identity; replacing it cannot transfer ownership. There
+//!   is no PID file, heartbeat or stale-file takeover heuristic. An ambiguous
 //!   write, flush, sync, rename or directory-sync outcome poisons the store
 //!   until [`EvidenceStore::recover`] verifies the reopened state. The failure
 //!   class survived is process-level interruption between operations: no
 //!   partial write or replacement is ever reported as success. Zero data loss
 //!   is not claimed for power loss, unreliable storage or for writes made
 //!   outside [`EvidenceStore`].
+//!
+//! Ownership is a convention among cooperating `EvidenceStore` users, not
+//! access control. `flock` is advisory: a process that ignores it and writes
+//! to the same inode in place is not stopped, and no checksum claims to notice
+//! every such write. A swap of the store inode is detected on the next guarded
+//! operation, but this lock makes no power-loss, network-filesystem or
+//! distributed-ownership claim. The deployment state directory is
+//! `/var/lib/fieldbook` (the systemd `StateDirectory` in
+//! `deploy/fieldbook.service`) on a locally mounted **ext4** filesystem, the
+//! same filesystem qualified by `scripts/verify-journal-enospc.sh` in CI.
+//! NFS, overlayfs and cluster filesystems are out of scope: their `flock`
+//! semantics are not assumed here.
 
 use std::{
     collections::BTreeMap,
+    ffi::{OsStr, OsString},
     fmt,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -390,34 +406,341 @@ impl fmt::Display for StoreFaultPoint {
 /// Error text for a live owner refusing a second writer process.
 const OWNED_BY_ANOTHER_PROCESS: &str = "evidence store is already owned by another process";
 
-/// Kernel-held writer token for one store path.
+/// Error text when the anchored store or lock inode is no longer the held one.
+const IDENTITY_CHANGED: &str = "evidence store identity changed outside its owner";
+
+/// Name of the observable lock token beside one store file.
+fn lock_name(name: &OsStr) -> OsString {
+    let mut lock = name.to_os_string();
+    lock.push(".lock");
+    lock
+}
+
+/// Name of the temporary file used for atomic replacement of one store file.
+fn temporary_name(name: &OsStr) -> OsString {
+    Path::new(name).with_extension("tmp").into_os_string()
+}
+
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "openat anchors file creation and opening to the owned directory descriptor"
+)]
+fn open_in_dir(directory: &File, name: &OsStr, flags: i32) -> anyhow::Result<File> {
+    use std::{
+        ffi::CString,
+        os::unix::{
+            ffi::OsStrExt,
+            io::{AsRawFd, FromRawFd},
+        },
+    };
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid evidence file name: {error}"))?;
+    // SAFETY: `name` is NUL-terminated and `directory` owns a live descriptor.
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return Err(anyhow::anyhow!(
+                "symlinked evidence store and lock paths are refused: {error}"
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "open evidence file in owned directory: {error}"
+        ));
+    }
+    // SAFETY: `fd` is a fresh descriptor returned by this call and now owned here.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "fstatat compares the path inode with the inode the owner locked"
+)]
+fn identity_at(directory: &File, name: &OsStr) -> anyhow::Result<String> {
+    use std::{
+        ffi::CString,
+        mem::MaybeUninit,
+        os::unix::{ffi::OsStrExt, io::AsRawFd},
+    };
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid evidence file name: {error}"))?;
+    let mut info = MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `name` is NUL-terminated, `directory` is live, and `info` has
+    // enough correctly aligned storage for the `stat` fstatat writes into it.
+    let outcome = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            info.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if outcome != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fstatat succeeded, so the stat storage is initialised.
+    let info = unsafe { info.assume_init() };
+    Ok(format!("{}:{}", info.st_dev, info.st_ino))
+}
+
+#[cfg(unix)]
+fn identity_of(file: &File) -> anyhow::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "renameat replaces the store atomically inside the owned directory descriptor"
+)]
+fn rename_in_dir(directory: &File, from: &OsStr, to: &OsStr) -> anyhow::Result<()> {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, io::AsRawFd},
+    };
+
+    let from = CString::new(from.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid temporary file name: {error}"))?;
+    let to = CString::new(to.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid store file name: {error}"))?;
+    // SAFETY: both names are NUL-terminated and `directory` owns a live fd.
+    let outcome = unsafe {
+        libc::renameat(
+            directory.as_raw_fd(),
+            from.as_ptr(),
+            directory.as_raw_fd(),
+            to.as_ptr(),
+        )
+    };
+    if outcome != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "unlinkat removes an orphan temporary inside the owned directory descriptor"
+)]
+fn unlink_in_dir(directory: &File, name: &OsStr) -> anyhow::Result<()> {
+    use std::{
+        ffi::CString,
+        os::unix::{ffi::OsStrExt, io::AsRawFd},
+    };
+
+    let name = CString::new(name.as_bytes())
+        .map_err(|error| anyhow::anyhow!("invalid temporary file name: {error}"))?;
+    // SAFETY: `name` is NUL-terminated and `directory` owns a live fd.
+    let outcome = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if outcome != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn rename_in_dir(_directory: &File, _from: &OsStr, _to: &OsStr) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "directory-anchored evidence operations require openat; platform is unsupported"
+    ))
+}
+
+#[cfg(not(unix))]
+fn unlink_in_dir(_directory: &File, _name: &OsStr) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "directory-anchored evidence operations require unlinkat; platform is unsupported"
+    ))
+}
+
+#[cfg(unix)]
+fn exists_in_dir(directory: &File, name: &OsStr) -> bool {
+    identity_at(directory, name).is_ok()
+}
+
+#[cfg(not(unix))]
+fn exists_in_dir(_directory: &File, _name: &OsStr) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn open_existing_in_dir(directory: &File, name: &OsStr) -> anyhow::Result<File> {
+    open_in_dir(
+        directory,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+}
+
+#[cfg(not(unix))]
+fn open_existing_in_dir(_directory: &File, _name: &OsStr) -> anyhow::Result<File> {
+    Err(anyhow::anyhow!(
+        "directory-anchored evidence operations require openat; platform is unsupported"
+    ))
+}
+
+#[cfg(unix)]
+fn create_store_file(directory: &File, name: &OsStr) -> anyhow::Result<()> {
+    let file = open_in_dir(
+        directory,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )?;
+    Ok(file.sync_all()?)
+}
+
+#[cfg(not(unix))]
+fn create_store_file(_directory: &File, _name: &OsStr) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "directory-anchored evidence operations require openat; platform is unsupported"
+    ))
+}
+
+#[cfg(unix)]
+fn append_in_dir(directory: &File, name: &OsStr) -> anyhow::Result<File> {
+    open_in_dir(
+        directory,
+        name,
+        libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+}
+
+#[cfg(not(unix))]
+fn append_in_dir(_directory: &File, _name: &OsStr) -> anyhow::Result<File> {
+    Err(anyhow::anyhow!(
+        "directory-anchored evidence operations require openat; platform is unsupported"
+    ))
+}
+
+#[cfg(unix)]
+fn create_temporary_in_dir(directory: &File, name: &OsStr) -> anyhow::Result<File> {
+    open_in_dir(
+        directory,
+        name,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )
+}
+
+#[cfg(not(unix))]
+fn create_temporary_in_dir(_directory: &File, _name: &OsStr) -> anyhow::Result<File> {
+    Err(anyhow::anyhow!(
+        "directory-anchored evidence operations require openat; platform is unsupported"
+    ))
+}
+
+/// Kernel-held writer token for one store.
+///
+/// The directory lock makes lock-token replacement harmless; the store-inode
+/// lock makes hard-link aliases in different directories share one owner. All
+/// descriptors are held for the process lifetime and released by the kernel,
+/// including on abnormal process exit.
 #[derive(Debug)]
 struct WriterLock {
-    /// Kept open for the lifetime of the owning process. The kernel drops the
-    /// lock when this descriptor closes, including on abnormal process exit.
-    _file: File,
+    directory: File,
+    store: File,
+    lock_file: File,
+    store_id: String,
+    lock_id: String,
 }
 
 impl WriterLock {
-    /// Acquire the stable lock file for `path` without waiting or inferring
-    /// ownership from file metadata.
-    fn acquire(path: &Path) -> anyhow::Result<Self> {
-        let stable = stable_path(path);
-        let mut name = stable.file_name().unwrap_or_default().to_os_string();
-        name.push(".lock");
-        let lock_path = stable.with_file_name(name);
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)
-            .map_err(|error| anyhow::anyhow!("open evidence writer lock file: {error}"))?;
-        acquire_exclusive(&file, &lock_path)?;
-        Ok(Self { _file: file })
+    /// Acquire the anchored directory and store-inode locks, then verify that
+    /// both named paths still refer to the descriptors just locked.
+    #[cfg(unix)]
+    fn acquire(directory: &Path, name: &OsStr) -> anyhow::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let lock = lock_name(name);
+        let directory_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(directory)
+            .map_err(|error| anyhow::anyhow!("open evidence store directory: {error}"))?;
+        acquire_exclusive(&directory_file, directory)?;
+        let store = open_in_dir(
+            &directory_file,
+            name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        acquire_exclusive(&store, &directory.join(name))?;
+        let lock_file = open_in_dir(
+            &directory_file,
+            &lock,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        acquire_exclusive(&lock_file, &directory.join(&lock))?;
+        let store_id = identity_of(&store)?;
+        let lock_id = identity_of(&lock_file)?;
+        if identity_at(&directory_file, name)? != store_id
+            || identity_at(&directory_file, &lock)? != lock_id
+        {
+            return Err(anyhow::anyhow!(IDENTITY_CHANGED));
+        }
+        Ok(Self {
+            directory: directory_file,
+            store,
+            lock_file,
+            store_id,
+            lock_id,
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_directory: &Path, _name: &OsStr) -> anyhow::Result<Self> {
+        Err(anyhow::anyhow!(
+            "cross-process evidence writer ownership requires flock; platform is unsupported"
+        ))
+    }
+
+    /// Refuse to use a store whose inode, or lock token, was swapped by a
+    /// writer that bypassed the lock.
+    #[cfg(unix)]
+    fn verify(&self, name: &OsStr) -> anyhow::Result<()> {
+        if identity_of(&self.store)? != self.store_id
+            || identity_of(&self.lock_file)? != self.lock_id
+            || identity_at(&self.directory, name)? != self.store_id
+            || identity_at(&self.directory, &lock_name(name))? != self.lock_id
+        {
+            return Err(anyhow::anyhow!(IDENTITY_CHANGED));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn verify(&self, _name: &OsStr) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Adopt the new inode after this owner's own atomic replacement. The
+    /// directory lock is still held, so no competing owner can interleave.
+    #[cfg(unix)]
+    fn refresh_store(&mut self, name: &OsStr) -> anyhow::Result<()> {
+        let store = open_in_dir(
+            &self.directory,
+            name,
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        acquire_exclusive(&store, Path::new(name))?;
+        let store_id = identity_of(&store)?;
+        self.store = store;
+        self.store_id = store_id;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn refresh_store(&mut self, _name: &OsStr) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
-/// Take an exclusive, non-blocking advisory lock on the stable lock file.
+/// Take an exclusive, non-blocking advisory lock on an anchored descriptor.
 #[cfg(unix)]
 #[expect(
     unsafe_code,
@@ -460,48 +783,67 @@ fn acquire_exclusive(_file: &File, _path: &Path) -> anyhow::Result<()> {
 }
 
 /// Write serialization, cross-process ownership and poison state shared by
-/// every handle to one file within one process.
+/// every handle to one canonical store path within one process.
 #[derive(Debug, Default)]
 struct StoreState {
     /// Set when an outcome may have partially changed the store on disk.
     poisoned: bool,
-    /// Acquired once per process and path; the registry retains it for the
-    /// lifetime of the process so the kernel releases it at process exit.
+    /// Acquired once per process and canonical store path; the registry
+    /// retains it for the process lifetime so the kernel releases it at exit.
     writer_lock: Option<WriterLock>,
 }
 
 impl StoreState {
-    /// Acquire the kernel writer token before any store I/O.
-    fn ensure_owner(&mut self, path: &Path) -> anyhow::Result<()> {
+    /// Acquire the anchored kernel tokens before any store I/O.
+    fn ensure_owner(&mut self, directory: &Path, name: &OsStr) -> anyhow::Result<()> {
         if self.writer_lock.is_none() {
-            self.writer_lock = Some(WriterLock::acquire(path)?);
+            self.writer_lock = Some(WriterLock::acquire(directory, name)?);
         }
         Ok(())
     }
+
+    /// Fail closed if a bypassing writer swapped the store or lock inode.
+    fn verify_identity(&self, name: &OsStr) -> anyhow::Result<()> {
+        match &self.writer_lock {
+            Some(lock) => lock.verify(name),
+            None => Err(anyhow::anyhow!("evidence store has no writer owner")),
+        }
+    }
+
+    /// Re-anchor to the new store inode after this owner's atomic replacement.
+    fn refresh_store(&mut self, name: &OsStr) -> anyhow::Result<()> {
+        match &mut self.writer_lock {
+            Some(lock) => lock.refresh_store(name),
+            None => Err(anyhow::anyhow!("evidence store has no writer owner")),
+        }
+    }
+
+    /// Duplicated directory descriptor anchoring every file operation for
+    /// this store. The duplicate shares the kernel's locked description.
+    fn directory(&self) -> anyhow::Result<File> {
+        let directory = self
+            .writer_lock
+            .as_ref()
+            .map(|lock| &lock.directory)
+            .ok_or_else(|| anyhow::anyhow!("evidence store has no writer owner"))?;
+        directory
+            .try_clone()
+            .map_err(|error| anyhow::anyhow!("duplicate evidence directory descriptor: {error}"))
+    }
 }
 
-/// Handles created independently for the same path must serialize together.
+/// Handles created independently for one canonical store path serialize
+/// together; an alias that reaches the same inode is refused by the kernel.
 static STORE_STATES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<StoreState>>>>> = OnceLock::new();
 
-/// Resolve a store path to a stable key without requiring the file to exist.
-/// Canonicalizing the parent avoids a second identity when the file appears
-/// and when the temp root is reached through a symlink.
-fn stable_path(path: &Path) -> PathBuf {
-    path.parent()
-        .and_then(|parent| std::fs::canonicalize(parent).ok())
-        .map_or_else(
-            || path.to_path_buf(),
-            |parent| parent.join(path.file_name().unwrap_or_default()),
-        )
-}
-
+/// Key the in-process registry by the canonical parent plus the exact name.
+/// The kernel locks, not this key, decide whether an alias is a second owner.
 fn shared_state(path: &Path) -> Arc<Mutex<StoreState>> {
-    let key = stable_path(path);
     let registry = STORE_STATES.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut registry = registry
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    Arc::clone(registry.entry(key).or_default())
+    Arc::clone(registry.entry(path.to_path_buf()).or_default())
 }
 
 const POISON_MESSAGE: &str =
@@ -535,22 +877,18 @@ fn directory_sync_unavailable(error: &std::io::Error) -> bool {
     )
 }
 
-/// Sync the directory entry, reporting unsupported platforms by skipping it.
-fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let directory = File::open(parent)
-        .map_err(|error| anyhow::anyhow!("open containing directory for sync: {error}"))?;
+/// Sync the owned directory descriptor, skipping platforms that cannot sync
+/// a directory handle without claiming directory-entry durability there.
+fn sync_directory(directory: &File) -> anyhow::Result<()> {
     match directory.sync_all() {
         Ok(()) => Ok(()),
-        // Windows and some filesystems cannot sync a directory handle. The
-        // caller proceeds without claiming directory-entry durability there.
         Err(error) if directory_sync_unavailable(&error) => Ok(()),
-        Err(error) => Err(anyhow::anyhow!("sync containing directory: {error}")),
+        Err(error) => Err(anyhow::anyhow!("sync owned directory: {error}")),
     }
 }
 
-fn read_extensions(path: &Path) -> anyhow::Result<Vec<EvidenceExtension>> {
-    let file = File::open(path)?;
+fn read_extensions(directory: &File, name: &OsStr) -> anyhow::Result<Vec<EvidenceExtension>> {
+    let file = open_existing_in_dir(directory, name)?;
     let mut extensions = Vec::new();
     for (line_number, line) in BufReader::new(file).lines().enumerate() {
         let line = line?;
@@ -566,11 +904,19 @@ fn read_extensions(path: &Path) -> anyhow::Result<Vec<EvidenceExtension>> {
 }
 
 /// Append-only NDJSON store of evidence extensions.
+///
+/// One process at a time owns a store inside a cooperating deployment: the
+/// kernel-held directory and inode locks serialise writers, and no PID file or
+/// lease is involved. This is advisory coordination, not access control; a
+/// process that ignores the lock and writes the same inode in place is outside
+/// the guarantee, as are power loss and distributed ownership. See the module
+/// documentation for the qualified filesystem.
 #[derive(Debug, Clone)]
 pub struct EvidenceStore {
     path: PathBuf,
-    /// Shared across clones and independent handles for the same path so
-    /// appends and replacements cannot interleave or race.
+    file_name: OsString,
+    /// Shared across clones and independent handles for one canonical store
+    /// path so appends and replacements cannot interleave or race.
     shared: Arc<Mutex<StoreState>>,
     /// One-shot deterministic interruption installed by tests.
     fault: Arc<Mutex<Option<StoreFaultPoint>>>,
@@ -580,26 +926,31 @@ impl EvidenceStore {
     /// Open or create a store in `directory`.
     pub fn new(directory: &Path, name: &str) -> anyhow::Result<Self> {
         std::fs::create_dir_all(directory)?;
-        let path = directory.join(name);
+        // Canonicalizing the directory resolves symlinked deployment roots once
+        // and anchors every later operation to one directory descriptor.
+        let canonical = std::fs::canonicalize(directory)
+            .map_err(|error| anyhow::anyhow!("resolve evidence store directory: {error}"))?;
+        let path = canonical.join(name);
+        let file_name = OsString::from(name);
         let shared = shared_state(&path);
         {
             let mut state = shared
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // Ownership precedes creation so two processes cannot race to
-            // create or replace the same path, and the token stays held until
+            // create or replace the same inode, and the tokens stay held until
             // this process exits.
-            state.ensure_owner(&path)?;
-        }
-        if !path.exists() {
-            let file = File::create(&path)?;
-            file.sync_all()?;
-            drop(file);
-            sync_parent_directory(&path)?;
+            state.ensure_owner(&canonical, &file_name)?;
+            let directory_file = state.directory()?;
+            if !exists_in_dir(&directory_file, &file_name) {
+                create_store_file(&directory_file, &file_name)?;
+                sync_directory(&directory_file)?;
+            }
         }
         Ok(Self {
             shared,
             path,
+            file_name,
             fault: Arc::new(Mutex::new(None)),
         })
     }
@@ -651,10 +1002,12 @@ impl EvidenceStore {
     /// temporary file left by an interrupted replacement is removed here.
     pub fn recover(&self) -> anyhow::Result<()> {
         let mut state = self.lock_state();
-        read_extensions(&self.path)?;
-        let temporary = self.path.with_extension("tmp");
-        if temporary.exists() {
-            std::fs::remove_file(&temporary).map_err(|error| {
+        state.verify_identity(&self.file_name)?;
+        let directory = state.directory()?;
+        read_extensions(&directory, &self.file_name)?;
+        let temporary = temporary_name(&self.file_name);
+        if exists_in_dir(&directory, &temporary) {
+            unlink_in_dir(&directory, &temporary).map_err(|error| {
                 anyhow::anyhow!("recover cannot remove orphan temporary file: {error}")
             })?;
         }
@@ -671,6 +1024,8 @@ impl EvidenceStore {
         payload.push(b'\n');
         let mut state = self.lock_state();
         ensure_writable(&state)?;
+        state.verify_identity(&self.file_name)?;
+        let directory = state.directory()?;
 
         if self.fault_here(StoreFaultPoint::Write) {
             return Err(poison_after(
@@ -679,10 +1034,7 @@ impl EvidenceStore {
                 injected(StoreFaultPoint::Write),
             ));
         }
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .map_err(|error| anyhow::anyhow!("open evidence store for append: {error}"))?;
+        let mut file = append_in_dir(&directory, &self.file_name)?;
         if let Err(error) = file.write_all(&payload) {
             return Err(poison_after(&mut state, StoreFaultPoint::Write, error));
         }
@@ -714,8 +1066,9 @@ impl EvidenceStore {
     /// Reading is allowed while the store is poisoned so callers can verify
     /// state before invoking [`EvidenceStore::recover`].
     pub fn load(&self) -> anyhow::Result<Vec<EvidenceExtension>> {
-        let _state = self.lock_state();
-        read_extensions(&self.path)
+        let state = self.lock_state();
+        state.verify_identity(&self.file_name)?;
+        read_extensions(&state.directory()?, &self.file_name)
     }
 
     /// Rewrite the store with bound extensions.
@@ -732,7 +1085,9 @@ impl EvidenceStore {
         }
         let mut state = self.lock_state();
         ensure_writable(&state)?;
-        let temporary = self.path.with_extension("tmp");
+        state.verify_identity(&self.file_name)?;
+        let directory = state.directory()?;
+        let temporary = temporary_name(&self.file_name);
 
         if self.fault_here(StoreFaultPoint::Write) {
             return Err(poison_after(
@@ -741,8 +1096,7 @@ impl EvidenceStore {
                 injected(StoreFaultPoint::Write),
             ));
         }
-        let mut file = File::create(&temporary)
-            .map_err(|error| anyhow::anyhow!("create evidence temporary file: {error}"))?;
+        let mut file = create_temporary_in_dir(&directory, &temporary)?;
         if let Err(error) = file.write_all(&payload) {
             return Err(poison_after(&mut state, StoreFaultPoint::Write, error));
         }
@@ -775,9 +1129,12 @@ impl EvidenceStore {
                 injected(StoreFaultPoint::Rename),
             ));
         }
-        if let Err(error) = std::fs::rename(&temporary, &self.path) {
+        if let Err(error) = rename_in_dir(&directory, &temporary, &self.file_name) {
             return Err(poison_after(&mut state, StoreFaultPoint::Rename, error));
         }
+        // This owner replaced the inode under its own directory lock. Re-anchor
+        // before the next operation so its own identity check still succeeds.
+        state.refresh_store(&self.file_name)?;
 
         if self.fault_here(StoreFaultPoint::DirectorySync) {
             return Err(poison_after(
@@ -786,7 +1143,7 @@ impl EvidenceStore {
                 injected(StoreFaultPoint::DirectorySync),
             ));
         }
-        if let Err(error) = sync_parent_directory(&self.path) {
+        if let Err(error) = sync_directory(&directory) {
             return Err(poison_after(
                 &mut state,
                 StoreFaultPoint::DirectorySync,
@@ -2417,6 +2774,116 @@ mod tests {
                 extension(2, b"replay-payload").evidence_id,
             ],
             "the replaced owner's append and the replay are both durable"
+        );
+    }
+
+    /// A symlink on the final component must not mint a second lock identity.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_alias_to_store_admits_exactly_one_owner() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&real).expect("real store directory");
+        std::fs::create_dir(&alias).expect("alias store directory");
+        std::os::unix::fs::symlink(real.join("evidence.jsonl"), alias.join("evidence.jsonl"))
+            .expect("symlink store alias");
+
+        let (mut owner, mut output, input) = spawn_writer(&real, "owner");
+        assert_eq!(
+            read_signal(&mut output, &mut owner),
+            "acquired",
+            "the real store path owns the store"
+        );
+        let probe = probe_writer(&alias);
+        assert!(
+            probe.contains(&format!("{CHILD_SIGNAL_PREFIX}busy:")),
+            "a symlink alias must not acquire a second owner: {probe:?}"
+        );
+        release_writer(input, &mut owner);
+    }
+
+    /// Hard links name one inode; they must name one owner, not two locks.
+    #[cfg(unix)]
+    #[test]
+    fn hard_link_alias_to_store_admits_exactly_one_owner() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let real = directory.path().join("real");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&real).expect("real store directory");
+        std::fs::create_dir(&alias).expect("alias store directory");
+
+        let (mut owner, mut output, input) = spawn_writer(&real, "owner");
+        assert_eq!(
+            read_signal(&mut output, &mut owner),
+            "acquired",
+            "the real store path owns the store"
+        );
+        std::fs::hard_link(real.join("evidence.jsonl"), alias.join("evidence.jsonl"))
+            .expect("hard link store alias");
+        let probe = probe_writer(&alias);
+        assert!(
+            probe.contains(&format!("{CHILD_SIGNAL_PREFIX}busy:")),
+            "a hard link alias must not acquire a second owner: {probe:?}"
+        );
+        release_writer(input, &mut owner);
+    }
+
+    /// The lock token itself is not the authority: replacing it while an owner
+    /// is alive must not let a second process acquire ownership.
+    #[test]
+    fn replacing_lock_file_while_owner_is_alive_cannot_steal_ownership() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut owner, mut output, input) = spawn_writer(directory.path(), "owner");
+        assert_eq!(
+            read_signal(&mut output, &mut owner),
+            "acquired",
+            "first process owns the store"
+        );
+        let lock = directory.path().join("evidence.jsonl.lock");
+        std::fs::remove_file(&lock).expect("remove lock token");
+        std::fs::write(&lock, b"").expect("install a fresh lock token");
+        let probe = probe_writer(directory.path());
+        assert!(
+            probe.contains(&format!("{CHILD_SIGNAL_PREFIX}busy:")),
+            "a replaced lock file must not transfer ownership: {probe:?}"
+        );
+        release_writer(input, &mut owner);
+    }
+
+    /// A symlinked lock path is refused instead of following the link into a
+    /// file the owner does not control.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_lock_path_is_refused() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let target = directory.path().join("outside.lock");
+        std::fs::write(&target, b"").expect("lock target");
+        std::os::unix::fs::symlink(&target, directory.path().join("evidence.jsonl.lock"))
+            .expect("symlink lock path");
+        assert!(
+            EvidenceStore::new(directory.path(), "evidence.jsonl").is_err(),
+            "a symlinked lock path must fail closed"
+        );
+    }
+
+    /// A bypassing writer that swaps the store inode is noticed on the next
+    /// guarded operation. In-place writes by a bypassing process are outside
+    /// the guarantee and are documented as such on `EvidenceStore`.
+    #[test]
+    fn bypass_writer_replacing_store_is_detected() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+        store
+            .append(&extension(1, b"guarded"))
+            .expect("guarded append before bypass");
+        let replacement = directory.path().join("bypass.jsonl");
+        std::fs::write(&replacement, b"").expect("bypass writer's replacement file");
+        std::fs::rename(&replacement, directory.path().join("evidence.jsonl"))
+            .expect("bypass writer replaces the store");
+        assert!(
+            store.append(&extension(2, b"after-bypass")).is_err(),
+            "an inode replaced outside the owner must fail closed on next use"
         );
     }
 }
