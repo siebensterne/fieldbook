@@ -27,7 +27,6 @@ import ast
 import json
 import re
 import sys
-import textwrap
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -244,40 +243,6 @@ def check_json(path: Path, errors: list[str]) -> None:
             errors.append(f"{path}:{number}: indentation is not a multiple of two")
 
 
-def check_markdown(path: Path, errors: list[str]) -> None:
-    """Check Google Markdown layout: one H1, ATX headings, labelled fences."""
-    lines = basic_lines(path, "markdown", errors)
-    if is_evidence(path):
-        return
-    in_fence = False
-    h1 = []
-    for number, line in enumerate(lines, 1):
-        if line.startswith("```"):
-            in_fence = not in_fence
-        elif not in_fence and line.startswith("# "):
-            h1.append(number)
-    if h1 != [1]:
-        errors.append(f"{path}: expected a single H1 on line 1, found {h1}")
-    in_fence = False
-    for number, line in enumerate(lines, 1):
-        if line.startswith("```"):
-            if not in_fence and len(line.strip()) == 3:
-                errors.append(f"{path}:{number}: fenced block has no language")
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        if re.match(r"^#{1,6}[^#\s]", line):
-            errors.append(f"{path}:{number}: heading needs a space after `#`")
-        if re.match(r"^[=-]{3,}\s*$", line) and number > 1 and lines[number - 2].strip():
-            errors.append(f"{path}:{number}: underlined heading is not ATX")
-        if re.search(r"(?<!\.)\.\./", MD_LINK_RE.sub("", line)):
-            errors.append(f"{path}:{number}: relative parent path in link")
-        without_code = MD_CODE_RE.sub("", line)
-        if re.search(r"<(?:div|span|br|table|p|img)\b", without_code):
-            errors.append(f"{path}:{number}: raw HTML is discouraged")
-
-
 def check_makefile(path: Path, errors: list[str]) -> None:
     """Check make style: phony targets, tab recipes and unique target names."""
     lines = basic_lines(path, "makefile", errors)
@@ -305,120 +270,6 @@ def check_makefile(path: Path, errors: list[str]) -> None:
         errors.append(f"{path}: target `{target}` is not .PHONY")
 
 
-def protect_spans(text: str) -> tuple[str, list[str]]:
-    """Replace code spans and links with placeholders so wrapping is safe."""
-    spans: list[str] = []
-
-    def replace(match: re.Match[str]) -> str:
-        """Exercise replace."""
-        token = match.group(0)
-        index = len(spans)
-        marker = f"\x00{index}\x00"
-        spans.append(token)
-        return marker + "X" * max(0, len(token) - len(marker))
-
-    masked = MD_CODE_RE.sub(replace, text)
-    masked = MD_LINK_RE.sub(replace, masked)
-    return masked, spans
-
-
-def restore_spans(text: str, spans: list[str]) -> str:
-    """Restore placeholders after wrapping."""
-    pattern = re.compile(r"\x00(\d+)\x00X*")
-    return pattern.sub(lambda match: spans[int(match.group(1))], text)
-
-
-def is_structural_markdown(line: str) -> bool:
-    """Report whether a line must not be joined into a prose paragraph."""
-    stripped = line.lstrip()
-    return (
-        not stripped
-        or line.startswith("#")
-        or stripped.startswith(("|", "<!--"))
-        or bool(MD_LINK_RE.fullmatch(stripped))
-    )
-
-
-def reflow_markdown(path: Path) -> bool:
-    """Wrap plain Markdown paragraphs to 80 columns; return True if changed."""
-    original = path.read_text(encoding="utf-8")
-    lines = original.splitlines()
-    output: list[str] = []
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if line.startswith("```"):
-            output.append(line)
-            index += 1
-            while index < len(lines):
-                output.append(lines[index])
-                index += 1
-                if output[-1].startswith("```"):
-                    break
-            continue
-        if is_structural_markdown(line):
-            output.append(line)
-            index += 1
-            continue
-        paragraph = [line]
-        index += 1
-        while index < len(lines):
-            candidate = lines[index]
-            if is_structural_markdown(candidate) or re.match(
-                r"^\s*(?:> |[-*+] |\d+\.\s)", candidate
-            ):
-                break
-            paragraph.append(candidate)
-            index += 1
-        prefix = ""
-        body = paragraph[0]
-        match = re.match(r"^(\s*)(?:> |[-*+] |\d+\.\s)", body)
-        if match:
-            prefix = match.group(0)
-            paragraph[0] = body[len(prefix) :]
-        joined = " ".join(part.strip() for part in paragraph)
-        if "`" in joined or "[" in joined:
-            # Links and code spans are Google's 100-column exceptions. Wrap the
-            # other lines of the paragraph individually so one link does not
-            # prevent ordinary prose from being brought under the limit.
-            for part in paragraph:
-                part_match = re.match(r"^(\s*)(?:> |[-*+] |\d+\.\s)", part)
-                part_prefix = part_match.group(0) if part_match else ""
-                part_body = part[len(part_prefix) :]
-                if "`" in part_body or "[" in part_body or len(part) <= MAX_LINE:
-                    output.append(part)
-                    continue
-                part_hanging = " " * len(part_prefix)
-                output.extend(
-                    textwrap.wrap(
-                        part_body,
-                        width=MAX_LINE,
-                        initial_indent=part_prefix,
-                        subsequent_indent=part_hanging,
-                        break_long_words=False,
-                        break_on_hyphens=False,
-                        replace_whitespace=False,
-                    )
-                )
-            continue
-        hanging = " " * len(prefix)
-        for wrapped in textwrap.wrap(
-            joined,
-            width=MAX_LINE,
-            initial_indent=prefix,
-            subsequent_indent=hanging,
-            break_long_words=False,
-            break_on_hyphens=False,
-            replace_whitespace=False,
-        ):
-            output.append(wrapped)
-    updated = "\n".join(output) + "\n"
-    if updated != original:
-        path.write_text(updated, encoding="utf-8")
-        return True
-    return False
-
-
 def apply_pyink() -> bool:
     """Run the pinned Pyink formatter; return True when it edits a file."""
     import shutil
@@ -444,36 +295,27 @@ def main() -> int:
     """Run the selected style checks and report every violation."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fix", action="store_true", help="apply safe fixes")
-    for name in ("python", "shell", "json", "markdown", "makefile"):
+    for name in ("python", "shell", "json", "makefile"):
         parser.add_argument(f"--{name}", action="store_true", help=f"check {name}")
     args = parser.parse_args()
-    selected = {
-        name for name in ("python", "shell", "json", "markdown", "makefile") if getattr(args, name)
-    }
+    selected = {name for name in ("python", "shell", "json", "makefile") if getattr(args, name)}
     if not selected:
-        selected = {"python", "shell", "json", "markdown", "makefile"}
+        selected = {"python", "shell", "json", "makefile"}
 
-    if args.fix:
-        if "python" in selected:
-            apply_pyink()
-        if "markdown" in selected:
-            for path in all_files("*.md"):
-                if not is_evidence(path):
-                    reflow_markdown(path)
+    if args.fix and "python" in selected:
+        apply_pyink()
 
     errors: list[str] = []
     checkers = {
         "python": check_python,
         "shell": check_shell,
         "json": check_json,
-        "markdown": check_markdown,
         "makefile": check_makefile,
     }
     sources = {
         "python": all_files("*.py"),
         "shell": [path for pattern in SHELLS for path in collect(pattern)],
         "json": all_files("*.json"),
-        "markdown": all_files("*.md"),
         "makefile": [ROOT / "Makefile"] if (ROOT / "Makefile").is_file() else [],
     }
     for kind in sorted(selected):

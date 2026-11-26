@@ -188,9 +188,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
-    const EXAMPLE_SPEC: &str = include_str!(
-        "../../docs/specifications/ndc-conformance-producer-spec-example-2026-11-24.json"
-    );
+    const EXAMPLE_SPEC: &str = include_str!("../../tests/fixtures/ndc/producer-spec-example.json");
     const RELEASE_ID: &str = "conformance-release-2";
     const ARTIFACT_PATHS: [&str; 2] = [
         "artifacts/sequenced-abstract.jsonl",

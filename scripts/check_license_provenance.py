@@ -36,8 +36,6 @@ AUTHORED = (
     ".hxx",
 )
 EXCLUDED = (
-    "references/",
-    "engineering/references/",
     "target/",
     "build/",
     ".local/",
@@ -125,11 +123,6 @@ class ProvenanceTests(unittest.TestCase):
             path.write_text("print('x')\n", encoding="utf-8")
             errors = check_spdx("example.py", Path(directory))
             self.assertTrue(any("missing" in error for error in errors))
-
-    def test_vendored_paths_excluded(self) -> None:
-        """Reference documents are not treated as authored source."""
-        self.assertIn("references/", EXCLUDED)
-        self.assertIn("engineering/references/", EXCLUDED)
 
     def test_notice_requires_author(self) -> None:
         """Notice content is mandatory."""

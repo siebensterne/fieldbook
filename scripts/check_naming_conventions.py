@@ -10,7 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PHASE = re.compile(r"(?:^|[-_])(?:p|m|h|d|e|v)[0-9]+(?:$|[-_.])", re.IGNORECASE)
-ACTIVE_PREFIXES = ("src/", "tests/", "xtask/", "docs/", "scripts/", "tools/")
+ACTIVE_PREFIXES = ("src/", "tests/", "xtask/", "scripts/", "tools/")
 EVIDENCE_PREFIXES = ("measurements/", "captures/")
 
 

@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Check architecture traceability without generated inventories.
+"""Check source-level architecture invariants without documentation inventories.
 
 Run from any working directory. --check is read-only and is used by CI. The
 gate verifies source responsibility coverage, module reachability, runtime
-integration anchors, falsifiable source anchors, required traceability text,
-and the structural shape of the Mermaid diagrams. It is not a substitute for
-Mermaid's syntax parser.
+integration anchors and falsifiable source anchors.
 """
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DOC = ROOT / "docs/architecture.md"
 
 
 def mask_rust(source: str) -> str:
@@ -385,11 +382,6 @@ REFERENCE_APP_FORBIDDEN_TOKENS = (
     "OrderBook",
 )
 
-MERMAID_RE = re.compile(r"```mermaid\s*\n(.*?)\n```", re.DOTALL)
-NODE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\n]*\]|\([^\n]*\)|\{[^\n]*\})\s*$")
-EDGE_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+-->\s+([A-Za-z_][A-Za-z0-9_]*)\s*$")
-
-
 MODULE_DECL_RE = re.compile(
     r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;\s*(?://.*)?$",
     re.MULTILINE,
@@ -507,67 +499,6 @@ def collect_sources() -> list[str]:
     return sorted(p.relative_to(ROOT).as_posix() for p in sorted((ROOT / "src").rglob("*.rs")))
 
 
-def check_mermaid_structure(document: str) -> list[str]:
-    """Check graph structure conservatively; GitHub Actions runs the full Mermaid parser."""
-    errors: list[str] = []
-    blocks = MERMAID_RE.findall(document)
-    if len(blocks) < 3:
-        errors.append(f"expected at least 3 Mermaid diagrams, found {len(blocks)}")
-    # Mermaid edge variants used here: --> and -->|edge label|. Keep each edge on one line.
-    arrow_re = re.compile(r"-->(?:\|[^|]+\|)?")
-    side_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)(.*)$")
-    shaped_re = re.compile(r"^\s*(?:\[[^\n]*\]|\([^\n]*\)|\{[^\n]*\})")
-    for index, body in enumerate(blocks, start=1):
-        lines = body.splitlines()
-        if not lines or not re.match(r"^\s*flowchart\s+(?:LR|RL|TB|TD|BT)\s*$", lines[0]):
-            errors.append(f"diagram {index}: first line must be a supported flowchart direction")
-            continue
-        declared: set[str] = set()
-        edges: list[tuple[str, str, int]] = []
-        for line_number, line in enumerate(lines[1:], start=2):
-            stripped = line.strip()
-            if not stripped or stripped.startswith(("%%", "subgraph ")) or stripped == "end":
-                continue
-            if arrow_re.search(line):
-                parts = arrow_re.split(line, maxsplit=1)
-                if len(parts) != 2:
-                    errors.append(
-                        f"diagram {index}, line {line_number}: malformed edge: {stripped}"
-                    )
-                    continue
-                lhs, rhs = parts
-                left = side_re.match(lhs)
-                right = side_re.match(rhs)
-                if not left or not right:
-                    errors.append(
-                        f"diagram {index}, line {line_number}: cannot parse edge endpoints: {stripped}"
-                    )
-                    continue
-                source_id, source_tail = left.group(1), left.group(2)
-                target_id, target_tail = right.group(1), right.group(2)
-                if shaped_re.match(source_tail):
-                    declared.add(source_id)
-                if shaped_re.match(target_tail):
-                    declared.add(target_id)
-                # A bare endpoint must have been declared on another line.
-                edges.append((source_id, target_id, line_number))
-                continue
-            node = NODE_RE.match(line)
-            if node:
-                declared.add(node.group(1))
-                continue
-            errors.append(
-                f"diagram {index}, line {line_number}: unsupported/unparsed Mermaid statement: {stripped}"
-            )
-        for source, target, line_number in edges:
-            for node_id in (source, target):
-                if node_id not in declared:
-                    errors.append(
-                        f"diagram {index}, line {line_number}: edge references undeclared node {node_id}"
-                    )
-    return errors
-
-
 def main() -> int:
     """Exercise main."""
     parser = argparse.ArgumentParser()
@@ -599,11 +530,6 @@ def main() -> int:
         )
     if unreachable:
         errors.append("unreachable source files: " + ", ".join(unreachable))
-    if not DOC.exists():
-        errors.append(f"missing architecture document: {DOC.relative_to(ROOT)}")
-        document = ""
-    else:
-        document = DOC.read_text(encoding="utf-8")
     for anchor_path, anchors in REQUIRED_ANCHORS.items():
         file_path = ROOT / anchor_path
         if not file_path.exists():
@@ -615,19 +541,6 @@ def main() -> int:
             literal_match = anchor in LITERAL_ANCHORS and anchor in raw_source
             if anchor not in source and not literal_match:
                 errors.append(f"source anchor `{anchor}` not found in `{anchor_path}`")
-    for required_text in [
-        "docs/requirement-test-matrix.md",
-        "docs/canonical-event-model.md",
-        "docs/jsonl-postgres-reference.md",
-        "Current operational caveat",
-        "not a production certification",
-    ]:
-        if required_text not in document:
-            errors.append(
-                f"architecture document is missing required traceability text: {required_text!r}"
-            )
-    errors.extend(check_mermaid_structure(document))
-
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
@@ -635,11 +548,7 @@ def main() -> int:
     reachable = collect_module_reachability()
     print(
         f"Architecture check passed: {len(actual_sources)} Rust source files, "
-        f"{len(reachable)} files reachable from crate roots, and "
-        f"{len(MERMAID_RE.findall(document))} structurally checked Mermaid diagrams."
-    )
-    print(
-        "Note: actual Mermaid grammar is parsed in the separate GitHub Actions Mermaid-validation job."
+        f"{len(reachable)} files reachable from crate roots."
     )
     return 0
 

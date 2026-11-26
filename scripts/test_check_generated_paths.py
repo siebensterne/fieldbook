@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from check_generated_paths import forbidden, validate
+from check_generated_paths import forbidden, markdown_errors, validate
 
 
 class GeneratedPathTests(unittest.TestCase):
@@ -66,6 +66,33 @@ class GeneratedPathTests(unittest.TestCase):
             (root / "docs" / ".DS_Store").write_text("junk", encoding="utf-8")
             errors = validate(root)
             self.assertTrue(any("untracked path" in error for error in errors), errors)
+
+
+class MarkdownRuleTests(unittest.TestCase):
+    """Only a root TODO.md is permitted as a Markdown file."""
+
+    def test_allowed_root_document(self) -> None:
+        """The single root task list is accepted."""
+        self.assertEqual(markdown_errors(["TODO.md"]), [])
+
+    def test_rejected_markdown_paths(self) -> None:
+        """Every other Markdown path and case variant is rejected."""
+        for path in (
+            "README.md",
+            "src/example.md",
+            "docs/example.markdown",
+            "subdir/TODO.md",
+            "src/EXAMPLE.MD",
+            "example.mdown",
+            "example.mkd",
+            "example.mdx",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(markdown_errors([path]))
+
+    def test_generated_rustdoc_is_exempt(self) -> None:
+        """Generated rustdoc Markdown is not project prose."""
+        self.assertEqual(markdown_errors(["target/doc/static.files/LICENSE.md"]), [])
 
 
 if __name__ == "__main__":

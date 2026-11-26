@@ -3,7 +3,7 @@
 # The Makefile is a thin, deterministic facade over `cargo xtask`, which owns
 # the authoritative gate definitions. Style rules follow the Linux kernel
 # coding guidelines and the Google Python, Shell, Markdown, JSON and Rust
-# style guides; see docs/style-guide.md.
+# style rules are enforced by the scripts/ gates.
 #
 # Command surface (`make help` prints the same list):
 #   check        full gate: style plus CI parity
@@ -25,7 +25,7 @@
 
 .PHONY: all help check check-static ci assure style format-fix fmt lint test \
 	docs e2e verify python-check ruff-check q-check standards-check \
-	python-fmt shell-check json-check markdown-check makefile-check \
+	python-fmt shell-check json-check makefile-check \
 	rust-check tools
 
 .DEFAULT_GOAL := check
@@ -40,7 +40,7 @@ help:
 	@echo "ci           full CI parity task"
 	@echo "assure       full assurance superset"
 	@echo "fmt          non-mutating rustfmt check"
-	@echo "format-fix   apply mutating Python and Markdown style fixes"
+	@echo "format-fix   apply mutating Python style fixes"
 	@echo "lint         clippy with warnings denied"
 	@echo "test         permitted all-target and doc tests"
 	@echo "docs         rustdoc with broken links denied"
@@ -70,7 +70,7 @@ format-fix:
 	python3 scripts/check_style.py --fix
 
 style: python-check ruff-check q-check standards-check shell-check \
-	json-check markdown-check makefile-check
+	json-check makefile-check
 
 python-check:
 	python3 scripts/check_style.py --python
@@ -83,8 +83,6 @@ q-check:
 	python3 scripts/check_q_style.py --self-test
 
 standards-check:
-	python3 scripts/check_prose_unified.py --self-test
-	python3 scripts/check_prose_unified.py
 	python3 scripts/check_quality_contract.py --self-test
 	python3 scripts/check_quality_contract.py
 	python3 scripts/check_license_provenance.py --self-test
@@ -99,9 +97,6 @@ shell-check:
 
 json-check:
 	python3 scripts/check_style.py --json
-
-markdown-check:
-	python3 scripts/check_style.py --markdown
 
 makefile-check:
 	python3 scripts/check_style.py --makefile

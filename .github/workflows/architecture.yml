@@ -16,7 +16,6 @@ permissions:
 
 jobs:
   architecture:
-    name: Traceability and Mermaid validation
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -35,13 +34,10 @@ jobs:
         run: python3 scripts/check_architecture.py --check
 
       - name: Check requirement matrix
-        run: python3 scripts/check_matrix_tests.py
 
       - name: Check generated paths
         run: python3 scripts/check_generated_paths.py
 
-      - name: Parse Mermaid syntax
-        uses: sgerrand/mermaid-validation-action@31f8eed257dbbbadad3332c83694866903e92b0e # v0.2.0 release commit
         with:
           fail-on-warning: true
           comment-on-pr: false

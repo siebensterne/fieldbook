@@ -4,8 +4,8 @@
 //! timestamps are compared with the local receive clock, so the result
 //! includes any exchange/local clock offset. When more than one replica is
 //! configured, identical events are matched across connections and their
-//! arrival skew is reported separately. The methodology is documented in
-//! The methodology is recorded in `docs/performance-methodology.md`.
+//! arrival skew is reported separately. Same-value matches do not prove
+//! same-time delivery; an unspecified clock is never assumed synchronized.
 
 use std::{
     collections::{HashMap, VecDeque},
