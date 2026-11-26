@@ -35,7 +35,7 @@ class StyleReferenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "STYLES.md").write_text("# mandate\n", encoding="utf-8")
-            refs = root / "references"
+            refs = root / "style"
             refs.mkdir()
             rows = []
             for name in sorted(MANDATED):
@@ -53,7 +53,7 @@ class StyleReferenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "STYLES.md").write_text("# mandate\n", encoding="utf-8")
-            refs = root / "references"
+            refs = root / "style"
             refs.mkdir()
             names = sorted(MANDATED)
             rows = []

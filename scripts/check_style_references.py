@@ -2,8 +2,8 @@
 """Verify the local copies of every reference named by ``STYLES.md``.
 
 The mandate names published style guides and expects local copies under
-``references/``. This gate checks that each named document exists, is
-non-empty, and matches the SHA-256 recorded in ``references/index.md``. It
+``style/``. This gate checks that each named document exists, is
+non-empty, and matches the SHA-256 recorded in ``style/index.md``. It
 also checks that the index covers the mandated set exactly. Published guides
 are third-party documents; this gate verifies their retention, not their
 adoption. Binding rules remain the repository's own checkers and lint config.
@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-INDEX = ROOT / "references" / "index.md"
+INDEX = ROOT / "style" / "index.md"
 ROW = re.compile(r"^\| `([^`]+)` \| .* \| `([0-9a-f]{64})` \|$")
 
 # Mirrors the mandatory list in STYLES.md.
@@ -50,9 +50,9 @@ def check(root: Path = ROOT) -> list[str]:
     styles = root / "STYLES.md"
     if not styles.is_file():
         return ["STYLES.md is missing"]
-    index = root / "references" / "index.md"
+    index = root / "style" / "index.md"
     if not index.is_file():
-        return ["references/index.md is missing"]
+        return ["style/index.md is missing"]
     rows = parse_index(index.read_text(encoding="utf-8"))
     if set(rows) != MANDATED:
         missing = sorted(MANDATED - set(rows))
@@ -62,7 +62,7 @@ def check(root: Path = ROOT) -> list[str]:
         if extra:
             errors.append(f"index lists unexpected references: {extra}")
     for name, expected in sorted(rows.items()):
-        path = root / "references" / name
+        path = root / "style" / name
         if not path.is_file():
             errors.append(f"reference {name} is missing")
             continue
