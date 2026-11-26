@@ -40,9 +40,11 @@ jobs:
       - name: Git policy
         if: github.event_name == 'push'
         run: python3 scripts/check_git_policy.py
-      - name: q / kdb+ style
+      - name: q / kdb+ style on added lines
         env:
-          FIELDBOOK_STYLE_BASE: origin/main
+          # PRs diff against the PR base commit; other events use a resolvable
+          # commit. Branch names and the all-zero "before" SHA are never used.
+          Q_STYLE_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || (github.event.before != '0000000000000000000000000000000000000000' && github.event.before || github.sha) }}
         run: |
           python3 scripts/check_q_style.py --self-test
           python3 scripts/check_q_style.py

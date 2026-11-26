@@ -11,7 +11,7 @@ mod tasks;
 
 use std::{
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode},
 };
 
 use command::Cmd;
@@ -100,7 +100,7 @@ fn dispatch(root: &Path, args: &[String]) -> Result<Report, String> {
             Ok(report)
         }
         Task::Style => {
-            run(&mut report, root, &style_commands())?;
+            run(&mut report, root, &style_commands(root)?)?;
             Ok(report)
         }
         Task::StyleFix => {
@@ -138,7 +138,7 @@ fn dispatch(root: &Path, args: &[String]) -> Result<Report, String> {
             Ok(report)
         }
         Task::Check => {
-            run(&mut report, root, &style_commands())?;
+            run(&mut report, root, &style_commands(root)?)?;
             run(
                 &mut report,
                 root,
@@ -154,7 +154,7 @@ fn dispatch(root: &Path, args: &[String]) -> Result<Report, String> {
             Ok(report)
         }
         Task::Ci => {
-            run(&mut report, root, &style_commands())?;
+            run(&mut report, root, &style_commands(root)?)?;
             run(
                 &mut report,
                 root,
@@ -186,15 +186,39 @@ fn dispatch(root: &Path, args: &[String]) -> Result<Report, String> {
     }
 }
 
+/// Resolve the q added-line gate base to a commit SHA, never a branch name.
+///
+/// A missing or unresolvable `origin/main` is an error: the checker must
+/// never receive an empty base and silently report zero findings.
+fn q_style_base_sha(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--verify", "origin/main^{commit}"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| format!("running git rev-parse: {error}"))?;
+    if !output.status.success() {
+        return Err("cannot resolve origin/main to a commit for the q style gate".to_owned());
+    }
+    let sha = String::from_utf8(output.stdout)
+        .map_err(|error| format!("git rev-parse output is not UTF-8: {error}"))?
+        .trim()
+        .to_owned();
+    if sha.is_empty() {
+        return Err("git rev-parse returned an empty SHA for the q style gate".to_owned());
+    }
+    Ok(sha)
+}
+
 /// Every non-Rust language gate, in one place, so `style`, `check` and `ci`
 /// cannot drift apart. Tool versions are pinned in requirements-dev.txt.
-fn style_commands() -> Vec<Cmd> {
-    vec![
+fn style_commands(root: &Path) -> Result<Vec<Cmd>, String> {
+    let base = q_style_base_sha(root)?;
+    Ok(vec![
         Cmd::new("python3 scripts/check_style.py"),
         Cmd::new("python3 scripts/ruff_gate.py ."),
         Cmd::new("python3 -m pyink --check --config pyproject.toml scripts"),
         Cmd::new("python3 scripts/check_q_style.py --self-test"),
-        Cmd::new("python3 scripts/check_q_style.py"),
+        Cmd::new("python3 scripts/check_q_style.py").with_env("Q_STYLE_BASE_SHA", &base),
         Cmd::new("python3 scripts/check_quality_contract.py --self-test"),
         Cmd::new("python3 scripts/check_quality_contract.py"),
         Cmd::new("python3 scripts/check_license_provenance.py --self-test"),
@@ -202,7 +226,7 @@ fn style_commands() -> Vec<Cmd> {
         Cmd::new("python3 scripts/check_shellcheck.py"),
         Cmd::new("python3 scripts/check_no_cross_pollution.py"),
         Cmd::new("python3 scripts/check_rust_style.py --self-test"),
-    ]
+    ])
 }
 
 /// Normalise CLI aliases to canonical task names.
