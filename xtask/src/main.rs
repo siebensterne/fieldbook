@@ -191,6 +191,11 @@ fn dispatch(root: &Path, args: &[String]) -> Result<Report, String> {
 /// A missing or unresolvable `origin/main` is an error: the checker must
 /// never receive an empty base and silently report zero findings.
 fn q_style_base_sha(root: &Path) -> Result<String, String> {
+    if let Ok(value) = std::env::var("Q_STYLE_BASE_SHA") {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
     let output = Command::new("git")
         .args(["rev-parse", "--verify", "origin/main^{commit}"])
         .current_dir(root)
