@@ -19,21 +19,15 @@ fi
 output="${1:-${repo_root}/build/assurance/english-audit.json}"
 mkdir -p "$(dirname "${output}")"
 
-# Vendored reference documents are byte-exact third-party material, verified
-# by scripts/check_style_references.py. Their wording is not authored prose.
-audit_excludes=(--exclude 'references/*')
-
 set +e
 if [[ "${#history[@]}" -gt 0 ]]; then
   python3 "${repo_root}/scripts/assurance/english_audit.py" \
     --repo "${repo_root}" \
     "${history[@]}" \
-    "${audit_excludes[@]}" \
     --json-out "${output}"
 else
   python3 "${repo_root}/scripts/assurance/english_audit.py" \
     --repo "${repo_root}" \
-    "${audit_excludes[@]}" \
     --json-out "${output}"
 fi
 status=$?

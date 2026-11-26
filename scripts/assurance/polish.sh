@@ -77,11 +77,9 @@ run_step "python unit tests (scripts)" \
   python3 -m unittest discover -s scripts -p 'test_*.py'
 run_step "python unit tests (scripts/assurance)" \
   python3 -m unittest discover -s scripts/assurance -p 'test_*.py'
-run_step "requirement-matrix references" python3 scripts/check_matrix_tests.py
 run_step "architecture traceability" python3 scripts/check_architecture.py \
   --check
 run_step "generated-path policy" python3 scripts/check_generated_paths.py
-run_step "style reference integrity" python3 scripts/check_style_references.py
 run_step "git policy" python3 scripts/check_git_policy.py
 run_step "cross-pollution guard" python3 scripts/check_no_cross_pollution.py
 run_step "Rust added-line style" python3 scripts/check_rust_style.py
@@ -117,7 +115,7 @@ while (( iteration <= loops )); do
   fi
   run_step "english audit (advisory)" scripts/assurance/run_audit.sh
   run_step "english audit strict" python3 scripts/assurance/english_audit.py \
-    --repo . --exclude 'references/*' --strict
+    --repo . --strict
 
   fingerprint_now="$(tree_fingerprint)"
   if [[ "$fingerprint_now" == "$fingerprint_start" ]]; then

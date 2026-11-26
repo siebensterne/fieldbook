@@ -4,7 +4,6 @@ use crate::{command::Cmd, report::Report};
 
 pub fn checks(report: &mut Report, root: &Path) -> Result<(), String> {
     for script in [
-        "python3 scripts/check_matrix_tests.py",
         "python3 scripts/check_architecture.py --check",
         "python3 scripts/check_generated_paths.py",
         "python3 scripts/check_compile_policy.py",

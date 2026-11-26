@@ -2,8 +2,6 @@
 * text=auto eol=lf
 
 # Third-party style references are retained verbatim. Their bytes are verified
-# by scripts/check_style_references.py; do not rewrite whitespace in them.
-references/** -text -whitespace
 
 # Hash-pinned raw evidence and generated wire codecs are immutable bytes.
 captures/** -text

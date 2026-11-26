@@ -28,12 +28,7 @@ max_line_length = 100
 indent_size = 2
 max_line_length = 80
 
-[*.md]
-indent_style = space
-indent_size = 2
-max_line_length = 100
-
-# q / kdb+ follows engineering/q-kdb-style.md in the sibling workspace.
+# q / kdb+ layout is enforced by scripts/check_q_style.py.
 [*.q]
 indent_style = space
 indent_size = 2
@@ -52,6 +47,6 @@ indent_size = 4
 insert_final_newline = unset
 trim_trailing_whitespace = false
 
-[{references/**/*.html,captures/**,measurements/**}]
+[{captures/**,measurements/**}]
 trim_trailing_whitespace = false
 insert_final_newline = unset

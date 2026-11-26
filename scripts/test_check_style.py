@@ -35,32 +35,6 @@ class ShellTest(unittest.TestCase):
         self.assertEqual(style.shell_heredoc_lines(lines), {2, 3})
 
 
-class MarkdownTest(unittest.TestCase):
-    """Check Markdown reflow safety."""
-
-    def test_reflow_wraps_plain_prose_without_placeholders(self) -> None:
-        """Wrap prose and leave no NUL placeholder bytes in the output."""
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "doc.md"
-            path.write_text("# Title\n\n" + "word " * 40 + "\n", encoding="utf-8")
-            self.assertTrue(style.reflow_markdown(path))
-            text = path.read_text(encoding="utf-8")
-            self.assertNotIn("\x00", text)
-            self.assertTrue(
-                all(len(line) <= 100 for line in text.splitlines()),
-                "reflow must respect the canonical 100-column line length",
-            )
-
-    def test_reflow_preserves_links_and_code(self) -> None:
-        """Never rewrite lines carrying links or code spans."""
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "doc.md"
-            original = "# Title\n\nSee [long](https://example.invalid) `code`.\n"
-            path.write_text(original, encoding="utf-8")
-            style.reflow_markdown(path)
-            self.assertEqual(path.read_text(encoding="utf-8"), original)
-
-
 class JsonTest(unittest.TestCase):
     """Check JSON structural validation."""
 

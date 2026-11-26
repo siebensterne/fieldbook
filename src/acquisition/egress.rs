@@ -26,8 +26,9 @@
 //!   credentials are only ever sent through the venue's TLS connection. A
 //!   proxy observes destination metadata; it is not a trust anchor.
 //!
-//! See [ADR 0002](../docs/adr/0002-egress-policy.md) for the policy and the
-//! evidence provenance contract.
+//! Egress is fail-closed: an unqualified destination is refused before any
+//! socket is opened, and the proxy's observation is metadata, not authority.
+//! A successful connection never grants source rights.
 
 use std::fmt;
 

@@ -40,8 +40,6 @@ jobs:
       - name: Git policy
         if: github.event_name == 'push'
         run: python3 scripts/check_git_policy.py
-      - name: Style reference integrity
-        run: python3 scripts/check_style_references.py
       - name: q / kdb+ style
         env:
           FIELDBOOK_STYLE_BASE: origin/main
@@ -76,7 +74,7 @@ jobs:
       - name: Install pinned style tools
         run: python3 -m pip install -r requirements-dev.txt
 
-      - name: Python, shell, Makefile, JSON and Markdown style
+      - name: Python, shell, Makefile and JSON style
         run: cargo xtask style
 
       - name: Check formatting

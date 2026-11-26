@@ -37,14 +37,6 @@ class ArchitectureGateTests(unittest.TestCase):
         """Check that every Rust source has a reviewed responsibility."""
         self.assertEqual(set(gate.collect_sources()), set(gate.SOURCE_RESPONSIBILITIES))
 
-    def test_architecture_has_at_least_three_structurally_valid_diagrams(
-        self,
-    ) -> None:
-        """Check that the architecture has three valid diagrams."""
-        document = gate.DOC.read_text(encoding="utf-8")
-        self.assertEqual([], gate.check_mermaid_structure(document))
-        self.assertGreaterEqual(len(gate.MERMAID_RE.findall(document)), 3)
-
     def test_phase2_runtime_paths_are_integrated(self) -> None:
         """Exercise test phase2 runtime paths are integrated."""
         self.assertEqual([], gate.module_integration_errors())
@@ -71,21 +63,6 @@ class ArchitectureGateTests(unittest.TestCase):
                 (root / "src" / path).write_text("", encoding="utf-8")
             errors = gate.module_integration_errors(root)
             self.assertTrue(any("capacity startup" in error for error in errors), errors)
-
-    def test_structural_checker_rejects_undeclared_nodes(self) -> None:
-        """Exercise test structural checker rejects undeclared nodes."""
-        invalid = '```mermaid\nflowchart LR\nA["Declared"] --> B\n```'
-        errors = gate.check_mermaid_structure(invalid)
-        self.assertTrue(any("undeclared node B" in error for error in errors), errors)
-
-    def test_structural_checker_rejects_unparsed_statements(self) -> None:
-        """Exercise test structural checker rejects unparsed statements."""
-        invalid = "```mermaid\nflowchart LR\n" 'A["Declared"]\nnot a Mermaid statement\n```'
-        errors = gate.check_mermaid_structure(invalid)
-        self.assertTrue(
-            any("unsupported/unparsed Mermaid statement" in error for error in errors),
-            errors,
-        )
 
 
 if __name__ == "__main__":

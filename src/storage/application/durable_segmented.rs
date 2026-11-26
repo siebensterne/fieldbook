@@ -4,7 +4,8 @@
 //! [`crate::application::DurableStore`] abstraction. Segments hold multiple
 //! framed commits, are bounded by record count and encoded bytes, rotate into
 //! a verified archive, and are finalized with separate record, footer, rename
-//! and directory sync boundaries. See `docs/segmented-durability-design.md`.
+//! and directory sync boundaries. A commit is durable only after those
+//! barriers complete in order; no rename is treated as a commit before them.
 
 use std::{
     fs::{File, OpenOptions},

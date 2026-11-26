@@ -4,16 +4,23 @@
 The repository's `git-policy.json` declares components and suffixes that must
 never be tracked. This gate inspects both tracked files and untracked,
 non-ignored files so a generated artifact cannot enter a commit unnoticed.
-Ignored build output is deliberately excluded: the build directory is not part
-of the reviewed source surface.
+It also enforces the one-document rule: the only Markdown file permitted in
+the reviewed source surface is a root `TODO.md`. Ignored Markdown is checked as
+well, so a file hidden by `.gitignore` cannot bypass the rule. Generated
+rustdoc under `target/doc/` is an explicit exception and is not project prose.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
+
+MARKDOWN_RE = re.compile(r"\.(?:md|markdown|mdown|mkd|mdx)$", re.IGNORECASE)
+GENERATED_DOC_PREFIX = "target/doc/"
+ALLOWED_MARKDOWN = "TODO.md"
 
 
 def load_policy(root: Path) -> dict:
@@ -53,17 +60,32 @@ def forbidden(path: str, policy: dict) -> str | None:
     return None
 
 
+def markdown_errors(paths: list[str]) -> list[str]:
+    """Return every Markdown path outside the single allowed root document."""
+    return sorted(
+        f"markdown file is not allowed: `{path}`"
+        for path in paths
+        if MARKDOWN_RE.search(path)
+        and path != ALLOWED_MARKDOWN
+        and not path.startswith(GENERATED_DOC_PREFIX)
+    )
+
+
 def validate(root: Path) -> list[str]:
     """Exercise validate."""
     policy = load_policy(root)
     tracked = git_paths(root, ["ls-files", "-z"])
     untracked = git_paths(root, ["ls-files", "--others", "--exclude-standard", "-z"])
+    all_untracked = git_paths(root, ["ls-files", "--others", "-z"])
     errors: list[str] = []
     for source, paths in (("tracked", tracked), ("untracked", untracked)):
         for path in paths:
             reason = forbidden(path, policy)
             if reason is not None:
                 errors.append(f"{source} path `{path}` uses a {reason}")
+    # Markdown is checked on every non-tracked path too, including ignored ones,
+    # so a hidden document cannot bypass the one-file rule.
+    errors.extend(markdown_errors(tracked + all_untracked))
     return sorted(errors)
 
 

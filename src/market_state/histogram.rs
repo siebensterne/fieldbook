@@ -17,7 +17,8 @@
 //! Nanoseconds are the storage unit, not a precision claim. The clock's step
 //! (measured per host in the stress manifest as `clock_resolution_ns`) can be
 //! far coarser than a nanosecond, and scheduling or instrumentation overhead
-//! can be far larger than the step. See `docs/PERFORMANCE_METHODOLOGY.md`.
+//! can be far larger than the step. Timing claims must state the measured
+//! clock resolution and the overhead model instead of assuming nanoseconds.
 
 use std::{
     sync::{
