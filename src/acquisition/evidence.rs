@@ -95,6 +95,24 @@ impl fmt::Display for FailurePoint {
 }
 
 /// Acknowledgement boundary reached by one record.
+///
+/// The variants are ordered from weakest to strongest. Each name promises the
+/// exact boundary reached by the journal writer, not a general durability
+/// claim:
+/// - [`Self::Received`]: the payload was accepted at the ingest boundary, but
+///   no journal record was admitted.
+/// - [`Self::Journalled`]: the record was admitted to the authoritative
+///   journal's bounded queue and the writer owns it. This is not durable
+///   storage; a process failure before a later boundary can lose the record.
+/// - [`Self::Written`]: the record was passed to the writer layer and appended
+///   to the open segment's userspace buffer.
+/// - [`Self::Flushed`]: the userspace buffer was flushed to the operating
+///   system. The bytes are not yet synced to stable storage.
+/// - [`Self::Synced`]: a requested file sync completed for the record.
+/// - [`Self::Replicated`]: remote copies acknowledged the record. No local
+///   replication exists, so no profile may claim this boundary.
+/// - [`Self::Finalized`]: the segment was finalized with its footer and
+///   manifest metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DurabilityAck {
@@ -118,6 +136,38 @@ impl DurabilityAck {
             Self::Synced => "synced",
             Self::Replicated => "replicated",
             Self::Finalized => "finalized",
+        }
+    }
+
+    /// Journal writer boundary that establishes this public acknowledgement.
+    ///
+    /// `Journalled` is queue admission with writer ownership, not a write: the
+    /// writer has taken the record but has not touched stable storage yet.
+    /// Boundaries with no journal equivalent (receive, replication and segment
+    /// finalization) are not producer-waitable and return `None`.
+    #[must_use]
+    pub(crate) const fn journal_level(self) -> Option<JournalAckLevel> {
+        match self {
+            Self::Journalled => Some(JournalAckLevel::Queued),
+            Self::Written => Some(JournalAckLevel::Written),
+            Self::Flushed => Some(JournalAckLevel::Flushed),
+            Self::Synced => Some(JournalAckLevel::Synced),
+            Self::Received | Self::Replicated | Self::Finalized => None,
+        }
+    }
+
+    /// Public acknowledgement achieved by a journal writer boundary.
+    ///
+    /// This is the exact inverse of [`Self::journal_level`] for every level a
+    /// producer can wait on, so a profile's declaration and the acknowledgement
+    /// actually returned after ingest cannot drift apart.
+    #[must_use]
+    pub(crate) const fn from_journal_level(level: JournalAckLevel) -> Self {
+        match level {
+            JournalAckLevel::Queued => Self::Journalled,
+            JournalAckLevel::Written => Self::Written,
+            JournalAckLevel::Flushed => Self::Flushed,
+            JournalAckLevel::Synced => Self::Synced,
         }
     }
 }
@@ -877,6 +927,10 @@ pub struct EvidencePipeline {
     injected_failure: Option<FailurePoint>,
     stages: Option<ProcessingStages>,
     receive_sequences: Mutex<ReceiveSequences>,
+    /// Test-only override for the writer acknowledgement deadline. Production
+    /// always uses the fixed deadline set in `new`.
+    #[cfg(test)]
+    ack_timeout: Duration,
 }
 
 impl EvidencePipeline {
@@ -898,7 +952,18 @@ impl EvidencePipeline {
             injected_failure: None,
             stages: None,
             receive_sequences: Mutex::new(ReceiveSequences::new()),
+            #[cfg(test)]
+            ack_timeout: Duration::from_secs(5),
         })
+    }
+
+    /// Shorten the writer acknowledgement deadline for deterministic timeout
+    /// tests. The acknowledgement contract is unchanged; only the wait is.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_ack_timeout(mut self, timeout: Duration) -> Self {
+        self.ack_timeout = timeout;
+        self
     }
 
     /// Install real decode, normalization and canonical persistence stages.
@@ -1000,15 +1065,23 @@ impl EvidencePipeline {
             signal: SessionSignal::MarketData,
             mechanism: HeartbeatMechanism::Disabled,
         };
-        let ack_level = match self.profile {
-            DurabilityProfile::D1 => JournalAckLevel::Written,
-            DurabilityProfile::D2 => JournalAckLevel::Flushed,
-            DurabilityProfile::D3 => JournalAckLevel::Synced,
-            DurabilityProfile::D4 | DurabilityProfile::D5 => JournalAckLevel::Synced,
+        // Derive the journal boundary from the profile's public declaration.
+        // There is no second profile-to-level table that could drift from it:
+        // a locally achievable profile always declares a waitable boundary,
+        // and D4/D5 are refused by `EvidencePipeline::new` before ingest.
+        let required = self.profile.required_ack();
+        let Some(ack_level) = required.journal_level() else {
+            return Self::rejected(
+                evidence_id,
+                FailurePoint::JournalSubmit,
+                "profile declares no local journal acknowledgement boundary",
+            );
         };
-        let ack_result = self
-            .journal
-            .record_ack(record, ack_level, Duration::from_secs(5));
+        #[cfg(test)]
+        let ack_deadline = self.ack_timeout;
+        #[cfg(not(test))]
+        let ack_deadline = Duration::from_secs(5);
+        let ack_result = self.journal.record_ack(record, ack_level, ack_deadline);
         // Commit even when acknowledgement failed. The record may already be
         // queued; reusing its sequence would duplicate a journal fence. A
         // record that never reached the journal leaves a gap, and verification
@@ -1040,7 +1113,7 @@ impl EvidencePipeline {
                     at: FailurePoint::JournalPersist,
                     reason: "journal persistence interrupted".to_owned(),
                 },
-                ack: DurabilityAck::Journalled,
+                ack: required,
             };
         }
         if self.injected_failure == Some(FailurePoint::EvidencePersist) {
@@ -1050,7 +1123,7 @@ impl EvidencePipeline {
                     at: FailurePoint::EvidencePersist,
                     reason: "evidence extension write interrupted".to_owned(),
                 },
-                ack: DurabilityAck::Journalled,
+                ack: required,
             };
         }
         if let Err(error) = self.store.append(&extension) {
@@ -1072,7 +1145,7 @@ impl EvidencePipeline {
                         at: point,
                         reason: format!("{point:?} interrupted"),
                     },
-                    ack: DurabilityAck::Journalled,
+                    ack: required,
                 };
             }
         }
@@ -1090,15 +1163,15 @@ impl EvidencePipeline {
                     at: error.point,
                     reason: error.reason,
                 },
-                ack: DurabilityAck::Journalled,
+                ack: required,
             };
         }
-        let achieved = match ack.level {
-            JournalAckLevel::Queued => DurabilityAck::Journalled,
-            JournalAckLevel::Written => DurabilityAck::Written,
-            JournalAckLevel::Flushed => DurabilityAck::Flushed,
-            JournalAckLevel::Synced => DurabilityAck::Synced,
-        };
+        // `record_ack` returns only after the record reached the fence at the
+        // journal level derived from the declared contract, and the identity
+        // check above ties that fence to this record. `from_journal_level` is
+        // the exact counterpart of `journal_level`, so the reported boundary
+        // is anchored both to the writer's level and to the declaration.
+        let achieved = DurabilityAck::from_journal_level(ack.level);
         EvidenceReceipt {
             evidence_id,
             disposition: EvidenceDisposition::EvidencePersisted,
@@ -1330,6 +1403,38 @@ mod tests {
         assert!(DurabilityProfile::D3.locally_achievable(), "D3 is local");
     }
 
+    #[test]
+    fn declared_ack_round_trips_through_the_journal_boundary() {
+        for (profile, expected_level) in [
+            (DurabilityProfile::D1, Some(JournalAckLevel::Queued)),
+            (DurabilityProfile::D2, Some(JournalAckLevel::Flushed)),
+            (DurabilityProfile::D3, Some(JournalAckLevel::Synced)),
+        ] {
+            let declared = profile.required_ack();
+            assert_eq!(
+                declared.journal_level(),
+                expected_level,
+                "declared boundary for {profile:?} maps to its journal level"
+            );
+            let achieved = DurabilityAck::from_journal_level(
+                declared
+                    .journal_level()
+                    .expect("locally achievable profile has a journal level"),
+            );
+            assert_eq!(
+                achieved, declared,
+                "declaration and acknowledgement are one mapping for {profile:?}"
+            );
+        }
+        for profile in [DurabilityProfile::D4, DurabilityProfile::D5] {
+            assert_eq!(
+                profile.required_ack().journal_level(),
+                None,
+                "replication has no local journal boundary for {profile:?}"
+            );
+        }
+    }
+
     fn context(sequence: u64) -> EvidenceContext {
         EvidenceContext {
             sequence_domain_id: "fixture-feed".to_owned(),
@@ -1346,6 +1451,227 @@ mod tests {
         let pipeline = EvidencePipeline::new(journal, store.clone(), DurabilityProfile::D1)
             .expect("pipeline created");
         (pipeline, store)
+    }
+
+    #[test]
+    fn ingest_ack_matches_declared_contract_for_every_profile() {
+        for (profile, declared, journal_level) in [
+            (
+                DurabilityProfile::D1,
+                DurabilityAck::Journalled,
+                JournalAckLevel::Queued,
+            ),
+            (
+                DurabilityProfile::D2,
+                DurabilityAck::Flushed,
+                JournalAckLevel::Flushed,
+            ),
+            (
+                DurabilityProfile::D3,
+                DurabilityAck::Synced,
+                JournalAckLevel::Synced,
+            ),
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let journal = JournalHandle::start(config(directory.path()), meta("ack-contract"))
+                .expect("journal started");
+            let store =
+                EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+            let pipeline =
+                EvidencePipeline::new(journal, store.clone(), profile).expect("pipeline created");
+            let receipt = pipeline.ingest(
+                &evidence(1, b"ack-contract-payload"),
+                SourceId::new(1, 0),
+                &context(1),
+            );
+            assert_eq!(
+                receipt.disposition,
+                EvidenceDisposition::EvidencePersisted,
+                "ingest must persist evidence for {profile:?}"
+            );
+            assert_eq!(
+                profile.required_ack(),
+                declared,
+                "declared contract for {profile:?}"
+            );
+            assert_eq!(
+                receipt.ack, declared,
+                "actual acknowledgement after ingest must equal the declared boundary for {profile:?}"
+            );
+            assert_eq!(
+                receipt.ack,
+                profile.required_ack(),
+                "achieved acknowledgement must equal the declared contract for {profile:?}"
+            );
+            let extensions = store.load().expect("extensions reload");
+            assert_eq!(extensions.len(), 1, "one extension for {profile:?}");
+            let ack = extensions[0]
+                .journal_ack
+                .as_ref()
+                .expect("journal ack recorded on the extension");
+            assert_eq!(
+                ack.level, journal_level,
+                "journal writer boundary for {profile:?}"
+            );
+            pipeline
+                .shutdown(Duration::from_secs(10))
+                .expect("journal closed");
+        }
+    }
+
+    #[test]
+    fn ingest_failure_paths_keep_declared_ack_for_every_profile() {
+        for profile in [
+            DurabilityProfile::D1,
+            DurabilityProfile::D2,
+            DurabilityProfile::D3,
+        ] {
+            for point in [
+                FailurePoint::JournalPersist,
+                FailurePoint::EvidencePersist,
+                FailurePoint::Decode,
+                FailurePoint::Normalize,
+                FailurePoint::CanonicalPersist,
+            ] {
+                let directory = tempfile::tempdir().expect("tempdir");
+                let journal = JournalHandle::start(config(directory.path()), meta("ack-failure"))
+                    .expect("journal started");
+                let store =
+                    EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+                let pipeline = EvidencePipeline::new(journal, store, profile)
+                    .expect("pipeline created")
+                    .with_injected_failure(point);
+                let receipt = pipeline.ingest(
+                    &evidence(1, b"quarantine-payload"),
+                    SourceId::new(1, 0),
+                    &context(1),
+                );
+                assert!(
+                    matches!(
+                        receipt.disposition,
+                        EvidenceDisposition::Quarantined { at, .. } if at == point
+                    ),
+                    "an injected {point:?} must quarantine for {profile:?}"
+                );
+                assert_eq!(
+                    receipt.ack,
+                    profile.required_ack(),
+                    "quarantine after journal acknowledgement must still report the achieved boundary for {profile:?}/{point:?}"
+                );
+                pipeline
+                    .shutdown(Duration::from_secs(10))
+                    .expect("journal closed");
+            }
+        }
+    }
+
+    #[test]
+    fn ingest_rejection_paths_claim_no_durability_for_every_profile() {
+        for profile in [
+            DurabilityProfile::D1,
+            DurabilityProfile::D2,
+            DurabilityProfile::D3,
+        ] {
+            for point in [FailurePoint::Receive, FailurePoint::JournalSubmit] {
+                let directory = tempfile::tempdir().expect("tempdir");
+                let journal = JournalHandle::start(config(directory.path()), meta("ack-rejected"))
+                    .expect("journal started");
+                let store =
+                    EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+                let pipeline = EvidencePipeline::new(journal, store, profile)
+                    .expect("pipeline created")
+                    .with_injected_failure(point);
+                let receipt = pipeline.ingest(
+                    &evidence(1, b"rejected-payload"),
+                    SourceId::new(1, 0),
+                    &context(1),
+                );
+                assert!(
+                    matches!(
+                        receipt.disposition,
+                        EvidenceDisposition::Rejected { at, .. } if at == point
+                    ),
+                    "an injected {point:?} must reject for {profile:?}"
+                );
+                assert_eq!(
+                    receipt.ack,
+                    DurabilityAck::Received,
+                    "a rejected record claims no durability for {profile:?}/{point:?}"
+                );
+                assert_eq!(
+                    pipeline.status().counters.queued,
+                    0,
+                    "a rejected record was never admitted for {profile:?}/{point:?}"
+                );
+                pipeline
+                    .shutdown(Duration::from_secs(10))
+                    .expect("journal closed");
+            }
+        }
+    }
+
+    #[test]
+    fn ingest_ack_timeout_never_over_reports_durability() {
+        for (profile, immediate) in [
+            (DurabilityProfile::D1, Some(DurabilityAck::Journalled)),
+            (DurabilityProfile::D2, None),
+            (DurabilityProfile::D3, None),
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let mut journal_config = config(directory.path());
+            journal_config.flush_interval = Duration::from_secs(60);
+            journal_config.sync_interval = Duration::from_secs(60);
+            let journal =
+                JournalHandle::start(journal_config, meta("ack-timeout")).expect("journal started");
+            let store =
+                EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+            let pipeline = EvidencePipeline::new(journal, store, profile)
+                .expect("pipeline created")
+                .with_ack_timeout(Duration::from_millis(100));
+            let receipt = pipeline.ingest(
+                &evidence(1, b"timeout-payload"),
+                SourceId::new(1, 0),
+                &context(1),
+            );
+            match immediate {
+                Some(ack) => {
+                    assert_eq!(
+                        receipt.disposition,
+                        EvidenceDisposition::EvidencePersisted,
+                        "queue admission needs no flush for {profile:?}"
+                    );
+                    assert_eq!(
+                        receipt.ack, ack,
+                        "the declared boundary is reached immediately for {profile:?}"
+                    );
+                }
+                None => {
+                    assert!(
+                        matches!(
+                            receipt.disposition,
+                            EvidenceDisposition::Rejected {
+                                at: FailurePoint::JournalPersist,
+                                ..
+                            }
+                        ),
+                        "an unreached declared boundary must be rejected for {profile:?}"
+                    );
+                    assert_eq!(
+                        receipt.ack,
+                        DurabilityAck::Received,
+                        "a timed-out acknowledgement claims no durability for {profile:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                pipeline.status().counters.queued,
+                1,
+                "the record was admitted before the acknowledgement wait for {profile:?}"
+            );
+            pipeline
+                .shutdown(Duration::from_secs(10))
+                .expect("journal closed");
+        }
     }
 
     #[test]

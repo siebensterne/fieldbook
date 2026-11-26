@@ -2208,3 +2208,73 @@ fn ack_reports_timeout_instead_of_success() {
         "no flush happened, so no flush acknowledgement is valid: {status:?}"
     );
 }
+
+#[test]
+fn ack_levels_follow_the_declared_profile_contract() {
+    use crate::acquisition::evidence::DurabilityAck;
+
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(temp.path());
+    config.flush_interval = Duration::from_secs(30);
+    config.sync_interval = Duration::from_secs(30);
+    let handle = JournalHandle::start(config, meta("ack-contract-levels")).expect("journal start");
+
+    // D1 declares queue admission: the writer owns the record at submit, so
+    // its acknowledgement is immediate and needs no flush or sync.
+    let d1_level = DurabilityAck::Journalled
+        .journal_level()
+        .expect("D1 declares a journal boundary");
+    let d1_ack = handle
+        .record_ack(
+            data_record(
+                SourceId::new(0, 0),
+                1,
+                1,
+                now_us().unwrap_or(0),
+                RawFrame::binary(b"queued".to_vec()),
+                DecodeOutcome::decoded(1),
+            ),
+            d1_level,
+            Duration::from_millis(500),
+        )
+        .expect("queue admission is acknowledged without durability");
+    assert_eq!(
+        d1_ack.level,
+        JournalAckLevel::Queued,
+        "D1 declares the queue boundary, never a write"
+    );
+
+    // D2 and D3 declare flush and sync; neither boundary is reached while the
+    // writer is idle, so acknowledgement must time out rather than over-report.
+    for (declared, receive_seq) in [
+        (DurabilityAck::Flushed, 2u64),
+        (DurabilityAck::Synced, 3u64),
+    ] {
+        let level = declared
+            .journal_level()
+            .expect("declared boundary has a journal level");
+        let error = handle
+            .record_ack(
+                data_record(
+                    SourceId::new(0, 0),
+                    1,
+                    receive_seq,
+                    now_us().unwrap_or(0),
+                    RawFrame::binary(b"waiting".to_vec()),
+                    DecodeOutcome::decoded(1),
+                ),
+                level,
+                Duration::from_millis(100),
+            )
+            .expect_err("an unreached declared boundary must not be acknowledged");
+        assert!(
+            format!("{error:#}").contains("acknowledgement timed out"),
+            "unexpected error for {declared:?}: {error:#}"
+        );
+    }
+    let status = handle.status();
+    assert!(
+        status.counters.flushed < status.counters.queued,
+        "no declared flush boundary was reached: {status:?}"
+    );
+}

@@ -328,11 +328,14 @@ pub struct DurabilityPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JournalAckLevel {
-    /// Record accepted into the writer queue.
+    /// Record admitted to the bounded writer queue; the writer owns it. No
+    /// bytes have been appended and no storage durability is claimed.
     Queued,
-    /// Record appended to the segment file.
+    /// Record passed to the writer layer and appended to the open segment's
+    /// userspace buffer. A process failure before a later boundary can lose it.
     Written,
-    /// Record included in a completed flush.
+    /// Record included in a completed `flush` of the userspace buffer to the
+    /// operating system. The bytes are not yet synced to stable storage.
     Flushed,
     /// Record included in a completed `sync_all`.
     Synced,
