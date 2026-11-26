@@ -2300,11 +2300,13 @@ mod tests {
             .env(CHILD_PATH_ENV, root)
             .output()
             .expect("spawn probing writer");
-        assert!(
-            output.status.success(),
-            "probing writer failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        if !output.status.success() {
+            eprintln!(
+                "probing writer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(output.status.success(), "probing writer failed");
         String::from_utf8(output.stdout).expect("probe output is UTF-8")
     }
 
@@ -2312,11 +2314,10 @@ mod tests {
         loop {
             let mut line = String::new();
             let count = output.read_line(&mut line).expect("read child signal");
-            assert!(
-                count > 0,
-                "writer exited before signalling: {:?}",
-                child.try_wait().expect("poll writer")
-            );
+            if count == 0 {
+                eprintln!("writer exited before signalling: {:?}", child.try_wait());
+            }
+            assert!(count > 0, "writer exited before signalling");
             if let Some(message) = line.strip_prefix(CHILD_SIGNAL_PREFIX) {
                 return message.trim().to_owned();
             }
@@ -2390,11 +2391,13 @@ mod tests {
             .env(CHILD_PATH_ENV, directory.path())
             .output()
             .expect("spawn replacement owner");
-        assert!(
-            replacement.status.success(),
-            "replacement owner failed: {}",
-            String::from_utf8_lossy(&replacement.stderr)
-        );
+        if !replacement.status.success() {
+            eprintln!(
+                "replacement owner failed: {}",
+                String::from_utf8_lossy(&replacement.stderr)
+            );
+        }
+        assert!(replacement.status.success(), "replacement owner failed");
         let replacement_output = String::from_utf8(replacement.stdout).expect("replacement output");
         assert!(
             replacement_output.contains(&format!("{CHILD_SIGNAL_PREFIX}recovered")),
