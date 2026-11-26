@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ARCHIVE_SCHEMA_VERSION","SEGMENT_SCHEMA_VERSION","SNAPSHOT_SCHEMA_VERSION"],"enum":["SegmentError","SegmentFault","SyncPolicy"],"fn":["migrate_legacy"],"struct":["ArchiveEntry","ArchiveManifest","RecoverySnapshot","SegmentFooter","SegmentFrame","SegmentFrontier","SegmentHeader","SegmentedStore","StoreLimits"]};

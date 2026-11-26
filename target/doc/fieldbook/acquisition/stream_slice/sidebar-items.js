@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ProcessingDisposition"],"fn":["run_stream_slice","verify_replay"],"struct":["CollectingSink","SliceConfig","SliceDispositionRecord","SliceOutcome","SliceVerification"]};

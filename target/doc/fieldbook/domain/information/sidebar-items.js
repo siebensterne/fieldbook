@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["INFORMATION_SCHEMA_VERSION"],"enum":["InformationPayload","SeasonalAdjustment","SourceObservationStatus"],"struct":["Bitemporal","BondEvaluatedPriceDetail","CommodityAssessmentDetail","DerivativeQuoteDetail","EconomicObservationDetail","FilingDetail","Greeks"],"type":["InformationEnvelope"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EdgeRelation","IdentifierStandard","MicRole","ReferenceError","ReferenceResolution","VenueCategory"],"struct":["EntityId","GraphEdge","InstrumentSpecification","MarketId","ReferenceGraph","StandardIdentifier","Venue"]};

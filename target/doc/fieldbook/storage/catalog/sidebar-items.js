@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CATALOG_SCHEMA_VERSION"],"fn":["checksum_for"],"struct":["Catalog"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["BUCKET_COUNT","BUCKET_UPPER_BOUNDS_NS","MAX_BUCKET_EXPONENT","OVERFLOW_BUCKET_INDEX","P9999_MIN_SAMPLES"],"enum":["StageHistogram"],"fn":["bucket_index"],"struct":["BucketCount","Histogram","HistogramReport","StageTimingReport","StageTimings","WriterTimings"]};

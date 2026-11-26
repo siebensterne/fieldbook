@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["adapter","config","coverage_certification","egress_intent","modality","operation_plan","rights"]};

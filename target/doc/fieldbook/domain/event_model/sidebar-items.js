@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ClockSynchronization","DomainPayload","EventModelError","OrderAction","TimestampRole"],"struct":["ObservedTimestamp","Provenance","UniversalEnvelope"],"type":["MarketEnvelope"]};

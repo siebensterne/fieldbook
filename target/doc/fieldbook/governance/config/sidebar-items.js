@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CatalogMode","JournalSyncMode"],"fn":["preflight_output","rotation_manifest_path"],"struct":["CollectorSettings","FileConfig","GovernanceSettings","JournalSettings","MetricsSettings","NetworkSettings","OutputSettings","Settings"]};

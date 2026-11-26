@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["canonical","capability_registry","event_model","fixed","framed_identity","identity","information","instrument_terms","market_registry","model","products","reference_core","reference_data","side","taxonomy"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["COMMIT_SCHEMA_VERSION"],"enum":["StoreError","StoreFault"],"fn":["load_state","run_streaming_pipeline","run_streaming_pipeline_bounded"],"struct":["CommitEnvelope","CommitRecord","CommitStore","DurableState","StreamingLimits","StreamingResult"]};
