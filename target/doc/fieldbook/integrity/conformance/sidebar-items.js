@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["ConformanceError","ConformanceStageState","UnknownEventPolicy"],"fn":["run_conformance"],"struct":["ConformanceCheck","ConformanceDeclaration","ConformanceFixture","ConformanceReport","ConformanceStatuses","ExpectedObservation","ExternalEvidence","IntegrationFixture"]};

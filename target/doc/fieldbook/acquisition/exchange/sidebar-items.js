@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["capabilities_for","source_capabilities_for"],"struct":["DiscoveryResult","DiscoveryStats","ExchangeCapabilities"],"trait":["Exchange"]};

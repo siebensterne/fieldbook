@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["run_server_on"],"struct":["CatalogHealth","CollectorStats","CoverageStats","DiscoveryTotals","LifecycleHealth","MetricsRegistry","MetricsSnapshot","ReadinessCheck","ReadinessPolicy","ReadinessReport","RuntimeStatus","WriterCounters","WriterStats"]};

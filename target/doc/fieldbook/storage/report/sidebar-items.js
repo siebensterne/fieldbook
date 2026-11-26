@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["REPORT_SCHEMA_VERSION"],"fn":["serialize_json_pretty","sidecar_path","write_bytes_atomic","write_json_atomic"],"struct":["CatalogReport","MarketMetadata","ReportConfig","RunReport"]};

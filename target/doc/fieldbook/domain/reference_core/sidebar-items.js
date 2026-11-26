@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["AssertionResolution","CoverageQueryResolution","CoverageState","IdentifierScheme","LedgerResolution","ObjectClass","ReferenceCoreError","VerificationStatus"],"fn":["resolve_assertions"],"struct":["BitemporalAssertion","BitemporalLedger","CoverageCell","CoverageRegistry","CoverageScope","IdentifierAssertion","ObjectId","ObjectRef"]};

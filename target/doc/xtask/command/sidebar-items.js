@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["status_of"],"struct":["Cmd","Outcome"]};

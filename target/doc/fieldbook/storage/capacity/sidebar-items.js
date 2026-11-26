@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["ESTIMATED_BYTES_PER_BOOK","ESTIMATED_BYTES_PER_SNAPSHOT","SUBSCRIPTION_FRAME_OVERHEAD"],"fn":["count_selected_markets","derive_shard_count","plan","plan_fixed_topology"],"struct":["CapacityPlan"]};

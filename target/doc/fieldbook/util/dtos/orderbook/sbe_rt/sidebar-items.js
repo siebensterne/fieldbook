@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"enum":["DecodeError","EncodeError","MetaAttribute","VerifyError"],"struct":["HeaderAbsent","HeaderPresent"],"trait":["GroupContext","HeaderState","IntoGroupResult","SbeMessage"],"type":["GroupResult"]};

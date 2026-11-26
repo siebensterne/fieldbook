@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"constant":["FILE_SCHEMA_VERSION","MAX_LINE_BYTES"],"enum":["DuplicatePolicy","FileSourceError","ResumeError"],"struct":["CheckpointBinding","DurableCheckpoint","FileSource","SourceFingerprint","SourceIdentity","SourceRegistry"]};
