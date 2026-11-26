@@ -6,14 +6,30 @@
 //! is closed, the extension is bound to the stable [`JournalPosition`] of its
 //! journal record and both are verified as one evidence relationship. A
 //! mismatch, an absent extension or an ambiguous position fails closed.
+//!
+//! Durability boundaries are explicit rather than implied by `sync_all`:
+//! - A file `sync_all` persists that file's bytes on filesystems that honour
+//!   the call. It does not persist the containing directory entry and does not
+//!   cover an interruption before the call returns.
+//! - The containing directory is synced after store creation and after atomic
+//!   replacement where the platform supports directory sync. Where it does
+//!   not, only file-content durability is claimed: a creation or rename can
+//!   still be lost on power failure.
+//! - Every handle for one path shares one writer and one poison state. An
+//!   ambiguous write, flush, sync, rename or directory-sync outcome poisons
+//!   the store until [`EvidenceStore::recover`] verifies the reopened state.
+//!   The failure class survived is process-level interruption between
+//!   operations: no partial write or replacement is ever reported as success.
+//!   Zero data loss is not claimed for power loss, unreliable storage or
+//!   concurrent processes.
 
 use std::{
     collections::BTreeMap,
     fmt,
     fs::{File, OpenOptions},
-    io::{BufRead, BufReader, BufWriter, Write},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Duration,
 };
 
@@ -282,13 +298,130 @@ impl EvidenceExtension {
     }
 }
 
+/// Boundary at which an evidence store write may be interrupted in tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFaultPoint {
+    /// Before bytes are handed to the sink.
+    Write,
+    /// Before buffered bytes are flushed to the file.
+    Flush,
+    /// Before the file is synced to stable storage.
+    Sync,
+    /// Before the temporary file replaces the store.
+    Rename,
+    /// Before the containing directory is synced.
+    DirectorySync,
+}
+
+impl StoreFaultPoint {
+    /// Return the stable contract string for this boundary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Write => "write",
+            Self::Flush => "flush",
+            Self::Sync => "sync",
+            Self::Rename => "rename",
+            Self::DirectorySync => "directory_sync",
+        }
+    }
+}
+
+impl fmt::Display for StoreFaultPoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Write serialization and poison state shared by every handle to one file.
+#[derive(Debug, Default)]
+struct StoreState {
+    /// Set when an outcome may have partially changed the store on disk.
+    poisoned: bool,
+}
+
+/// Handles created independently for the same path must serialize together.
+static STORE_STATES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<StoreState>>>>> = OnceLock::new();
+
+fn shared_state(path: &Path) -> Arc<Mutex<StoreState>> {
+    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let registry = STORE_STATES.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(registry.entry(key).or_default())
+}
+
+const POISON_MESSAGE: &str =
+    "evidence store is poisoned after an ambiguous write; call recover() to verify state";
+
+fn ensure_writable(state: &StoreState) -> anyhow::Result<()> {
+    anyhow::ensure!(!state.poisoned, "{POISON_MESSAGE}");
+    Ok(())
+}
+
+fn injected(point: StoreFaultPoint) -> anyhow::Error {
+    anyhow::anyhow!("injected failure at {} boundary", point.as_str())
+}
+
+fn poison_after(
+    state: &mut StoreState,
+    point: StoreFaultPoint,
+    error: impl fmt::Display,
+) -> anyhow::Error {
+    state.poisoned = true;
+    anyhow::anyhow!("ambiguous {} failure: {error}", point.as_str())
+}
+
+fn directory_sync_unavailable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::Unsupported
+            | std::io::ErrorKind::InvalidInput
+            | std::io::ErrorKind::PermissionDenied
+            | std::io::ErrorKind::IsADirectory
+    )
+}
+
+/// Sync the directory entry, reporting unsupported platforms by skipping it.
+fn sync_parent_directory(path: &Path) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let directory = File::open(parent)
+        .map_err(|error| anyhow::anyhow!("open containing directory for sync: {error}"))?;
+    match directory.sync_all() {
+        Ok(()) => Ok(()),
+        // Windows and some filesystems cannot sync a directory handle. The
+        // caller proceeds without claiming directory-entry durability there.
+        Err(error) if directory_sync_unavailable(&error) => Ok(()),
+        Err(error) => Err(anyhow::anyhow!("sync containing directory: {error}")),
+    }
+}
+
+fn read_extensions(path: &Path) -> anyhow::Result<Vec<EvidenceExtension>> {
+    let file = File::open(path)?;
+    let mut extensions = Vec::new();
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let extension: EvidenceExtension = serde_json::from_str(&line)
+            .map_err(|error| anyhow::anyhow!("line {}: {}", line_number + 1, error))?;
+        extension.validate()?;
+        extensions.push(extension);
+    }
+    Ok(extensions)
+}
+
 /// Append-only NDJSON store of evidence extensions.
 #[derive(Debug, Clone)]
 pub struct EvidenceStore {
     path: PathBuf,
-    /// Shared across clones so concurrent ingests cannot interleave NDJSON
-    /// lines. One line is one atomic append from the reader's point of view.
-    write_lock: Arc<Mutex<()>>,
+    /// Shared across clones and independent handles for the same path so
+    /// appends and replacements cannot interleave or race.
+    shared: Arc<Mutex<StoreState>>,
+    /// One-shot deterministic interruption installed by tests.
+    fault: Arc<Mutex<Option<StoreFaultPoint>>>,
 }
 
 impl EvidenceStore {
@@ -297,11 +430,15 @@ impl EvidenceStore {
         std::fs::create_dir_all(directory)?;
         let path = directory.join(name);
         if !path.exists() {
-            File::create(&path)?;
+            let file = File::create(&path)?;
+            file.sync_all()?;
+            drop(file);
+            sync_parent_directory(&path)?;
         }
         Ok(Self {
+            shared: shared_state(&path),
             path,
-            write_lock: Arc::new(Mutex::new(())),
+            fault: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -311,62 +448,189 @@ impl EvidenceStore {
         &self.path
     }
 
+    fn lock_state(&self) -> MutexGuard<'_, StoreState> {
+        self.shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn fault_here(&self, point: StoreFaultPoint) -> bool {
+        let mut fault = self
+            .fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *fault == Some(point) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Install a one-shot write interruption at `point` for deterministic tests.
+    pub fn with_injected_fault(self, point: StoreFaultPoint) -> Self {
+        *self
+            .fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(point);
+        self
+    }
+
+    /// Whether an ambiguous write has left this store unavailable for writes.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.lock_state().poisoned
+    }
+
+    /// Verify the reopened state and clear poison after an ambiguous outcome.
+    ///
+    /// This is the explicit recovery step: a poisoned store refuses writes
+    /// until every line on disk has been read and validated again. An orphan
+    /// temporary file left by an interrupted replacement is removed here.
+    pub fn recover(&self) -> anyhow::Result<()> {
+        let mut state = self.lock_state();
+        read_extensions(&self.path)?;
+        let temporary = self.path.with_extension("tmp");
+        if temporary.exists() {
+            std::fs::remove_file(&temporary).map_err(|error| {
+                anyhow::anyhow!("recover cannot remove orphan temporary file: {error}")
+            })?;
+        }
+        state.poisoned = false;
+        Ok(())
+    }
+
     /// Append one validated extension.
     pub fn append(&self, extension: &EvidenceExtension) -> anyhow::Result<()> {
         extension.validate()?;
-        let _write = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut file = OpenOptions::new().append(true).open(&self.path)?;
         let line =
             serde_json::to_string(extension).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        writeln!(file, "{line}")?;
-        file.sync_all()?;
+        let mut payload = line.into_bytes();
+        payload.push(b'\n');
+        let mut state = self.lock_state();
+        ensure_writable(&state)?;
+
+        if self.fault_here(StoreFaultPoint::Write) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::Write,
+                injected(StoreFaultPoint::Write),
+            ));
+        }
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| anyhow::anyhow!("open evidence store for append: {error}"))?;
+        if let Err(error) = file.write_all(&payload) {
+            return Err(poison_after(&mut state, StoreFaultPoint::Write, error));
+        }
+        if self.fault_here(StoreFaultPoint::Flush) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::Flush,
+                injected(StoreFaultPoint::Flush),
+            ));
+        }
+        if let Err(error) = file.flush() {
+            return Err(poison_after(&mut state, StoreFaultPoint::Flush, error));
+        }
+        if self.fault_here(StoreFaultPoint::Sync) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::Sync,
+                injected(StoreFaultPoint::Sync),
+            ));
+        }
+        if let Err(error) = file.sync_all() {
+            return Err(poison_after(&mut state, StoreFaultPoint::Sync, error));
+        }
         Ok(())
     }
 
     /// Load every extension, failing closed on an unsupported version.
+    ///
+    /// Reading is allowed while the store is poisoned so callers can verify
+    /// state before invoking [`EvidenceStore::recover`].
     pub fn load(&self) -> anyhow::Result<Vec<EvidenceExtension>> {
-        let _write = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let file = File::open(&self.path)?;
-        let mut extensions = Vec::new();
-        for (line_number, line) in BufReader::new(file).lines().enumerate() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let extension: EvidenceExtension = serde_json::from_str(&line)
-                .map_err(|error| anyhow::anyhow!("line {}: {}", line_number + 1, error))?;
-            extension.validate()?;
-            extensions.push(extension);
-        }
-        Ok(extensions)
+        let _state = self.lock_state();
+        read_extensions(&self.path)
     }
 
     /// Rewrite the store with bound extensions.
     pub fn write_all(&self, extensions: &[EvidenceExtension]) -> anyhow::Result<()> {
-        let _write = self
-            .write_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let temporary = self.path.with_extension("tmp");
-        {
-            let file = File::create(&temporary)?;
-            let mut writer = BufWriter::new(file);
-            for extension in extensions {
-                extension.validate()?;
-                let line = serde_json::to_string(extension)
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-                writeln!(writer, "{line}")?;
-            }
-            writer.flush()?;
-            writer.get_ref().sync_all()?;
+        // Validate and serialize before any I/O: these failures cannot leave
+        // the live store in an ambiguous state.
+        let mut payload = Vec::new();
+        for extension in extensions {
+            extension.validate()?;
+            let line = serde_json::to_string(extension)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            payload.extend_from_slice(line.as_bytes());
+            payload.push(b'\n');
         }
-        std::fs::rename(&temporary, &self.path)?;
+        let mut state = self.lock_state();
+        ensure_writable(&state)?;
+        let temporary = self.path.with_extension("tmp");
+
+        if self.fault_here(StoreFaultPoint::Write) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::Write,
+                injected(StoreFaultPoint::Write),
+            ));
+        }
+        let mut file = File::create(&temporary)
+            .map_err(|error| anyhow::anyhow!("create evidence temporary file: {error}"))?;
+        if let Err(error) = file.write_all(&payload) {
+            return Err(poison_after(&mut state, StoreFaultPoint::Write, error));
+        }
+        if self.fault_here(StoreFaultPoint::Flush) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::Flush,
+                injected(StoreFaultPoint::Flush),
+            ));
+        }
+        if let Err(error) = file.flush() {
+            return Err(poison_after(&mut state, StoreFaultPoint::Flush, error));
+        }
+        if self.fault_here(StoreFaultPoint::Sync) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::Sync,
+                injected(StoreFaultPoint::Sync),
+            ));
+        }
+        if let Err(error) = file.sync_all() {
+            return Err(poison_after(&mut state, StoreFaultPoint::Sync, error));
+        }
+        drop(file);
+
+        if self.fault_here(StoreFaultPoint::Rename) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::Rename,
+                injected(StoreFaultPoint::Rename),
+            ));
+        }
+        if let Err(error) = std::fs::rename(&temporary, &self.path) {
+            return Err(poison_after(&mut state, StoreFaultPoint::Rename, error));
+        }
+
+        if self.fault_here(StoreFaultPoint::DirectorySync) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::DirectorySync,
+                injected(StoreFaultPoint::DirectorySync),
+            ));
+        }
+        if let Err(error) = sync_parent_directory(&self.path) {
+            return Err(poison_after(
+                &mut state,
+                StoreFaultPoint::DirectorySync,
+                error,
+            ));
+        }
         Ok(())
     }
 }
@@ -1318,5 +1582,187 @@ mod tests {
             .shutdown(Duration::from_secs(10))
             .expect("journal closed");
         assert_eq!(summary.record_count, 1, "the raw frame remains journaled");
+    }
+
+    fn extension(sequence: u64, payload: &[u8]) -> EvidenceExtension {
+        EvidenceExtension::from_packet(&evidence(sequence, payload), SourceId::new(1, 0))
+    }
+
+    fn reopen(directory: &Path) -> (EvidenceStore, Vec<EvidenceExtension>) {
+        let store = EvidenceStore::new(directory, "evidence.jsonl").expect("store reopened");
+        let extensions = store.load().expect("reopened store loads");
+        (store, extensions)
+    }
+
+    fn ids(extensions: &[EvidenceExtension]) -> Vec<String> {
+        extensions
+            .iter()
+            .map(|extension| extension.evidence_id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn injected_append_faults_poison_until_recovery() {
+        let first = extension(1, b"first");
+        let second = extension(2, b"second");
+        let third = extension(3, b"third");
+        for point in [
+            StoreFaultPoint::Write,
+            StoreFaultPoint::Flush,
+            StoreFaultPoint::Sync,
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let store =
+                EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+            store.append(&first).expect("seed append");
+            store.clone().with_injected_fault(point);
+
+            let error = store.append(&second).expect_err("injected append fault");
+            assert!(
+                error.to_string().contains(point.as_str()),
+                "error names the failing boundary: {error}"
+            );
+            assert!(store.is_poisoned(), "{point:?} must poison the store");
+            assert!(
+                store.append(&third).is_err(),
+                "a poisoned store must refuse appends"
+            );
+
+            let (reopened, loaded) = reopen(directory.path());
+            assert!(reopened.is_poisoned(), "poison follows the store path");
+            let expected = match point {
+                StoreFaultPoint::Write => vec![first.evidence_id.clone()],
+                StoreFaultPoint::Flush | StoreFaultPoint::Sync => {
+                    vec![first.evidence_id.clone(), second.evidence_id.clone()]
+                }
+                StoreFaultPoint::Rename | StoreFaultPoint::DirectorySync => Vec::new(),
+            };
+            assert_eq!(
+                ids(&loaded),
+                expected,
+                "reopened state matches the injected boundary"
+            );
+
+            reopened
+                .recover()
+                .expect("recovery verifies the reopened state");
+            assert!(
+                !reopened.is_poisoned(),
+                "recovery clears poison after verification"
+            );
+            reopened.append(&third).expect("append after recovery");
+            let (_, after) = reopen(directory.path());
+            assert!(
+                ids(&after).contains(&third.evidence_id),
+                "replayed append is visible after recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn injected_replacement_faults_poison_until_recovery() {
+        let first = extension(1, b"first");
+        let second = extension(2, b"second");
+        for point in [
+            StoreFaultPoint::Write,
+            StoreFaultPoint::Flush,
+            StoreFaultPoint::Sync,
+            StoreFaultPoint::Rename,
+            StoreFaultPoint::DirectorySync,
+        ] {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let store =
+                EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store created");
+            store.append(&first).expect("seed append");
+            store.clone().with_injected_fault(point);
+
+            let error = store
+                .write_all(std::slice::from_ref(&second))
+                .expect_err("injected replacement fault");
+            assert!(
+                error.to_string().contains(point.as_str()),
+                "error names the failing boundary: {error}"
+            );
+            assert!(store.is_poisoned(), "{point:?} must poison the store");
+            assert!(
+                store.write_all(std::slice::from_ref(&second)).is_err(),
+                "a poisoned store must refuse replacement"
+            );
+
+            let (reopened, loaded) = reopen(directory.path());
+            assert!(reopened.is_poisoned(), "poison follows the store path");
+            // A directory-sync fault happens after the rename; every earlier
+            // boundary leaves the previous file in place.
+            let expected = match point {
+                StoreFaultPoint::DirectorySync => vec![second.evidence_id.clone()],
+                StoreFaultPoint::Write
+                | StoreFaultPoint::Flush
+                | StoreFaultPoint::Sync
+                | StoreFaultPoint::Rename => vec![first.evidence_id.clone()],
+            };
+            assert_eq!(
+                ids(&loaded),
+                expected,
+                "{point:?}: a replacement never partially applies"
+            );
+
+            reopened
+                .recover()
+                .expect("recovery verifies the reopened state");
+            assert!(
+                !reopened.is_poisoned(),
+                "recovery clears poison after verification"
+            );
+            reopened
+                .write_all(std::slice::from_ref(&second))
+                .expect("replacement after recovery");
+            let (_, after) = reopen(directory.path());
+            assert_eq!(
+                ids(&after),
+                vec![second.evidence_id.clone()],
+                "replacement replayed after recovery"
+            );
+        }
+    }
+
+    #[test]
+    fn independent_handles_share_serialized_writer_and_poison() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let writer = EvidenceStore::new(directory.path(), "evidence.jsonl").expect("first handle");
+        let observer =
+            EvidenceStore::new(directory.path(), "evidence.jsonl").expect("second handle");
+        let extension = extension(1, b"shared");
+
+        observer.clone().with_injected_fault(StoreFaultPoint::Write);
+        assert!(
+            observer.append(&extension).is_err(),
+            "an interrupted write on one handle fails"
+        );
+        assert!(writer.is_poisoned(), "peer observes poison");
+        assert!(observer.is_poisoned(), "both handles share poison state");
+
+        let (reopened, loaded) = reopen(directory.path());
+        assert!(
+            loaded.is_empty(),
+            "no bytes are written before an injected write fault"
+        );
+        observer.recover().expect("peer recovers shared state");
+        assert!(
+            !writer.is_poisoned(),
+            "recovery on any handle clears shared poison"
+        );
+        writer
+            .append(&extension)
+            .expect("write after peer recovery");
+        let (_, after) = reopen(directory.path());
+        assert_eq!(
+            ids(&after),
+            vec![extension.evidence_id.clone()],
+            "the shared writer resumes after recovery"
+        );
+        assert!(
+            reopened.path() == writer.path(),
+            "reopened handle addresses the same store file"
+        );
     }
 }
