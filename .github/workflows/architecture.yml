@@ -33,11 +33,5 @@ jobs:
       - name: Check architecture traceability
         run: python3 scripts/check_architecture.py --check
 
-      - name: Check requirement matrix
-
       - name: Check generated paths
         run: python3 scripts/check_generated_paths.py
-
-        with:
-          fail-on-warning: true
-          comment-on-pr: false
