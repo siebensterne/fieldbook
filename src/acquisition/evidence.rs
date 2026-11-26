@@ -13,7 +13,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -286,6 +286,9 @@ impl EvidenceExtension {
 #[derive(Debug, Clone)]
 pub struct EvidenceStore {
     path: PathBuf,
+    /// Shared across clones so concurrent ingests cannot interleave NDJSON
+    /// lines. One line is one atomic append from the reader's point of view.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl EvidenceStore {
@@ -296,7 +299,10 @@ impl EvidenceStore {
         if !path.exists() {
             File::create(&path)?;
         }
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            write_lock: Arc::new(Mutex::new(())),
+        })
     }
 
     /// Return the store file path.
@@ -308,6 +314,10 @@ impl EvidenceStore {
     /// Append one validated extension.
     pub fn append(&self, extension: &EvidenceExtension) -> anyhow::Result<()> {
         extension.validate()?;
+        let _write = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
         let line =
             serde_json::to_string(extension).map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -318,6 +328,10 @@ impl EvidenceStore {
 
     /// Load every extension, failing closed on an unsupported version.
     pub fn load(&self) -> anyhow::Result<Vec<EvidenceExtension>> {
+        let _write = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let file = File::open(&self.path)?;
         let mut extensions = Vec::new();
         for (line_number, line) in BufReader::new(file).lines().enumerate() {
@@ -335,6 +349,10 @@ impl EvidenceStore {
 
     /// Rewrite the store with bound extensions.
     pub fn write_all(&self, extensions: &[EvidenceExtension]) -> anyhow::Result<()> {
+        let _write = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temporary = self.path.with_extension("tmp");
         {
             let file = File::create(&temporary)?;
@@ -580,6 +598,13 @@ pub struct EvidenceReceipt {
     pub ack: DurabilityAck,
 }
 
+/// Receive-sequence state for one source and connection epoch.
+///
+/// The journal verifier requires receive sequences to start at 1 and remain
+/// contiguous per source and epoch. A new epoch is a new map key, so its
+/// counter starts from zero independently of the previous connection.
+type ReceiveSequences = BTreeMap<(crate::model::SourceId, u64), u64>;
+
 /// Ingestion path that journals raw bytes before persisting their extension.
 pub struct EvidencePipeline {
     journal: JournalHandle,
@@ -587,7 +612,7 @@ pub struct EvidencePipeline {
     profile: DurabilityProfile,
     injected_failure: Option<FailurePoint>,
     stages: Option<ProcessingStages>,
-    next_receive_seq: AtomicU64,
+    receive_sequences: Mutex<ReceiveSequences>,
 }
 
 impl EvidencePipeline {
@@ -608,7 +633,7 @@ impl EvidencePipeline {
             profile,
             injected_failure: None,
             stages: None,
-            next_receive_seq: AtomicU64::new(1),
+            receive_sequences: Mutex::new(ReceiveSequences::new()),
         })
     }
 
@@ -681,10 +706,26 @@ impl EvidencePipeline {
                 "journal submission interrupted",
             );
         }
-        let receive_seq = self.next_receive_seq.fetch_add(1, Ordering::Relaxed);
+        // The journal verifier requires contiguous receive sequences per source
+        // and epoch. Hold the reservation lock across journal submission so the
+        // sequence order and the journal's admission order cannot diverge. A
+        // new epoch is a new key, so its sequence restarts at one.
+        let epoch = evidence.connection_epoch;
+        let mut sequences = self
+            .receive_sequences
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = sequences.get(&(source, epoch)).copied().unwrap_or(0);
+        let Some(receive_seq) = current.checked_add(1) else {
+            return Self::rejected(
+                evidence_id,
+                FailurePoint::JournalSubmit,
+                "receive sequence exhausted for source and connection epoch",
+            );
+        };
         let record = DataRecord {
             source,
-            connection_epoch: evidence.connection_epoch,
+            connection_epoch: epoch,
             receive_seq,
             received_at_us: evidence.received_at_us,
             frame: RawFrame {
@@ -701,10 +742,16 @@ impl EvidencePipeline {
             DurabilityProfile::D3 => JournalAckLevel::Synced,
             DurabilityProfile::D4 | DurabilityProfile::D5 => JournalAckLevel::Synced,
         };
-        let ack = match self
+        let ack_result = self
             .journal
-            .record_ack(record, ack_level, Duration::from_secs(5))
-        {
+            .record_ack(record, ack_level, Duration::from_secs(5));
+        // Commit even when acknowledgement failed. The record may already be
+        // queued; reusing its sequence would duplicate a journal fence. A
+        // record that never reached the journal leaves a gap, and verification
+        // then fails closed instead of claiming a complete capture.
+        sequences.insert((source, epoch), receive_seq);
+        drop(sequences);
+        let ack = match ack_result {
             Ok(ack) => ack,
             Err(error) => {
                 return Self::rejected(
@@ -714,6 +761,13 @@ impl EvidencePipeline {
                 );
             }
         };
+        if ack.source != source || ack.connection_epoch != epoch || ack.receive_seq != receive_seq {
+            return Self::rejected(
+                evidence_id,
+                FailurePoint::JournalPersist,
+                "acknowledgement does not identify the submitted record",
+            );
+        }
         extension.journal_ack = Some(ack.clone());
         if self.injected_failure == Some(FailurePoint::JournalPersist) {
             return EvidenceReceipt {
@@ -838,9 +892,16 @@ impl EvidenceLedger {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Barrier},
+        thread,
+    };
+
     use super::*;
     use crate::{
         acquisition::arbiter::FeedChannel,
+        integrity::journal::read_records,
+        integrity::journal::verify_run,
         integrity::journal::{JournalConfig, JournalMeta, SyncMode},
         model::SourceId,
     };
@@ -1003,5 +1064,259 @@ mod tests {
             "D5 needs replication"
         );
         assert!(DurabilityProfile::D3.locally_achievable(), "D3 is local");
+    }
+
+    fn context(sequence: u64) -> EvidenceContext {
+        EvidenceContext {
+            sequence_domain_id: "fixture-feed".to_owned(),
+            source_schema_id: "fixture-schema".to_owned(),
+            source_schema_version: 1,
+            receive_sequence: sequence,
+        }
+    }
+
+    fn pipeline_for(directory: &Path, run_id: &str) -> (EvidencePipeline, EvidenceStore) {
+        let journal =
+            JournalHandle::start(config(directory), meta(run_id)).expect("journal started");
+        let store = EvidenceStore::new(directory, "evidence.jsonl").expect("store created");
+        let pipeline = EvidencePipeline::new(journal, store.clone(), DurabilityProfile::D1)
+            .expect("pipeline created");
+        (pipeline, store)
+    }
+
+    #[test]
+    fn two_sources_get_independent_contiguous_receive_sequences() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (pipeline, store) = pipeline_for(directory.path(), "two-sources");
+        for sequence in 1..=3u64 {
+            let current = context(sequence);
+            for source in [SourceId::new(0, 0), SourceId::new(0, 1)] {
+                let packet = evidence(sequence, format!("{source}-{sequence}").as_bytes());
+                let receipt = pipeline.ingest(&packet, source, &current);
+                assert_eq!(
+                    receipt.disposition,
+                    EvidenceDisposition::EvidencePersisted,
+                    "both sources must persist evidence"
+                );
+            }
+        }
+        let summary = pipeline
+            .shutdown(Duration::from_secs(10))
+            .expect("journal closed");
+        let run_directory = Path::new(&summary.run_directory);
+        let records = read_records(run_directory).expect("records");
+        for source in ["s0r0", "s0r1"] {
+            let received: Vec<_> = records
+                .iter()
+                .filter(|record| record.source == source)
+                .map(|record| record.receive_seq)
+                .collect();
+            assert_eq!(received, vec![1, 2, 3], "per-source receive sequence");
+        }
+        let verification = verify_run(run_directory).expect("verify");
+        if !verification.complete {
+            eprintln!("journal verification errors: {:?}", verification.errors);
+        }
+        assert!(verification.complete, "journal verification incomplete");
+        let extensions = store.load().expect("extensions reload");
+        let contexts: Vec<_> = extensions
+            .iter()
+            .map(|extension| extension.receive_sequence)
+            .collect();
+        assert_eq!(
+            contexts,
+            vec![1, 1, 2, 2, 3, 3],
+            "context semantics retained"
+        );
+    }
+
+    #[test]
+    fn new_connection_epoch_resets_the_receive_sequence() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (pipeline, _store) = pipeline_for(directory.path(), "new-epoch");
+        let source = SourceId::new(0, 0);
+        let mut first = evidence(1, b"epoch-1-first");
+        let mut second = evidence(2, b"epoch-1-second");
+        let mut third = evidence(3, b"epoch-2-first");
+        let mut fourth = evidence(4, b"epoch-2-second");
+        first.connection_epoch = 1;
+        second.connection_epoch = 1;
+        third.connection_epoch = 2;
+        fourth.connection_epoch = 2;
+        for (index, packet) in [&first, &second, &third, &fourth].into_iter().enumerate() {
+            let receipt = pipeline.ingest(packet, source, &context(index as u64 + 1));
+            assert_eq!(
+                receipt.disposition,
+                EvidenceDisposition::EvidencePersisted,
+                "each epoch must persist evidence"
+            );
+        }
+        let summary = pipeline
+            .shutdown(Duration::from_secs(10))
+            .expect("journal closed");
+        let run_directory = Path::new(&summary.run_directory);
+        let records = read_records(run_directory).expect("records");
+        let identity: Vec<_> = records
+            .iter()
+            .map(|record| (record.connection_epoch, record.receive_seq))
+            .collect();
+        assert_eq!(
+            identity,
+            vec![(1, 1), (1, 2), (2, 1), (2, 2)],
+            "receive sequence restarts at one for a new epoch"
+        );
+        let verification = verify_run(run_directory).expect("verify");
+        if !verification.complete {
+            eprintln!("journal verification errors: {:?}", verification.errors);
+        }
+        assert!(verification.complete, "journal verification incomplete");
+    }
+
+    #[test]
+    fn concurrent_ingest_for_one_source_epoch_is_contiguous() {
+        const WORKERS: u64 = 8;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (pipeline, store) = pipeline_for(directory.path(), "concurrent-source");
+        let pipeline = Arc::new(pipeline);
+        let barrier = Arc::new(Barrier::new(WORKERS as usize));
+        let source = SourceId::new(0, 0);
+        let workers: Vec<_> = (1..=WORKERS)
+            .map(|sequence| {
+                let pipeline = Arc::clone(&pipeline);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    let packet = evidence(sequence, format!("concurrent-{sequence}").as_bytes());
+                    pipeline.ingest(&packet, source, &context(sequence))
+                })
+            })
+            .collect();
+        for worker in workers {
+            let receipt = worker.join().expect("worker joined");
+            assert_eq!(
+                receipt.disposition,
+                EvidenceDisposition::EvidencePersisted,
+                "all concurrent ingests must persist"
+            );
+        }
+        let pipeline = Arc::try_unwrap(pipeline).unwrap_or_else(|_| panic!("sole pipeline owner"));
+        let summary = pipeline
+            .shutdown(Duration::from_secs(10))
+            .expect("journal closed");
+        let run_directory = Path::new(&summary.run_directory);
+        let records = read_records(run_directory).expect("records");
+        let mut sequences: Vec<_> = records.iter().map(|record| record.receive_seq).collect();
+        sequences.sort_unstable();
+        assert_eq!(
+            sequences,
+            (1..=WORKERS).collect::<Vec<_>>(),
+            "concurrent admissions receive a contiguous range"
+        );
+        let verification = verify_run(run_directory).expect("verify");
+        if !verification.complete {
+            eprintln!("journal verification errors: {:?}", verification.errors);
+        }
+        assert!(verification.complete, "journal verification incomplete");
+        let extensions = store.load().expect("extensions reload");
+        assert_eq!(
+            extensions.len(),
+            WORKERS as usize,
+            "one extension per packet"
+        );
+    }
+
+    #[test]
+    fn receive_sequence_exhaustion_fails_closed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (pipeline, store) = pipeline_for(directory.path(), "exhausted");
+        let source = SourceId::new(0, 0);
+        {
+            let mut sequences = pipeline.receive_sequences.lock().expect("sequencer lock");
+            sequences.insert((source, 1), u64::MAX);
+        }
+        let receipt = pipeline.ingest(&evidence(1, b"exhausted"), source, &context(1));
+        assert!(
+            matches!(
+                receipt.disposition,
+                EvidenceDisposition::Rejected {
+                    at: FailurePoint::JournalSubmit,
+                    ..
+                }
+            ),
+            "exhaustion must reject before submission"
+        );
+        assert_eq!(
+            receipt.ack,
+            DurabilityAck::Received,
+            "no durability is claimed on exhaustion"
+        );
+        assert_eq!(
+            pipeline.status().counters.queued,
+            0,
+            "no record was submitted"
+        );
+        let summary = pipeline
+            .shutdown(Duration::from_secs(10))
+            .expect("journal closed");
+        assert_eq!(summary.record_count, 0, "exhaustion wrote no record");
+        assert!(
+            store.load().expect("extensions reload").is_empty(),
+            "exhaustion wrote no extension"
+        );
+    }
+
+    #[test]
+    fn interrupted_journal_submission_never_reports_success() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (journal, _store) = pipeline_for(directory.path(), "submit-interrupted");
+        let pipeline = journal.with_injected_failure(FailurePoint::JournalSubmit);
+        let source = SourceId::new(0, 0);
+        let receipt = pipeline.ingest(&evidence(1, b"interrupted"), source, &context(1));
+        assert!(
+            matches!(
+                receipt.disposition,
+                EvidenceDisposition::Rejected {
+                    at: FailurePoint::JournalSubmit,
+                    ..
+                }
+            ),
+            "an interrupted submission must be rejected"
+        );
+        assert_eq!(
+            receipt.ack,
+            DurabilityAck::Received,
+            "no acknowledgement is claimed"
+        );
+        let summary = pipeline
+            .shutdown(Duration::from_secs(10))
+            .expect("journal closed");
+        assert_eq!(summary.record_count, 0, "nothing was admitted");
+    }
+
+    #[test]
+    fn interrupted_persistence_never_reports_success() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (journal, store) = pipeline_for(directory.path(), "persist-interrupted");
+        let pipeline = journal.with_injected_failure(FailurePoint::JournalPersist);
+        let source = SourceId::new(0, 0);
+        let receipt = pipeline.ingest(&evidence(1, b"quarantined"), source, &context(1));
+        assert!(
+            matches!(
+                receipt.disposition,
+                EvidenceDisposition::Quarantined {
+                    at: FailurePoint::JournalPersist,
+                    ..
+                }
+            ),
+            "an interrupted persistence must be quarantined"
+        );
+        assert!(
+            store.load().expect("extensions reload").is_empty(),
+            "no extension was persisted"
+        );
+        let summary = pipeline
+            .shutdown(Duration::from_secs(10))
+            .expect("journal closed");
+        assert_eq!(summary.record_count, 1, "the raw frame remains journaled");
     }
 }

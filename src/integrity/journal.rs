@@ -350,7 +350,11 @@ impl JournalAckLevel {
     }
 }
 
-/// Acknowledgement tied to a concrete writer counter fence.
+/// Acknowledgement tied to a concrete writer counter fence and record.
+///
+/// A fence is a queue-admission ordinal. The identity fields are what prove a
+/// caller was acknowledged for the record it actually submitted; callers must
+/// compare them against their own record before treating an ack as success.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalAck {
     pub run_id: String,
@@ -358,6 +362,15 @@ pub struct JournalAck {
     /// Monotonic writer counter value the record reached.
     pub fence: u64,
     pub state: RunState,
+    /// Source of the record the fence was reserved for.
+    #[serde(default)]
+    pub source: SourceId,
+    /// Connection epoch of the record the fence was reserved for.
+    #[serde(default)]
+    pub connection_epoch: u64,
+    /// Receive sequence of the record the fence was reserved for.
+    #[serde(default)]
+    pub receive_seq: u64,
 }
 
 /// Result of an orderly finalization.
@@ -380,6 +393,10 @@ struct Inner {
     join: Mutex<Option<JoinHandle<()>>>,
     shutdown: Mutex<bool>,
     admission: Mutex<Admission>,
+    /// Serializes fence reservation with the enqueue that consumes it. A fence
+    /// sampled outside this mutex could belong to a concurrent producer's
+    /// record. The status lock is never held while waiting for queue space.
+    submit: Mutex<()>,
     admission_cv: Condvar,
     /// Wakes producers waiting for a per-record durability boundary.
     ack_cv: Condvar,
@@ -510,6 +527,7 @@ impl JournalHandle {
                 accepting: true,
                 active: 0,
             }),
+            submit: Mutex::new(()),
             admission_cv: Condvar::new(),
             ack_cv: Condvar::new(),
             append_latency,
@@ -537,7 +555,11 @@ impl JournalHandle {
     /// A timeout or a stopped writer marks the run failed and returns an error;
     /// the frame is not silently dropped while the capture remains complete.
     pub fn record(&self, record: DataRecord) -> anyhow::Result<()> {
-        let job = RecordJob {
+        self.enqueue(Self::data_job(record))
+    }
+
+    fn data_job(record: DataRecord) -> RecordJob {
+        RecordJob {
             source: record.source,
             connection_epoch: record.connection_epoch,
             observation_seq: 0,
@@ -553,29 +575,23 @@ impl JournalHandle {
             payload: record.frame.payload,
             outcome: Some(record.outcome),
             send_result: None,
-        };
-        self.enqueue(job)
+        }
     }
 
     /// Queue one record and wait for a concrete writer durability boundary.
     ///
-    /// The returned acknowledgement carries the writer counter fence reached
-    /// by this record. It does not rely on a global status snapshot alone.
+    /// The fence is reserved under the submit mutex immediately before the
+    /// enqueue that increments `queued`, and the returned acknowledgement names
+    /// the submitted record. No other producer can claim the same ordinal.
     pub fn record_ack(
         &self,
         record: DataRecord,
         level: JournalAckLevel,
         timeout: Duration,
     ) -> anyhow::Result<JournalAck> {
-        let fence = {
-            let status = self
-                .inner
-                .status
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            status.counters.queued.saturating_add(1)
-        };
-        self.record(record)?;
+        let (source, connection_epoch, receive_seq) =
+            (record.source, record.connection_epoch, record.receive_seq);
+        let fence = self.enqueue_with_fence(Self::data_job(record))?;
         let deadline = Instant::now() + timeout;
         loop {
             let status = self
@@ -583,6 +599,13 @@ impl JournalHandle {
                 .status
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if status.last_error.is_some() || status.state == RunState::Failed {
+                let reason = status
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "journal failed".to_owned());
+                anyhow::bail!("journal failed before {}: {reason}", level.as_str());
+            }
             let reached = match level {
                 JournalAckLevel::Queued => status.counters.queued,
                 JournalAckLevel::Written => status.counters.written,
@@ -595,14 +618,10 @@ impl JournalHandle {
                     level,
                     fence,
                     state: status.state,
+                    source,
+                    connection_epoch,
+                    receive_seq,
                 });
-            }
-            if status.last_error.is_some() || status.state == RunState::Failed {
-                let reason = status
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "journal failed".to_owned());
-                anyhow::bail!("journal failed before {}: {reason}", level.as_str());
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -646,6 +665,46 @@ impl JournalHandle {
         // to drop, which happens only after a queue failure has been latched
         // and accepted records have updated their counters.
         let _admission = self.admit()?;
+        let _submit = self
+            .inner
+            .submit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.submit(job)
+    }
+
+    /// Reserve an admission fence and submit this record under one mutex.
+    ///
+    /// Every enqueue takes the same mutex, so the sampled `queued` counter
+    /// plus one is the exact ordinal this record will obtain when `submit`
+    /// increments the counter. A queue failure returns an error and consumes
+    /// no fence. The status lock is held neither across the queue wait nor
+    /// across the acknowledgement wait, so the writer's condvar cannot
+    /// deadlock with the submit mutex.
+    fn enqueue_with_fence(&self, job: RecordJob) -> anyhow::Result<u64> {
+        let _admission = self.admit()?;
+        let _submit = self
+            .inner
+            .submit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let fence = {
+            let status = self
+                .inner
+                .status
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            status
+                .counters
+                .queued
+                .checked_add(1)
+                .context("journal queued counter exhausted")?
+        };
+        self.submit(job)?;
+        Ok(fence)
+    }
+
+    fn submit(&self, job: RecordJob) -> anyhow::Result<()> {
         let timeout = Duration::from_millis(self.inner.durability.enqueue_timeout_ms);
         let result = self.inner.queue.send_timeout(Command::Record(job), timeout);
         #[cfg(test)]
@@ -673,7 +732,9 @@ impl JournalHandle {
                     .status
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                status.counters.queued = status.counters.queued.saturating_add(1);
+                status.counters.queued = status.counters.queued.checked_add(1).context(
+                    "journal queued counter exhausted; no further record may be admitted",
+                )?;
                 status.counters.queue_depth = self.inner.queue.len() as u64;
                 drop(status);
                 self.inner.ack_cv.notify_all();

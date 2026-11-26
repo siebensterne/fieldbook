@@ -359,7 +359,10 @@ fn control_and_data_sequences_reset_with_each_connection_epoch() {
         .expect("journal shutdown");
     let directory = PathBuf::from(&summary.run_directory);
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
 
     let observations = read_observations(&directory).expect("read observations");
     let per_epoch: Vec<_> = observations
@@ -492,7 +495,10 @@ fn record_order_matches_source_epoch_and_sequence() {
         .expect("journal shutdown");
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     let records = read_records(&directory).expect("read records");
     let identity: Vec<_> = records
         .iter()
@@ -537,7 +543,10 @@ fn record_order_is_checked_across_segments() {
     assert!(summary.segment_count >= 2);
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     let records = read_records(&directory).expect("read records");
     let sequences: Vec<_> = records.iter().map(|record| record.receive_seq).collect();
     assert_eq!(sequences, (1..=12).collect::<Vec<_>>());
@@ -1486,7 +1495,10 @@ fn successful_shutdown_reconciles_counters() {
     assert_eq!(summary.record_count, status.counters.finalized);
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     assert_eq!(verification.record_count, status.counters.finalized);
     assert_eq!(verification.segments.len() as u64, status.counters.segments);
     validate_report_status(&status, &verification)
@@ -1529,7 +1541,10 @@ fn graceful_shutdown_finalizes_rotated_segments() {
     assert!(summary.segment_count >= 3);
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     assert_eq!(verification.state, RunState::Finalized);
     assert_eq!(verification.record_count, 12);
     assert_eq!(verification.segments.len() as u64, summary.segment_count);
@@ -1840,7 +1855,10 @@ fn post_commit_failure_does_not_downgrade_finalized_run() {
         .expect("post-commit hook cannot undo finalization");
     assert_eq!(summary.state, RunState::Finalized);
     let verification = verify_run(&run_directory(temp.path(), "run")).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     assert_eq!(verification.state, RunState::Finalized);
 }
 
@@ -1906,5 +1924,287 @@ fn framing_marker_tolerates_partial_reads() {
     assert_eq!(
         marker, RECORD_MAGIC,
         "partial reads must assemble the marker"
+    );
+}
+
+#[test]
+fn ack_identifies_the_exact_submitted_record() {
+    let temp = TempDir::new().expect("tempdir");
+    let handle = start(temp.path(), "ack-identity");
+    let source = SourceId::new(0, 7);
+    let record = data_record(
+        source,
+        1,
+        1,
+        1_700_000_000_000_100,
+        RawFrame::binary(b"identified".to_vec()),
+        DecodeOutcome::decoded(1),
+    );
+    let ack = handle
+        .record_ack(record, JournalAckLevel::Written, Duration::from_secs(2))
+        .expect("acknowledgement");
+    assert_eq!(ack.source, source, "ack must name the submitted source");
+    assert_eq!(
+        ack.connection_epoch, 1,
+        "ack must name the submitted connection epoch"
+    );
+    assert_eq!(
+        ack.receive_seq, 1,
+        "ack must name the submitted receive sequence"
+    );
+    assert_eq!(ack.fence, 1, "the first record owns fence 1");
+    let summary = handle
+        .shutdown(Duration::from_secs(2))
+        .expect("journal shutdown");
+    let records = read_records(Path::new(&summary.run_directory)).expect("records");
+    assert_eq!(records.len(), 1, "one record was admitted");
+    assert_eq!(
+        records[0].receive_seq, 1,
+        "the record carries its own fence"
+    );
+    assert_eq!(
+        ack.receive_seq, records[0].receive_seq,
+        "ack and persisted record agree"
+    );
+}
+
+#[test]
+fn concurrent_record_ack_fences_bind_to_their_own_records() {
+    let temp = TempDir::new().expect("tempdir");
+    let handle = Arc::new(start(temp.path(), "ack-fences"));
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let first_gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let gate = Arc::clone(&first_gate);
+    handle.set_record_hook(Arc::new(move || {
+        if !gate.swap(true, Ordering::SeqCst) {
+            let _ = entered_tx.send(());
+            if let Ok(receiver) = release_rx.lock() {
+                let _ = receiver.recv_timeout(Duration::from_secs(10));
+            }
+        }
+    }));
+    let (started_tx, started_rx) = mpsc::channel();
+    let left = SourceId::new(0, 0);
+    let right = SourceId::new(0, 1);
+    let first_handle = Arc::clone(&handle);
+    let first = thread::spawn(move || {
+        first_handle.record_ack(
+            data_record(
+                left,
+                1,
+                1,
+                1_700_000_000_000_100,
+                RawFrame::binary(b"left".to_vec()),
+                DecodeOutcome::decoded(1),
+            ),
+            JournalAckLevel::Written,
+            Duration::from_secs(5),
+        )
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first producer reached the enqueue gate");
+    let second_handle = Arc::clone(&handle);
+    let second = thread::spawn(move || {
+        let _ = started_tx.send(());
+        second_handle.record_ack(
+            data_record(
+                right,
+                1,
+                1,
+                1_700_000_000_000_200,
+                RawFrame::binary(b"right".to_vec()),
+                DecodeOutcome::decoded(1),
+            ),
+            JournalAckLevel::Written,
+            Duration::from_secs(5),
+        )
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second producer started");
+    let _ = release_tx.send(());
+    let first_ack = first
+        .join()
+        .expect("first producer joined")
+        .expect("first ack");
+    let second_ack = second
+        .join()
+        .expect("second producer joined")
+        .expect("second ack");
+    assert_ne!(
+        first_ack.fence, second_ack.fence,
+        "two admissions cannot share a fence"
+    );
+    assert_eq!(
+        first_ack.source, left,
+        "the first acknowledgement belongs to the first record"
+    );
+    assert_eq!(
+        second_ack.source, right,
+        "the second acknowledgement belongs to the second record"
+    );
+    assert_eq!(
+        first_ack.receive_seq, 1,
+        "the first acknowledgement carries the first receive sequence"
+    );
+    assert_eq!(
+        second_ack.receive_seq, 1,
+        "the second acknowledgement carries the second receive sequence"
+    );
+    let mut fences = vec![first_ack.fence, second_ack.fence];
+    fences.sort_unstable();
+    assert_eq!(fences, vec![1, 2], "fences are exact admission ordinals");
+    assert_eq!(
+        handle.status().counters.queued,
+        2,
+        "both records were admitted"
+    );
+    handle
+        .shutdown(Duration::from_secs(2))
+        .expect("journal shutdown");
+    let directory = run_directory(temp.path(), "ack-fences");
+    let verification = verify_run(&directory).expect("verify");
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
+}
+
+#[test]
+fn ack_reports_queue_failure_instead_of_success() {
+    let temp = TempDir::new().expect("tempdir");
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_gate = Arc::clone(&blocked);
+    let hook: FaultHook = Arc::new(move |point| {
+        if point == FaultPoint::Write && !writer_gate.swap(true, Ordering::SeqCst) {
+            let _ = entered_tx.send(());
+            if let Ok(receiver) = release_rx.lock() {
+                let _ = receiver.recv_timeout(Duration::from_secs(10));
+            }
+        }
+        Ok(())
+    });
+    let mut config = test_config(temp.path());
+    config.queue_capacity = 1;
+    config.enqueue_timeout = Duration::from_millis(30);
+    let handle =
+        JournalHandle::start_inner(config, meta("ack-queue"), Some(hook)).expect("journal start");
+    append(
+        &handle,
+        SourceId::new(0, 0),
+        1,
+        1,
+        b"first",
+        DecodeOutcome::decoded(1),
+    );
+    entered_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("writer entered the write hook");
+    append(
+        &handle,
+        SourceId::new(0, 0),
+        1,
+        2,
+        b"second",
+        DecodeOutcome::decoded(1),
+    );
+    let error = handle
+        .record_ack(
+            data_record(
+                SourceId::new(0, 0),
+                1,
+                3,
+                now_us().unwrap_or(0),
+                RawFrame::binary(b"third".to_vec()),
+                DecodeOutcome::decoded(1),
+            ),
+            JournalAckLevel::Written,
+            Duration::from_secs(1),
+        )
+        .expect_err("a full queue cannot be acknowledged");
+    assert!(
+        format!("{error:#}").contains("queue stayed full"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        handle.status().state,
+        RunState::Failed,
+        "queue failure must fail the run"
+    );
+    let _ = release_tx.send(());
+}
+
+#[test]
+fn ack_reports_writer_failure_instead_of_success() {
+    let temp = TempDir::new().expect("tempdir");
+    let hook: FaultHook = Arc::new(|point| {
+        if point == FaultPoint::Write {
+            bail!("simulated write failure");
+        }
+        Ok(())
+    });
+    let handle =
+        JournalHandle::start_inner(test_config(temp.path()), meta("ack-writer"), Some(hook))
+            .expect("journal start");
+    let error = handle
+        .record_ack(
+            data_record(
+                SourceId::new(0, 0),
+                1,
+                1,
+                now_us().unwrap_or(0),
+                RawFrame::binary(b"failed".to_vec()),
+                DecodeOutcome::decoded(1),
+            ),
+            JournalAckLevel::Written,
+            Duration::from_secs(2),
+        )
+        .expect_err("a failed writer cannot acknowledge");
+    assert!(
+        format!("{error:#}").contains("journal failed before"),
+        "unexpected error: {error:#}"
+    );
+    assert_eq!(
+        handle.status().state,
+        RunState::Failed,
+        "writer failure must fail the run"
+    );
+}
+
+#[test]
+fn ack_reports_timeout_instead_of_success() {
+    let temp = TempDir::new().expect("tempdir");
+    let mut config = test_config(temp.path());
+    config.flush_interval = Duration::from_secs(30);
+    config.sync_interval = Duration::from_secs(30);
+    let handle = JournalHandle::start(config, meta("ack-timeout")).expect("journal start");
+    let error = handle
+        .record_ack(
+            data_record(
+                SourceId::new(0, 0),
+                1,
+                1,
+                now_us().unwrap_or(0),
+                RawFrame::binary(b"waiting".to_vec()),
+                DecodeOutcome::decoded(1),
+            ),
+            JournalAckLevel::Flushed,
+            Duration::from_millis(100),
+        )
+        .expect_err("an unreached durability level cannot acknowledge");
+    assert!(
+        format!("{error:#}").contains("acknowledgement timed out"),
+        "unexpected error: {error:#}"
+    );
+    let status = handle.status();
+    assert!(
+        status.counters.flushed < status.counters.queued,
+        "no flush happened, so no flush acknowledgement is valid: {status:?}"
     );
 }
