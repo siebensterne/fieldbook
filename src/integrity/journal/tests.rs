@@ -359,7 +359,10 @@ fn control_and_data_sequences_reset_with_each_connection_epoch() {
         .expect("journal shutdown");
     let directory = PathBuf::from(&summary.run_directory);
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
 
     let observations = read_observations(&directory).expect("read observations");
     let per_epoch: Vec<_> = observations
@@ -492,7 +495,10 @@ fn record_order_matches_source_epoch_and_sequence() {
         .expect("journal shutdown");
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     let records = read_records(&directory).expect("read records");
     let identity: Vec<_> = records
         .iter()
@@ -537,7 +543,10 @@ fn record_order_is_checked_across_segments() {
     assert!(summary.segment_count >= 2);
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     let records = read_records(&directory).expect("read records");
     let sequences: Vec<_> = records.iter().map(|record| record.receive_seq).collect();
     assert_eq!(sequences, (1..=12).collect::<Vec<_>>());
@@ -1486,7 +1495,10 @@ fn successful_shutdown_reconciles_counters() {
     assert_eq!(summary.record_count, status.counters.finalized);
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     assert_eq!(verification.record_count, status.counters.finalized);
     assert_eq!(verification.segments.len() as u64, status.counters.segments);
     validate_report_status(&status, &verification)
@@ -1529,7 +1541,10 @@ fn graceful_shutdown_finalizes_rotated_segments() {
     assert!(summary.segment_count >= 3);
     let directory = run_directory(temp.path(), "run");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     assert_eq!(verification.state, RunState::Finalized);
     assert_eq!(verification.record_count, 12);
     assert_eq!(verification.segments.len() as u64, summary.segment_count);
@@ -1840,7 +1855,10 @@ fn post_commit_failure_does_not_downgrade_finalized_run() {
         .expect("post-commit hook cannot undo finalization");
     assert_eq!(summary.state, RunState::Finalized);
     let verification = verify_run(&run_directory(temp.path(), "run")).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
     assert_eq!(verification.state, RunState::Finalized);
 }
 
@@ -2049,7 +2067,10 @@ fn concurrent_record_ack_fences_bind_to_their_own_records() {
         .expect("journal shutdown");
     let directory = run_directory(temp.path(), "ack-fences");
     let verification = verify_run(&directory).expect("verify");
-    assert!(verification.complete, "{:?}", verification.errors);
+    if !verification.complete {
+        eprintln!("journal verification errors: {:?}", verification.errors);
+    }
+    assert!(verification.complete, "journal verification incomplete");
 }
 
 #[test]

@@ -1114,7 +1114,10 @@ mod tests {
             assert_eq!(received, vec![1, 2, 3], "per-source receive sequence");
         }
         let verification = verify_run(run_directory).expect("verify");
-        assert!(verification.complete, "{:?}", verification.errors);
+        if !verification.complete {
+            eprintln!("journal verification errors: {:?}", verification.errors);
+        }
+        assert!(verification.complete, "journal verification incomplete");
         let extensions = store.load().expect("extensions reload");
         let contexts: Vec<_> = extensions
             .iter()
@@ -1163,7 +1166,10 @@ mod tests {
             "receive sequence restarts at one for a new epoch"
         );
         let verification = verify_run(run_directory).expect("verify");
-        assert!(verification.complete, "{:?}", verification.errors);
+        if !verification.complete {
+            eprintln!("journal verification errors: {:?}", verification.errors);
+        }
+        assert!(verification.complete, "journal verification incomplete");
     }
 
     #[test]
@@ -1207,7 +1213,10 @@ mod tests {
             "concurrent admissions receive a contiguous range"
         );
         let verification = verify_run(run_directory).expect("verify");
-        assert!(verification.complete, "{:?}", verification.errors);
+        if !verification.complete {
+            eprintln!("journal verification errors: {:?}", verification.errors);
+        }
+        assert!(verification.complete, "journal verification incomplete");
         let extensions = store.load().expect("extensions reload");
         assert_eq!(
             extensions.len(),
@@ -1234,8 +1243,7 @@ mod tests {
                     ..
                 }
             ),
-            "exhaustion must reject before submission: {:?}",
-            receipt.disposition
+            "exhaustion must reject before submission"
         );
         assert_eq!(
             receipt.ack,
@@ -1272,8 +1280,7 @@ mod tests {
                     ..
                 }
             ),
-            "an interrupted submission must be rejected: {:?}",
-            receipt.disposition
+            "an interrupted submission must be rejected"
         );
         assert_eq!(
             receipt.ack,
@@ -1301,8 +1308,7 @@ mod tests {
                     ..
                 }
             ),
-            "an interrupted persistence must be quarantined: {:?}",
-            receipt.disposition
+            "an interrupted persistence must be quarantined"
         );
         assert!(
             store.load().expect("extensions reload").is_empty(),
