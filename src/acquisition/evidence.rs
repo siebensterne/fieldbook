@@ -15,13 +15,17 @@
 //!   replacement where the platform supports directory sync. Where it does
 //!   not, only file-content durability is claimed: a creation or rename can
 //!   still be lost on power failure.
-//! - Every handle for one path shares one writer and one poison state. An
-//!   ambiguous write, flush, sync, rename or directory-sync outcome poisons
-//!   the store until [`EvidenceStore::recover`] verifies the reopened state.
-//!   The failure class survived is process-level interruption between
-//!   operations: no partial write or replacement is ever reported as success.
-//!   Zero data loss is not claimed for power loss, unreliable storage or
-//!   concurrent processes.
+//! - Every handle for one path in one process shares one writer and one poison
+//!   state. Ownership of the path is guarded by a kernel-held exclusive lock on
+//!   a stable `.lock` file: a second live process cannot acquire the same
+//!   store, and the kernel releases ownership when the owner exits. There is
+//!   no PID file, heartbeat or stale-file takeover heuristic. An ambiguous
+//!   write, flush, sync, rename or directory-sync outcome poisons the store
+//!   until [`EvidenceStore::recover`] verifies the reopened state. The failure
+//!   class survived is process-level interruption between operations: no
+//!   partial write or replacement is ever reported as success. Zero data loss
+//!   is not claimed for power loss, unreliable storage or for writes made
+//!   outside [`EvidenceStore`].
 
 use std::{
     collections::BTreeMap,
@@ -383,18 +387,116 @@ impl fmt::Display for StoreFaultPoint {
     }
 }
 
-/// Write serialization and poison state shared by every handle to one file.
+/// Error text for a live owner refusing a second writer process.
+const OWNED_BY_ANOTHER_PROCESS: &str = "evidence store is already owned by another process";
+
+/// Kernel-held writer token for one store path.
+#[derive(Debug)]
+struct WriterLock {
+    /// Kept open for the lifetime of the owning process. The kernel drops the
+    /// lock when this descriptor closes, including on abnormal process exit.
+    _file: File,
+}
+
+impl WriterLock {
+    /// Acquire the stable lock file for `path` without waiting or inferring
+    /// ownership from file metadata.
+    fn acquire(path: &Path) -> anyhow::Result<Self> {
+        let stable = stable_path(path);
+        let mut name = stable.file_name().unwrap_or_default().to_os_string();
+        name.push(".lock");
+        let lock_path = stable.with_file_name(name);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| anyhow::anyhow!("open evidence writer lock file: {error}"))?;
+        acquire_exclusive(&file, &lock_path)?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Take an exclusive, non-blocking advisory lock on the stable lock file.
+#[cfg(unix)]
+#[expect(
+    unsafe_code,
+    reason = "flock is the kernel primitive that ties ownership to a live process"
+)]
+fn acquire_exclusive(file: &File, path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of this call.
+        // LOCK_NB makes a competing process fail immediately; the kernel owns
+        // release at process exit, so no age or PID heuristic is involved.
+        let outcome = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if outcome == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(anyhow::anyhow!(
+                "{OWNED_BY_ANOTHER_PROCESS}: {}",
+                path.display()
+            ));
+        }
+        return Err(anyhow::anyhow!(
+            "acquire evidence writer lock {}: {error}",
+            path.display()
+        ));
+    }
+}
+
+/// Fail closed where no supported cross-process lock primitive is available.
+#[cfg(not(unix))]
+fn acquire_exclusive(_file: &File, _path: &Path) -> anyhow::Result<()> {
+    Err(anyhow::anyhow!(
+        "cross-process evidence writer ownership requires flock; platform is unsupported"
+    ))
+}
+
+/// Write serialization, cross-process ownership and poison state shared by
+/// every handle to one file within one process.
 #[derive(Debug, Default)]
 struct StoreState {
     /// Set when an outcome may have partially changed the store on disk.
     poisoned: bool,
+    /// Acquired once per process and path; the registry retains it for the
+    /// lifetime of the process so the kernel releases it at process exit.
+    writer_lock: Option<WriterLock>,
+}
+
+impl StoreState {
+    /// Acquire the kernel writer token before any store I/O.
+    fn ensure_owner(&mut self, path: &Path) -> anyhow::Result<()> {
+        if self.writer_lock.is_none() {
+            self.writer_lock = Some(WriterLock::acquire(path)?);
+        }
+        Ok(())
+    }
 }
 
 /// Handles created independently for the same path must serialize together.
 static STORE_STATES: OnceLock<Mutex<BTreeMap<PathBuf, Arc<Mutex<StoreState>>>>> = OnceLock::new();
 
+/// Resolve a store path to a stable key without requiring the file to exist.
+/// Canonicalizing the parent avoids a second identity when the file appears
+/// and when the temp root is reached through a symlink.
+fn stable_path(path: &Path) -> PathBuf {
+    path.parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+        .map_or_else(
+            || path.to_path_buf(),
+            |parent| parent.join(path.file_name().unwrap_or_default()),
+        )
+}
+
 fn shared_state(path: &Path) -> Arc<Mutex<StoreState>> {
-    let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let key = stable_path(path);
     let registry = STORE_STATES.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut registry = registry
         .lock()
@@ -479,6 +581,16 @@ impl EvidenceStore {
     pub fn new(directory: &Path, name: &str) -> anyhow::Result<Self> {
         std::fs::create_dir_all(directory)?;
         let path = directory.join(name);
+        let shared = shared_state(&path);
+        {
+            let mut state = shared
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Ownership precedes creation so two processes cannot race to
+            // create or replace the same path, and the token stays held until
+            // this process exits.
+            state.ensure_owner(&path)?;
+        }
         if !path.exists() {
             let file = File::create(&path)?;
             file.sync_all()?;
@@ -486,7 +598,7 @@ impl EvidenceStore {
             sync_parent_directory(&path)?;
         }
         Ok(Self {
-            shared: shared_state(&path),
+            shared,
             path,
             fault: Arc::new(Mutex::new(None)),
         })
@@ -1230,6 +1342,8 @@ impl EvidenceLedger {
 #[cfg(test)]
 mod tests {
     use std::{
+        env,
+        process::{Child, ChildStdin, ChildStdout, Command, Stdio},
         sync::{Arc, Barrier},
         thread,
     };
@@ -2089,6 +2203,220 @@ mod tests {
         assert!(
             reopened.path() == writer.path(),
             "reopened handle addresses the same store file"
+        );
+    }
+
+    const CHILD_MODE_ENV: &str = "FIELDBOOK_EVIDENCE_WRITER_MODE";
+    const CHILD_PATH_ENV: &str = "FIELDBOOK_EVIDENCE_WRITER_PATH";
+    const CHILD_TEST: &str = "acquisition::evidence::tests::writer_process_helper";
+    const CHILD_SIGNAL_PREFIX: &str = "EVIDENCE_WRITER:";
+
+    fn signal(message: &str) {
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        writeln!(stdout, "{CHILD_SIGNAL_PREFIX}{message}").expect("write child signal");
+        stdout.flush().expect("flush child signal");
+    }
+
+    fn await_stop() {
+        let stdin = std::io::stdin();
+        let mut line = String::new();
+        let count = stdin
+            .lock()
+            .read_line(&mut line)
+            .expect("await release from parent");
+        assert!(count > 0, "release channel closed before stop");
+        assert_eq!(line.trim(), "stop", "unexpected child command");
+    }
+
+    /// Subprocess entry point for the cross-process ownership tests. The
+    /// parent re-executes this test binary with `--exact` and a role selected
+    /// by [`CHILD_MODE_ENV`]; stdin/stdout are the deterministic channels.
+    #[test]
+    fn writer_process_helper() {
+        let Ok(mode) = env::var(CHILD_MODE_ENV) else {
+            return;
+        };
+        let root = PathBuf::from(env::var_os(CHILD_PATH_ENV).expect("child root"));
+        match mode.as_str() {
+            "owner" => {
+                let store = EvidenceStore::new(&root, "evidence.jsonl").expect("child store");
+                store
+                    .append(&extension(1, b"owner-payload"))
+                    .expect("child append");
+                signal("acquired");
+                await_stop();
+            }
+            "stalled" => {
+                let _store = EvidenceStore::new(&root, "evidence.jsonl").expect("stalled store");
+                signal("acquired");
+                await_stop();
+            }
+            "probe" => match EvidenceStore::new(&root, "evidence.jsonl") {
+                Ok(store) => {
+                    store
+                        .append(&extension(3, b"probe-payload"))
+                        .expect("probe append");
+                    signal("acquired");
+                }
+                Err(error) => signal(&format!("busy: {error}")),
+            },
+            "recovery" => {
+                let store = EvidenceStore::new(&root, "evidence.jsonl").expect("recovery store");
+                store.recover().expect("recovery verification");
+                store
+                    .append(&extension(2, b"replay-payload"))
+                    .expect("replay append");
+                signal("recovered");
+            }
+            other => panic!("unknown writer helper mode: {other}"),
+        }
+    }
+
+    fn spawn_writer(root: &Path, mode: &str) -> (Child, BufReader<ChildStdout>, ChildStdin) {
+        let executable = env::current_exe().expect("current test executable");
+        let mut child = Command::new(executable)
+            .arg("--exact")
+            .arg(CHILD_TEST)
+            .arg("--nocapture")
+            .env(CHILD_MODE_ENV, mode)
+            .env(CHILD_PATH_ENV, root)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn writer process");
+        let output = BufReader::new(child.stdout.take().expect("child stdout pipe"));
+        let input = child.stdin.take().expect("child stdin pipe");
+        (child, output, input)
+    }
+
+    fn probe_writer(root: &Path) -> String {
+        let executable = env::current_exe().expect("current test executable");
+        let output = Command::new(executable)
+            .arg("--exact")
+            .arg(CHILD_TEST)
+            .arg("--nocapture")
+            .env(CHILD_MODE_ENV, "probe")
+            .env(CHILD_PATH_ENV, root)
+            .output()
+            .expect("spawn probing writer");
+        if !output.status.success() {
+            eprintln!(
+                "probing writer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(output.status.success(), "probing writer failed");
+        String::from_utf8(output.stdout).expect("probe output is UTF-8")
+    }
+
+    fn read_signal(output: &mut BufReader<ChildStdout>, child: &mut Child) -> String {
+        loop {
+            let mut line = String::new();
+            let count = output.read_line(&mut line).expect("read child signal");
+            if count == 0 {
+                eprintln!("writer exited before signalling: {:?}", child.try_wait());
+            }
+            assert!(count > 0, "writer exited before signalling");
+            if let Some(message) = line.strip_prefix(CHILD_SIGNAL_PREFIX) {
+                return message.trim().to_owned();
+            }
+        }
+    }
+
+    fn release_writer(mut input: ChildStdin, child: &mut Child) {
+        writeln!(input, "stop").expect("send release");
+        input.flush().expect("flush release");
+        drop(input);
+        let status = child.wait().expect("wait for writer");
+        assert!(status.success(), "writer exited with {status}");
+    }
+
+    #[test]
+    fn two_writer_processes_admit_exactly_one_owner() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut owner, mut output, input) = spawn_writer(directory.path(), "owner");
+        assert_eq!(
+            read_signal(&mut output, &mut owner),
+            "acquired",
+            "first process owns the store"
+        );
+        let probe = probe_writer(directory.path());
+        assert!(
+            probe.contains(&format!("{CHILD_SIGNAL_PREFIX}busy:")),
+            "a second live process must not acquire the same store: {probe:?}"
+        );
+        release_writer(input, &mut owner);
+    }
+
+    #[test]
+    fn live_but_stalled_owner_is_not_treated_as_free() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut stalled, mut output, input) = spawn_writer(directory.path(), "stalled");
+        assert_eq!(
+            read_signal(&mut output, &mut stalled),
+            "acquired",
+            "stalled process owns the store"
+        );
+        let probe = probe_writer(directory.path());
+        assert!(
+            probe.contains(&format!("{CHILD_SIGNAL_PREFIX}busy:")),
+            "a live owner that stops progressing still holds ownership: {probe}"
+        );
+        assert!(
+            stalled.try_wait().expect("poll stalled owner").is_none(),
+            "the stalled owner is still alive, so the kernel must keep its lock"
+        );
+        release_writer(input, &mut stalled);
+    }
+
+    #[test]
+    fn killed_owner_is_replaced_by_a_process_that_recovers_and_replays() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (mut owner, mut output, _input) = spawn_writer(directory.path(), "owner");
+        assert_eq!(
+            read_signal(&mut output, &mut owner),
+            "acquired",
+            "first process owns the store"
+        );
+        owner.kill().expect("kill owner");
+        owner.wait().expect("reap killed owner");
+
+        let executable = env::current_exe().expect("current test executable");
+        let replacement = Command::new(executable)
+            .arg("--exact")
+            .arg(CHILD_TEST)
+            .arg("--nocapture")
+            .env(CHILD_MODE_ENV, "recovery")
+            .env(CHILD_PATH_ENV, directory.path())
+            .output()
+            .expect("spawn replacement owner");
+        if !replacement.status.success() {
+            eprintln!(
+                "replacement owner failed: {}",
+                String::from_utf8_lossy(&replacement.stderr)
+            );
+        }
+        assert!(replacement.status.success(), "replacement owner failed");
+        let replacement_output = String::from_utf8(replacement.stdout).expect("replacement output");
+        assert!(
+            replacement_output.contains(&format!("{CHILD_SIGNAL_PREFIX}recovered")),
+            "new owner must verify and replay after the kill: {replacement_output}"
+        );
+
+        assert!(
+            directory.path().join("evidence.jsonl.lock").exists(),
+            "the stable lock file survives owner replacement and recovery"
+        );
+        let store =
+            EvidenceStore::new(directory.path(), "evidence.jsonl").expect("store after handover");
+        assert_eq!(
+            ids(&store.load().expect("reloaded extensions")),
+            vec![
+                extension(1, b"owner-payload").evidence_id,
+                extension(2, b"replay-payload").evidence_id,
+            ],
+            "the replaced owner's append and the replay are both durable"
         );
     }
 }
