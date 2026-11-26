@@ -32,6 +32,12 @@
 
 SHELL := /bin/bash
 
+# Added-line gates compare against a resolved commit, never a branch name.
+# If origin/main cannot be resolved the variable is empty and the q checker
+# fails closed instead of silently treating the diff as empty.
+Q_STYLE_BASE_SHA := $(shell git rev-parse --verify origin/main^{commit} 2>/dev/null)
+export Q_STYLE_BASE_SHA
+
 all: check
 
 help:
