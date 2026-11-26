@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["CapabilityError","CapabilityResolution","CapabilityState","CoverageRegistryError","EvidenceKind","PromotionDenial","PromotionError","RightsState"],"fn":["promote","promotion_error"],"struct":["CapabilityAssertion","CapabilityCoverageRegistry","CapabilityRegistry","EvidenceRef"]};

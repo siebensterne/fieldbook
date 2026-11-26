@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AuthorityKind","RegistryError","RegistryResolution"],"struct":["AuthorityAssertion","CountryPack","JurisdictionCode","MarketProductAssertion","MarketRegistry","SegmentAssertion","VenueAssertion"]};

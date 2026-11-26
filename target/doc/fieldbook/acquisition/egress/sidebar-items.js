@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EgressRoute","ProxyScheme"],"fn":["authorize_http_request","authorize_redirect_on","dispatch_http_request","http_client","http_client_with","http_client_with_authorized_redirects","http_client_with_request","http_request_for_plan_step"],"struct":["HttpEgressRequest","ProxyEndpoint","RouteProvenance"]};

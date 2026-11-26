@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["V1_OBSERVATION_SCHEMA_VERSION","V2_EVIDENCE_SCHEMA_VERSION"],"struct":["EvidenceEnvelope","ObservationBinding","PacketEvidence","PacketEvidenceExtension","VersionedEvidence"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["FORMAT_VERSION","IDENTITY_V2_DOMAIN","MAX_FIELD_BYTES"],"enum":["IdentityFormat","IdentityV2Error"],"fn":["derive_v2","detect_format","is_valid_class_token","parse_legacy_or_v2"],"struct":["FramedPreimage","IdentityRegistry","V2Identity"]};

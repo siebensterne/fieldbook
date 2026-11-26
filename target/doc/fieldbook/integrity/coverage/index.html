@@ -1,0 +1,40 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Per-symbol live-coverage certification for one aligned SBE capture."><title>fieldbook::integrity::coverage - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-0c87338a.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="fieldbook" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.1 (58cf8f9c3 2026-10-13)" data-channel="1.99.1" data-search-js="search-cf4fc35e.js" data-stringdex-js="stringdex-b5109af9.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-9f56287d.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module coverage</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../fieldbook/index.html">fieldbook</a><span class="version">0.3.0</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module coverage</a></h2><h3><a href="#">Sections</a></h3><ul class="block top-toc"><li><a href="#what-this-does-not-establish" title="What this does not establish">What this does not establish</a></li></ul><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li><li><a href="#constants" title="Constants">Constants</a></li><li><a href="#functions" title="Functions">Functions</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In fieldbook::<wbr>integrity</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">fieldbook</a>::<wbr><a href="../index.html">integrity</a></div><h1>Module <span>coverage</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/fieldbook/integrity/coverage.rs.html#1-538">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Per-symbol live-coverage certification for one aligned SBE capture.</p>
+<p><code>completeness</code> answers whether deltas arrived after a baseline. This report
+answers the question a live-evidence claim depends on: <strong>did every symbol
+the run was supposed to collect get subscribed and snapshot
+anchored?</strong> It compares three sets and cross-checks the capture against
+the run report’s writer counter (a truncated capture cannot certify as
+complete):</p>
+<ul>
+<li><strong>expected</strong>: the normalized symbols in the metadata sidecar written by
+the collector (<code>markets.json</code>);</li>
+<li><strong>acknowledged</strong>: the union of each worker’s last successfully applied
+subscription set, mapped from native identifiers through that sidecar;</li>
+<li><strong>anchored</strong>: symbols with at least one snapshot in the capture.</li>
+</ul>
+<p>The certificate is <code>valid</code> only when expected, acknowledged, and anchored
+agree for every expected symbol, with no duplicate expected entry, no
+acknowledged symbol outside the expected set, and a non-empty expected set.</p>
+<p>An empty-book snapshot counts as an anchor because the SBE snapshot still
+names the symbol and establishes the baseline. A symbol that appears only
+in price-level updates is reported under <code>observed_not_anchored</code> and is not
+anchored.</p>
+<p>Retired symbols are reported separately: a symbol that was captured before
+discovery removed it can appear in <code>anchored_not_expected</code> without
+invalidating the certificate, because the expected set is the final
+metadata and the central invariant is about that set.</p>
+<h3 id="what-this-does-not-establish"><a class="doc-anchor" href="#what-this-does-not-establish">§</a>What this does not establish</h3>
+<ul>
+<li>Venue wire acknowledgement. <code>acknowledged_symbols</code> records that the
+session successfully applied and transmitted a subscription request; the
+snapshot anchor is the independent proof that a book baseline arrived.</li>
+<li>That the venue delivered every event. Checksums and sequence continuity
+belong to <code>verify</code> and the raw-frame journal.</li>
+<li>That a periodic snapshot was generated from exchange state rather than
+synthesized locally. The collector only emits generated snapshots for a
+book that already accepted an exchange snapshot, so generated captures
+still imply a prior exchange anchor.</li>
+</ul>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.BoundedList.html" title="struct fieldbook::integrity::coverage::BoundedList">Bounded<wbr>List</a></dt><dd>An exact count plus a deterministic, bounded sample of the offending
+symbols.</dd><dt><a class="struct" href="struct.CoverageSummary.html" title="struct fieldbook::integrity::coverage::CoverageSummary">Coverage<wbr>Summary</a></dt><dd>Machine-readable coverage certificate for one capture.</dd></dl><h2 id="constants" class="section-header">Constants<a href="#constants" class="anchor">§</a></h2><dl class="item-table"><dt><a class="constant" href="constant.MAX_REPORTED_SYMBOLS.html" title="constant fieldbook::integrity::coverage::MAX_REPORTED_SYMBOLS">MAX_<wbr>REPORTED_<wbr>SYMBOLS</a></dt><dd>Cap on entries listed under each diagnostic. The counts stay exact; only
+the rendered sample is bounded so universe-scale reports remain readable.</dd></dl><h2 id="functions" class="section-header">Functions<a href="#functions" class="anchor">§</a></h2><dl class="item-table"><dt><a class="fn" href="fn.run.html" title="fn fieldbook::integrity::coverage::run">run</a></dt><dd>Certify one capture against its metadata sidecar and run report.</dd></dl></section></div></main></body></html>

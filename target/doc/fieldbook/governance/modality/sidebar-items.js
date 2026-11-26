@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AcquisitionModality"],"fn":["validate_modalities"],"struct":["AcquiredRecord","BatchCapability","BatchPage","DocumentCapability","DocumentRecord","OnChainCapability","SnapshotCapability","StreamingCapability"],"trait":["BatchConnector","DocumentConnector","OnChainConnector","SnapshotConnector","SourceLifecycle","StreamingConnector"]};

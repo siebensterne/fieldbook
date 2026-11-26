@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["AccessStatus","ManifestError","Protocol","SourceHealthState","Transport"],"struct":["HistoricalCapability","RecoveryCapability","RecoveryReport","SourceCapabilityManifest","SourceHealth","SourceRegistry","TimestampCapability"],"trait":["SourceConnector"]};

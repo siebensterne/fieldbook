@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ConnectionState","SupervisionDecision"],"struct":["ConnectionSupervisor","SupervisorPolicy"]};
