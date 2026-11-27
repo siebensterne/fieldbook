@@ -124,6 +124,8 @@ SOURCE_RESPONSIBILITIES = {
     "src/acquisition/packet.rs": "raw packet evidence with payload digests and explicit-source journal mapping",
     "src/acquisition/supervisor.rs": "typed connection supervision with bounded retry and backoff decisions",
     "src/governance/adapter.rs": "universal source connector contract, machine-readable capability manifest with declared modalities, source registry and protocol vocabulary",
+    "src/governance/connector_lifecycle.rs": "transport-independent connector lifecycle with rights-gated preflight, ordered phase transitions, quarantine branch, recorded decisions and replay verification",
+    "src/governance/source_event.rs": "versioned v1 source-event metadata envelope with canonical JSON SHA-256 digest, typed rejection reasons, quality and continuity rules, quarantine admission gate and per-session sequence monotonicity",
     "src/governance/modality.rs": "typed acquisition ports by modality, declared modality capabilities, validation and independent raw/record envelopes",
     "src/governance/coverage_certification.rs": "ordered coverage statuses, country dossiers, rights- and quality-gated certification and coverage matrix",
     "src/domain/event_model.rs": "universal typed event envelope with multi-role timestamps, provenance, quality state and domain payloads",
