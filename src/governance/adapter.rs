@@ -277,10 +277,11 @@ pub trait SourceConnector: Send + Sync {
     async fn disconnect(&mut self) -> Result<()>;
 }
 
-/// Registry of declared source capabilities.
+/// Registry of declared source capabilities and their enforceable grants.
 #[derive(Debug, Default)]
 pub struct SourceRegistry {
     manifests: BTreeMap<String, SourceCapabilityManifest>,
+    grants: BTreeMap<(String, SourceCapability), CapabilityGrant>,
 }
 
 impl SourceRegistry {
@@ -308,6 +309,283 @@ impl SourceRegistry {
     pub fn resolve(&self, source_id: &str) -> Option<&SourceCapabilityManifest> {
         self.manifests.get(source_id)
     }
+
+    /// Record one validated capability grant. A second grant for the same
+    /// subject and capability is refused so selection stays unambiguous.
+    pub fn grant(&mut self, grant: CapabilityGrant) -> Result<(), CapabilityDenial> {
+        grant.validate()?;
+        let key = (grant.subject.clone(), grant.capability);
+        if self.grants.contains_key(&key) {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "duplicate capability grant",
+            });
+        }
+        self.grants.insert(key, grant);
+        Ok(())
+    }
+
+    /// Record a revocation with its retained reason reference.
+    pub fn revoke(
+        &mut self,
+        subject: &str,
+        capability: SourceCapability,
+        reason_ref: &str,
+    ) -> Result<(), CapabilityDenial> {
+        if reason_ref.is_empty() {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "empty revocation reference",
+            });
+        }
+        let grant = self
+            .grants
+            .get_mut(&(subject.to_owned(), capability))
+            .ok_or(CapabilityDenial::Missing {
+                subject: subject.to_owned(),
+                capability,
+            })?;
+        grant.state = GrantState::Revoked {
+            reason_ref: reason_ref.to_owned(),
+        };
+        Ok(())
+    }
+
+    /// Enforced selection point for a source or target. Every requested
+    /// binding, the manifest declaration, the grant state and the validity
+    /// interval are checked before a manifest is returned. Unknown is denied.
+    pub fn select(
+        &self,
+        request: &SelectionRequest<'_>,
+    ) -> Result<&SourceCapabilityManifest, CapabilityDenial> {
+        let manifest = self
+            .resolve(request.subject)
+            .ok_or(CapabilityDenial::Incompatible {
+                reason: "unknown source identity",
+            })?;
+        if !request.capability.declared_by(manifest) {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "capability not declared",
+            });
+        }
+        let grant = self
+            .grants
+            .get(&(request.subject.to_owned(), request.capability))
+            .ok_or_else(|| CapabilityDenial::Missing {
+                subject: request.subject.to_owned(),
+                capability: request.capability,
+            })?;
+        if grant.actor != request.actor
+            || grant.subject != request.subject
+            || grant.action != request.action
+            || grant.resource != request.resource
+            || grant.scope != request.scope
+            || grant.policy_version != request.policy_version
+        {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "grant binding mismatch",
+            });
+        }
+        if let GrantState::Revoked { reason_ref } = &grant.state {
+            return Err(CapabilityDenial::Revoked {
+                reason_ref: reason_ref.clone(),
+            });
+        }
+        if request.at_us < grant.valid_from_us
+            || grant.valid_until_us.is_some_and(|end| request.at_us > end)
+        {
+            return Err(CapabilityDenial::Expired {
+                at_us: request.at_us,
+                valid_from_us: grant.valid_from_us,
+                valid_until_us: grant.valid_until_us,
+            });
+        }
+        Ok(manifest)
+    }
+}
+
+/// Named capability that a manifest may declare and a request may exercise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceCapability {
+    Streaming,
+    Snapshot,
+    Batch,
+    Document,
+    OnChain,
+    Historical,
+}
+
+impl SourceCapability {
+    /// Return the stable contract string for this capability.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Streaming => "streaming",
+            Self::Snapshot => "snapshot",
+            Self::Batch => "batch",
+            Self::Document => "document",
+            Self::OnChain => "on_chain",
+            Self::Historical => "historical",
+        }
+    }
+
+    /// Answer whether a manifest genuinely declares this capability.
+    pub fn declared_by(self, manifest: &SourceCapabilityManifest) -> bool {
+        match self {
+            Self::Streaming => {
+                manifest
+                    .modalities
+                    .contains(&AcquisitionModality::Streaming)
+                    && manifest.streaming.is_some()
+            }
+            Self::Snapshot => {
+                manifest.modalities.contains(&AcquisitionModality::Snapshot)
+                    && manifest.snapshot.is_some()
+            }
+            Self::Batch => {
+                manifest.modalities.contains(&AcquisitionModality::Batch)
+                    && manifest.batch.is_some()
+            }
+            Self::Document => {
+                manifest.modalities.contains(&AcquisitionModality::Document)
+                    && manifest.document.is_some()
+            }
+            Self::OnChain => {
+                manifest.modalities.contains(&AcquisitionModality::OnChain)
+                    && manifest.on_chain.is_some()
+            }
+            Self::Historical => manifest.historical.available,
+        }
+    }
+}
+
+/// Action a selection request performs on its resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityAction {
+    SelectSource,
+    SelectTarget,
+}
+
+/// Scope in which a capability grant is valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityScope {
+    Acquisition,
+    Distribution,
+}
+
+/// Reference to retained proof, never the proof bytes themselves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityEvidence {
+    pub digest: String,
+    pub origin: String,
+}
+
+impl CapabilityEvidence {
+    fn validate(&self) -> Result<(), CapabilityDenial> {
+        if self.digest.len() < 16 || !self.digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "invalid evidence digest",
+            });
+        }
+        if self.origin.is_empty() {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "missing evidence origin",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Lifecycle of a recorded grant. Revocation always carries a reason reference.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum GrantState {
+    Active,
+    Revoked { reason_ref: String },
+}
+
+/// Enforceable capability grant binding every party and condition of a choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityGrant {
+    pub actor: String,
+    pub subject: String,
+    pub capability: SourceCapability,
+    pub action: CapabilityAction,
+    pub resource: String,
+    pub scope: CapabilityScope,
+    pub policy_version: u32,
+    pub valid_from_us: i64,
+    pub valid_until_us: Option<i64>,
+    pub evidence: CapabilityEvidence,
+    pub state: GrantState,
+}
+
+impl CapabilityGrant {
+    /// Validate every binding, the policy version and the retained evidence.
+    pub fn validate(&self) -> Result<(), CapabilityDenial> {
+        if self.actor.is_empty() || self.subject.is_empty() || self.resource.is_empty() {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "empty grant binding",
+            });
+        }
+        if self.policy_version == 0 {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "zero policy version",
+            });
+        }
+        if self
+            .valid_until_us
+            .is_some_and(|end| self.valid_from_us > end)
+        {
+            return Err(CapabilityDenial::Expired {
+                at_us: self.valid_from_us,
+                valid_from_us: self.valid_from_us,
+                valid_until_us: self.valid_until_us,
+            });
+        }
+        self.evidence.validate()?;
+        if let GrantState::Revoked { reason_ref } = &self.state
+            && reason_ref.is_empty()
+        {
+            return Err(CapabilityDenial::Incompatible {
+                reason: "empty revocation reference",
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Explicit request made at the point a source or target is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionRequest<'a> {
+    pub actor: &'a str,
+    pub subject: &'a str,
+    pub capability: SourceCapability,
+    pub action: CapabilityAction,
+    pub resource: &'a str,
+    pub scope: CapabilityScope,
+    pub policy_version: u32,
+    pub at_us: i64,
+}
+
+/// Fail-closed reason a selection was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CapabilityDenial {
+    #[error("no capability grant for subject {subject} and capability {capability:?}")]
+    Missing {
+        subject: String,
+        capability: SourceCapability,
+    },
+    #[error("capability expired at {at_us}; valid from {valid_from_us} until {valid_until_us:?}")]
+    Expired {
+        at_us: i64,
+        valid_from_us: i64,
+        valid_until_us: Option<i64>,
+    },
+    #[error("capability grant was revoked: {reason_ref}")]
+    Revoked { reason_ref: String },
+    #[error("capability is incompatible with the selection request: {reason}")]
+    Incompatible { reason: &'static str },
 }
 
 #[cfg(test)]
@@ -392,6 +670,185 @@ mod tests {
             registry.resolve("source"),
             Some(&manifest()),
             "original manifest must remain"
+        );
+    }
+
+    fn evidence() -> CapabilityEvidence {
+        CapabilityEvidence {
+            digest: "0123456789abcdef".to_owned(),
+            origin: "retained-proof-store".to_owned(),
+        }
+    }
+
+    fn grant() -> CapabilityGrant {
+        CapabilityGrant {
+            actor: "actor-a".to_owned(),
+            subject: "source".to_owned(),
+            capability: SourceCapability::Streaming,
+            action: CapabilityAction::SelectSource,
+            resource: "target-a".to_owned(),
+            scope: CapabilityScope::Acquisition,
+            policy_version: 1,
+            valid_from_us: 10,
+            valid_until_us: Some(20),
+            evidence: evidence(),
+            state: GrantState::Active,
+        }
+    }
+
+    fn request() -> SelectionRequest<'static> {
+        SelectionRequest {
+            actor: "actor-a",
+            subject: "source",
+            capability: SourceCapability::Streaming,
+            action: CapabilityAction::SelectSource,
+            resource: "target-a",
+            scope: CapabilityScope::Acquisition,
+            policy_version: 1,
+            at_us: 15,
+        }
+    }
+
+    #[test]
+    fn compatible_grant_permits_selection() {
+        let mut registry = SourceRegistry::new();
+        registry.register(manifest()).expect("manifest");
+        registry.grant(grant()).expect("grant");
+        assert_eq!(
+            registry.select(&request()),
+            Ok(&manifest()),
+            "a manifest-declared capability with a matching grant permits selection"
+        );
+    }
+
+    #[test]
+    fn missing_capability_grant_is_rejected_at_selection() {
+        let mut registry = SourceRegistry::new();
+        registry.register(manifest()).expect("manifest");
+        assert_eq!(
+            registry.select(&request()),
+            Err(CapabilityDenial::Missing {
+                subject: "source".to_owned(),
+                capability: SourceCapability::Streaming,
+            }),
+            "selection without a recorded grant must fail closed"
+        );
+    }
+
+    #[test]
+    fn expired_capability_grant_is_rejected_at_selection() {
+        let mut registry = SourceRegistry::new();
+        registry.register(manifest()).expect("manifest");
+        registry.grant(grant()).expect("grant");
+        let mut late = request();
+        late.at_us = 21;
+        assert!(
+            matches!(
+                registry.select(&late),
+                Err(CapabilityDenial::Expired { at_us: 21, .. })
+            ),
+            "a request after the validity interval must be refused"
+        );
+        let mut early = request();
+        early.at_us = 9;
+        assert!(
+            matches!(
+                registry.select(&early),
+                Err(CapabilityDenial::Expired { at_us: 9, .. })
+            ),
+            "a request before the validity interval must be refused"
+        );
+    }
+
+    #[test]
+    fn revoked_capability_grant_is_rejected_at_selection() {
+        let mut registry = SourceRegistry::new();
+        registry.register(manifest()).expect("manifest");
+        registry.grant(grant()).expect("grant");
+        registry
+            .revoke("source", SourceCapability::Streaming, "proof-of-revocation")
+            .expect("revocation");
+        assert_eq!(
+            registry.select(&request()),
+            Err(CapabilityDenial::Revoked {
+                reason_ref: "proof-of-revocation".to_owned(),
+            }),
+            "a revoked grant must fail closed with its reason reference"
+        );
+    }
+
+    #[test]
+    fn incompatible_grant_bindings_are_rejected_at_selection() {
+        for label in ["actor", "action", "resource", "scope", "policy_version"] {
+            let mut registry = SourceRegistry::new();
+            registry.register(manifest()).expect("manifest");
+            registry.grant(grant()).expect("grant");
+            let mut selection = request();
+            match label {
+                "actor" => selection.actor = "actor-b",
+                "action" => selection.action = CapabilityAction::SelectTarget,
+                "resource" => selection.resource = "target-b",
+                "scope" => selection.scope = CapabilityScope::Distribution,
+                "policy_version" => selection.policy_version = 2,
+                _ => {}
+            }
+            assert_eq!(
+                registry.select(&selection),
+                Err(CapabilityDenial::Incompatible {
+                    reason: "grant binding mismatch",
+                }),
+                "binding {label} must be enforced at selection"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_capability_is_never_supported() {
+        let mut registry = SourceRegistry::new();
+        registry.register(manifest()).expect("manifest");
+        let mut undeclared = grant();
+        undeclared.capability = SourceCapability::OnChain;
+        registry.grant(undeclared).expect("grant");
+        let mut undeclared_request = request();
+        undeclared_request.capability = SourceCapability::OnChain;
+        assert_eq!(
+            registry.select(&undeclared_request),
+            Err(CapabilityDenial::Incompatible {
+                reason: "capability not declared",
+            }),
+            "an undeclared capability must never be treated as supported"
+        );
+        let mut unknown = request();
+        unknown.subject = "missing-source";
+        assert_eq!(
+            registry.select(&unknown),
+            Err(CapabilityDenial::Incompatible {
+                reason: "unknown source identity",
+            }),
+            "an unknown source must never be treated as supported"
+        );
+    }
+
+    #[test]
+    fn malformed_grant_is_refused_at_registration() {
+        let mut registry = SourceRegistry::new();
+        let mut without_evidence = grant();
+        without_evidence.evidence.digest.clear();
+        assert_eq!(
+            registry.grant(without_evidence),
+            Err(CapabilityDenial::Incompatible {
+                reason: "invalid evidence digest",
+            }),
+            "a grant without a retained evidence reference must be refused"
+        );
+        let mut zero_policy = grant();
+        zero_policy.policy_version = 0;
+        assert_eq!(
+            registry.grant(zero_policy),
+            Err(CapabilityDenial::Incompatible {
+                reason: "zero policy version",
+            }),
+            "a grant without a policy version must be refused"
         );
     }
 }
