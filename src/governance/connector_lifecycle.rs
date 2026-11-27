@@ -14,9 +14,11 @@
 //! expired or out of scope. No capture transition is possible before a
 //! successful preflight decision.
 
-use std::{collections::BTreeSet, fmt};
+use std::collections::BTreeSet;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// Exact denial code for rights evidence that is unknown, missing, expired or
 /// out of scope.

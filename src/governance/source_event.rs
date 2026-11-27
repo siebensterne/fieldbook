@@ -13,9 +13,11 @@
 //! value. A digest is never synthesized by a reader; a producer may call
 //! [`SourceEventEnvelope::seal`] to set it before publishing the metadata.
 
-use std::{collections::BTreeMap, fmt};
+use std::collections::BTreeMap;
+use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::util::sha256_hex;
 
