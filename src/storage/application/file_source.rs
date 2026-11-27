@@ -442,6 +442,395 @@ pub enum ResumeError {
     TargetMismatch { expected: String, found: String },
 }
 
+/// Explicit reference to the checkpoint that precedes a stream checkpoint.
+pub const GENESIS_CHECKPOINT: &str = "genesis";
+
+/// Schema version of the extended stream checkpoint binding.
+pub const STREAM_CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+
+/// One ordered mutation in a replayable journal. Sequences and physical offsets
+/// are supplied explicitly so restoration can refuse a non-contiguous tail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalEvent {
+    pub sequence: u64,
+    pub offset: u64,
+    pub mutation: Mutation,
+}
+
+/// Mutation carried by one journal event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Mutation {
+    Put { key: String, value: i64 },
+    Delete { key: String },
+    NoOp,
+}
+
+/// Complete deterministic state reconstructed from a journal prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ReplayedState {
+    pub values: BTreeMap<String, i64>,
+    pub applied: Vec<u64>,
+    pub last_offset: u64,
+}
+
+impl ReplayedState {
+    /// Apply one ordered event, refusing a gap or a non-advancing offset.
+    fn apply(&mut self, event: &JournalEvent) -> Result<(), ReplayError> {
+        let previous = self.applied.last().copied();
+        if previous.is_some_and(|last| event.sequence != last.saturating_add(1)) {
+            return Err(ReplayError::NonContiguous {
+                expected: previous.map(|last| last.saturating_add(1)),
+                found: event.sequence,
+            });
+        }
+        if event.offset <= self.last_offset {
+            return Err(ReplayError::OffsetNotAdvancing {
+                previous: self.last_offset,
+                found: event.offset,
+            });
+        }
+        match &event.mutation {
+            Mutation::Put { key, value } => {
+                let _ = self.values.insert(key.clone(), *value);
+            }
+            Mutation::Delete { key } => {
+                let _ = self.values.remove(key);
+            }
+            Mutation::NoOp => {}
+        }
+        self.applied.push(event.sequence);
+        self.last_offset = event.offset;
+        Ok(())
+    }
+
+    /// Stable digest over every reconstructed field.
+    pub fn digest(&self) -> String {
+        let mut text = String::new();
+        let _ = FmtWrite::write_fmt(&mut text, format_args!("offset:{};", self.last_offset));
+        for (key, value) in &self.values {
+            let _ = FmtWrite::write_fmt(&mut text, format_args!("{key}={value};"));
+        }
+        for sequence in &self.applied {
+            let _ = FmtWrite::write_fmt(&mut text, format_args!("seq:{sequence};"));
+        }
+        SourceFingerprint::compute(text.as_bytes())
+            .as_str()
+            .to_owned()
+    }
+}
+
+/// Fail-closed reason a journal replay was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ReplayError {
+    #[error("journal sequence {found} is not contiguous after {expected:?}")]
+    NonContiguous { expected: Option<u64>, found: u64 },
+    #[error("journal offset {found} does not advance past {previous}")]
+    OffsetNotAdvancing { previous: u64, found: u64 },
+    #[error("journal replay interrupted at event {at}")]
+    Interrupted { at: usize },
+}
+
+fn apply_events(
+    state: &mut ReplayedState,
+    events: &[JournalEvent],
+    interrupt_at: Option<usize>,
+) -> Result<(), ReplayError> {
+    for (index, event) in events.iter().enumerate() {
+        if interrupt_at == Some(index) {
+            return Err(ReplayError::Interrupted { at: index });
+        }
+        state.apply(event)?;
+    }
+    Ok(())
+}
+
+/// Deterministic digest of a journal head over sequence, offset and mutation.
+#[must_use]
+pub fn journal_head_digest(events: &[JournalEvent]) -> String {
+    let mut text = String::new();
+    for event in events {
+        let _ = FmtWrite::write_fmt(
+            &mut text,
+            format_args!("{}:{}:{:?};", event.sequence, event.offset, event.mutation),
+        );
+    }
+    SourceFingerprint::compute(text.as_bytes())
+        .as_str()
+        .to_owned()
+}
+
+/// Replay a complete journal prefix J0:n into reconstructed state.
+pub fn replay(events: &[JournalEvent]) -> Result<ReplayedState, ReplayError> {
+    replay_with_interrupt(events, None)
+}
+
+/// Replay with an explicit interruption point for fail-closed testing.
+pub fn replay_with_interrupt(
+    events: &[JournalEvent],
+    interrupt_at: Option<usize>,
+) -> Result<ReplayedState, ReplayError> {
+    let mut state = ReplayedState::default();
+    apply_events(&mut state, events, interrupt_at)?;
+    Ok(state)
+}
+
+/// Checkpoint bound to a stream identity, partition, epoch, journal head and
+/// reconstructed state. It is additive to the legacy `CheckpointBinding`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamCheckpoint {
+    pub binding: CheckpointBinding,
+    pub partition: String,
+    pub owner_epoch: u64,
+    pub schema_version: u32,
+    pub last_sequence: u64,
+    pub last_offset: u64,
+    pub previous_checkpoint: String,
+    pub journal_head_digest: String,
+    pub state: ReplayedState,
+    pub state_digest: String,
+}
+
+impl StreamCheckpoint {
+    /// Build a checkpoint for J0:n. Every binding must be present; an
+    /// interruption at any named stage returns an error and emits no checkpoint.
+    pub fn create(
+        binding: CheckpointBinding,
+        partition: &str,
+        owner_epoch: u64,
+        previous_checkpoint: String,
+        events: &[JournalEvent],
+        interrupted_after: Option<&'static str>,
+    ) -> Result<Self, CheckpointError> {
+        if interrupted_after == Some("binding") {
+            return Err(CheckpointError::Interrupted { field: "binding" });
+        }
+        if binding.source_id.is_empty()
+            || binding.source_fingerprint.is_empty()
+            || binding.target_id.is_empty()
+        {
+            return Err(CheckpointError::Incomplete { field: "binding" });
+        }
+        if interrupted_after == Some("partition") {
+            return Err(CheckpointError::Interrupted { field: "partition" });
+        }
+        if partition.is_empty() {
+            return Err(CheckpointError::Incomplete { field: "partition" });
+        }
+        if interrupted_after == Some("owner_epoch") {
+            return Err(CheckpointError::Interrupted {
+                field: "owner_epoch",
+            });
+        }
+        if owner_epoch == 0 {
+            return Err(CheckpointError::Incomplete {
+                field: "owner_epoch",
+            });
+        }
+        if previous_checkpoint.is_empty() {
+            return Err(CheckpointError::Incomplete {
+                field: "previous_checkpoint",
+            });
+        }
+        let state = replay(events)?;
+        if interrupted_after == Some("state") {
+            return Err(CheckpointError::Interrupted { field: "state" });
+        }
+        let last_sequence: u64 = state.applied.last().copied().unwrap_or_default();
+        let last_offset = state.last_offset;
+        let state_digest = state.digest();
+        if interrupted_after == Some("journal_head") {
+            return Err(CheckpointError::Interrupted {
+                field: "journal_head",
+            });
+        }
+        Ok(Self {
+            binding,
+            partition: partition.to_owned(),
+            owner_epoch,
+            schema_version: STREAM_CHECKPOINT_SCHEMA_VERSION,
+            last_sequence,
+            last_offset,
+            previous_checkpoint,
+            journal_head_digest: journal_head_digest(events),
+            state,
+            state_digest,
+        })
+    }
+
+    /// Stable identity of this checkpoint, suitable as a predecessor reference.
+    pub fn digest(&self) -> String {
+        let mut text = String::new();
+        let _ = FmtWrite::write_fmt(
+            &mut text,
+            format_args!(
+                "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                self.binding.source_id,
+                self.binding.source_fingerprint,
+                self.binding.target_id,
+                self.partition,
+                self.owner_epoch,
+                self.schema_version,
+                self.last_sequence,
+                self.last_offset,
+                self.previous_checkpoint,
+                self.journal_head_digest,
+                self.state_digest
+            ),
+        );
+        SourceFingerprint::compute(text.as_bytes())
+            .as_str()
+            .to_owned()
+    }
+
+    /// Advance to the next checkpoint with an explicit predecessor reference.
+    pub fn advance(
+        &self,
+        previous_checkpoint: String,
+        events: &[JournalEvent],
+    ) -> Result<Self, CheckpointError> {
+        Self::create(
+            self.binding.clone(),
+            &self.partition,
+            self.owner_epoch,
+            previous_checkpoint,
+            events,
+            None,
+        )
+    }
+}
+
+/// Fail-closed reason a checkpoint or restore was refused.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CheckpointError {
+    #[error("checkpoint is incomplete: {field}")]
+    Incomplete { field: &'static str },
+    #[error("checkpoint creation interrupted before {field}")]
+    Interrupted { field: &'static str },
+    #[error("checkpoint schema version {found} is unsupported (expected {expected})")]
+    UnsupportedSchemaVersion { found: u32, expected: u32 },
+    #[error("checkpoint stream binding does not match the requested stream")]
+    BindingMismatch,
+    #[error("checkpoint partition {expected} does not match {found}")]
+    PartitionMismatch { expected: String, found: String },
+    #[error("checkpoint owner epoch {expected} does not match {found}")]
+    OwnerEpochMismatch { expected: u64, found: u64 },
+    #[error("journal head digest mismatch at sequence {sequence}")]
+    JournalHeadMismatch { sequence: u64 },
+    #[error("reconstructed state digest mismatch at sequence {sequence}")]
+    StateDigestMismatch { sequence: u64 },
+    #[error("multiple checkpoints are eligible; refusing to choose a largest offset")]
+    AmbiguousCheckpoints,
+    #[error("checkpoint replay failed: {0}")]
+    Replay(#[from] ReplayError),
+}
+
+/// Restore state from Kn and the tail Jn+1:m, verifying every bound field.
+pub fn restore(
+    checkpoint: &StreamCheckpoint,
+    binding: &CheckpointBinding,
+    partition: &str,
+    owner_epoch: u64,
+    prefix: &[JournalEvent],
+    tail: &[JournalEvent],
+) -> Result<ReplayedState, CheckpointError> {
+    restore_with_interrupt(
+        checkpoint,
+        binding,
+        partition,
+        owner_epoch,
+        prefix,
+        tail,
+        None,
+    )
+}
+
+/// Restore with an explicit interruption point for fail-closed testing.
+pub fn restore_with_interrupt(
+    checkpoint: &StreamCheckpoint,
+    binding: &CheckpointBinding,
+    partition: &str,
+    owner_epoch: u64,
+    prefix: &[JournalEvent],
+    tail: &[JournalEvent],
+    interrupt_at: Option<usize>,
+) -> Result<ReplayedState, CheckpointError> {
+    if checkpoint.schema_version != STREAM_CHECKPOINT_SCHEMA_VERSION {
+        return Err(CheckpointError::UnsupportedSchemaVersion {
+            found: checkpoint.schema_version,
+            expected: STREAM_CHECKPOINT_SCHEMA_VERSION,
+        });
+    }
+    if checkpoint.binding != *binding
+        || checkpoint.previous_checkpoint.is_empty()
+        || checkpoint.journal_head_digest.is_empty()
+        || checkpoint.state_digest.is_empty()
+    {
+        return Err(CheckpointError::BindingMismatch);
+    }
+    if checkpoint.partition != partition {
+        return Err(CheckpointError::PartitionMismatch {
+            expected: checkpoint.partition.clone(),
+            found: partition.to_owned(),
+        });
+    }
+    if checkpoint.owner_epoch != owner_epoch {
+        return Err(CheckpointError::OwnerEpochMismatch {
+            expected: checkpoint.owner_epoch,
+            found: owner_epoch,
+        });
+    }
+    if journal_head_digest(prefix) != checkpoint.journal_head_digest {
+        return Err(CheckpointError::JournalHeadMismatch {
+            sequence: checkpoint.last_sequence,
+        });
+    }
+    match prefix.last() {
+        Some(event)
+            if event.sequence == checkpoint.last_sequence
+                && event.offset == checkpoint.last_offset => {}
+        Some(_) => {
+            return Err(CheckpointError::JournalHeadMismatch {
+                sequence: checkpoint.last_sequence,
+            });
+        }
+        None if checkpoint.last_sequence == 0 && checkpoint.last_offset == 0 => {}
+        None => {
+            return Err(CheckpointError::JournalHeadMismatch {
+                sequence: checkpoint.last_sequence,
+            });
+        }
+    }
+    if checkpoint.state.digest() != checkpoint.state_digest {
+        return Err(CheckpointError::StateDigestMismatch {
+            sequence: checkpoint.last_sequence,
+        });
+    }
+    let mut state = checkpoint.state.clone();
+    apply_events(&mut state, tail, interrupt_at)?;
+    Ok(state)
+}
+
+/// Restore from exactly one eligible checkpoint. Two candidates are ambiguous
+/// and must never resolve to the largest offset.
+pub fn restore_from_candidates(
+    checkpoints: &[StreamCheckpoint],
+    binding: &CheckpointBinding,
+    partition: &str,
+    owner_epoch: u64,
+    prefix: &[JournalEvent],
+    tail: &[JournalEvent],
+) -> Result<ReplayedState, CheckpointError> {
+    let mut eligible = checkpoints.iter();
+    let first = eligible.next().ok_or(CheckpointError::Incomplete {
+        field: "checkpoint",
+    })?;
+    if eligible.next().is_some() {
+        return Err(CheckpointError::AmbiguousCheckpoints);
+    }
+    restore(first, binding, partition, owner_epoch, prefix, tail)
+}
+
 /// Explicit duplicate-id policy. A repeated record id is always rejected with
 /// evidence (sequence, line, first line and exact bytes) rather than silently
 /// skipped, so every physical line remains accountable.
@@ -1060,5 +1449,281 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(registry.resolve("fixture"), Some(&first));
         assert!(registry.resolve("missing").is_none());
+    }
+
+    fn journal() -> Vec<JournalEvent> {
+        (1..=6_u64)
+            .map(|sequence| JournalEvent {
+                sequence,
+                offset: sequence * 32,
+                mutation: if sequence == 4 {
+                    Mutation::Delete {
+                        key: "key-2".to_owned(),
+                    }
+                } else if sequence % 2 == 0 {
+                    Mutation::NoOp
+                } else {
+                    Mutation::Put {
+                        key: format!("key-{sequence}"),
+                        value: i64::try_from(sequence).expect("small sequence"),
+                    }
+                },
+            })
+            .collect()
+    }
+
+    fn binding() -> CheckpointBinding {
+        CheckpointBinding {
+            source_id: "stream-a".to_owned(),
+            source_fingerprint: "sha256:0123456789abcdef".to_owned(),
+            target_id: "target-a".to_owned(),
+        }
+    }
+
+    fn checkpoint_at(events: &[JournalEvent]) -> StreamCheckpoint {
+        StreamCheckpoint::create(
+            binding(),
+            "partition-a",
+            7,
+            GENESIS_CHECKPOINT.to_owned(),
+            events,
+            None,
+        )
+        .expect("checkpoint")
+    }
+
+    #[test]
+    fn replay_equals_restore_across_complete_state() {
+        let events = journal();
+        let boundary = 4;
+        let prefix = &events[..boundary];
+        let tail = &events[boundary..];
+        let checkpoint = checkpoint_at(prefix);
+
+        let replayed = replay(&events).expect("full replay");
+        let restored =
+            restore(&checkpoint, &binding(), "partition-a", 7, prefix, tail).expect("restore");
+
+        assert_eq!(
+            replayed, restored,
+            "replay and restore must agree on every field"
+        );
+        assert_eq!(
+            replayed.digest(),
+            restored.digest(),
+            "replay and restore must agree on the state digest"
+        );
+        assert_eq!(
+            checkpoint.journal_head_digest,
+            journal_head_digest(prefix),
+            "checkpoint must bind the journal head it was created from"
+        );
+        assert_eq!(
+            checkpoint.state_digest,
+            replay(prefix).expect("prefix replay").digest(),
+            "checkpoint must bind the reconstructed state digest"
+        );
+        assert_eq!(
+            checkpoint.last_sequence, 4,
+            "checkpoint must bind its terminal sequence"
+        );
+        assert_eq!(
+            checkpoint.last_offset, 128,
+            "checkpoint must bind its terminal physical offset"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_a_wrong_stream_partition_or_owner_epoch() {
+        let events = journal();
+        let checkpoint = checkpoint_at(&events[..4]);
+        let mut other_binding = binding();
+        other_binding.target_id = "target-b".to_owned();
+        assert!(
+            matches!(
+                restore(
+                    &checkpoint,
+                    &other_binding,
+                    "partition-a",
+                    7,
+                    &events[..4],
+                    &events[4..]
+                ),
+                Err(CheckpointError::BindingMismatch)
+            ),
+            "a different stream target must be refused"
+        );
+        assert!(
+            matches!(
+                restore(
+                    &checkpoint,
+                    &binding(),
+                    "partition-b",
+                    7,
+                    &events[..4],
+                    &events[4..]
+                ),
+                Err(CheckpointError::PartitionMismatch { .. })
+            ),
+            "a different partition must be refused"
+        );
+        assert!(
+            matches!(
+                restore(
+                    &checkpoint,
+                    &binding(),
+                    "partition-a",
+                    8,
+                    &events[..4],
+                    &events[4..]
+                ),
+                Err(CheckpointError::OwnerEpochMismatch { .. })
+            ),
+            "a different owner epoch must be refused"
+        );
+        assert!(
+            matches!(
+                restore(
+                    &checkpoint,
+                    &binding(),
+                    "partition-a",
+                    7,
+                    &events[..5],
+                    &events[5..]
+                ),
+                Err(CheckpointError::JournalHeadMismatch { .. })
+            ),
+            "a different journal prefix must be refused"
+        );
+    }
+
+    #[test]
+    fn restore_does_not_silently_choose_the_largest_offset() {
+        let events = journal();
+        let earlier = checkpoint_at(&events[..3]);
+        let later = checkpoint_at(&events[..5]);
+        let candidates = [earlier, later];
+        assert_eq!(
+            restore_from_candidates(
+                &candidates,
+                &binding(),
+                "partition-a",
+                7,
+                &events[..5],
+                &events[5..]
+            ),
+            Err(CheckpointError::AmbiguousCheckpoints),
+            "two eligible checkpoints must never resolve to the largest offset"
+        );
+        assert!(
+            matches!(
+                restore(
+                    &candidates[0],
+                    &binding(),
+                    "partition-a",
+                    7,
+                    &events[..5],
+                    &events[5..]
+                ),
+                Err(CheckpointError::JournalHeadMismatch { .. })
+            ),
+            "a checkpoint must not advance to a longer journal prefix on its own"
+        );
+        assert!(
+            matches!(
+                restore(
+                    &candidates[0],
+                    &binding(),
+                    "partition-a",
+                    7,
+                    &events[..3],
+                    &events[5..]
+                ),
+                Err(CheckpointError::Replay(ReplayError::NonContiguous { .. }))
+            ),
+            "a gap in the tail must not be skipped"
+        );
+    }
+
+    #[test]
+    fn interrupted_checkpoint_creation_fails_closed() {
+        let events = journal();
+        for field in [
+            "binding",
+            "partition",
+            "owner_epoch",
+            "state",
+            "journal_head",
+        ] {
+            let outcome = StreamCheckpoint::create(
+                binding(),
+                "partition-a",
+                7,
+                GENESIS_CHECKPOINT.to_owned(),
+                &events[..4],
+                Some(field),
+            );
+            assert_eq!(
+                outcome,
+                Err(CheckpointError::Interrupted { field }),
+                "interruption at {field} must not emit a checkpoint"
+            );
+        }
+        let mut incomplete = binding();
+        incomplete.source_fingerprint.clear();
+        assert_eq!(
+            StreamCheckpoint::create(
+                incomplete,
+                "partition-a",
+                7,
+                GENESIS_CHECKPOINT.to_owned(),
+                &events[..4],
+                None
+            ),
+            Err(CheckpointError::Incomplete { field: "binding" }),
+            "a checkpoint without a stream binding must be refused"
+        );
+    }
+
+    #[test]
+    fn interrupted_replay_and_restore_fail_closed() {
+        let events = journal();
+        assert_eq!(
+            replay_with_interrupt(&events, Some(2)),
+            Err(ReplayError::Interrupted { at: 2 }),
+            "an interrupted replay must not return partial state"
+        );
+        assert!(
+            replay(&events).is_ok(),
+            "an uninterrupted replay of the same journal must succeed"
+        );
+        let checkpoint = checkpoint_at(&events[..4]);
+        assert!(
+            matches!(
+                restore_with_interrupt(
+                    &checkpoint,
+                    &binding(),
+                    "partition-a",
+                    7,
+                    &events[..4],
+                    &events[4..],
+                    Some(1)
+                ),
+                Err(CheckpointError::Replay(ReplayError::Interrupted { at: 1 }))
+            ),
+            "an interrupted restore must not return partial state"
+        );
+        assert!(
+            restore(
+                &checkpoint,
+                &binding(),
+                "partition-a",
+                7,
+                &events[..4],
+                &events[4..]
+            )
+            .is_ok(),
+            "an uninterrupted restore of the same input must succeed"
+        );
     }
 }
