@@ -41,6 +41,7 @@ pub enum SourceEventReason {
     InvalidConnectionEpoch,
     InvalidReceiveTime,
     InvalidProviderSequence,
+    InvalidSourceTimestamp,
     InvalidDigestFormat,
     EnvelopeDigestMismatch,
     InvalidQualityState,
@@ -67,6 +68,7 @@ impl SourceEventReason {
             Self::InvalidConnectionEpoch => "INVALID_CONNECTION_EPOCH",
             Self::InvalidReceiveTime => "INVALID_RECEIVE_TIME",
             Self::InvalidProviderSequence => "INVALID_PROVIDER_SEQUENCE",
+            Self::InvalidSourceTimestamp => "INVALID_SOURCE_TIMESTAMP",
             Self::InvalidDigestFormat => "INVALID_DIGEST_FORMAT",
             Self::EnvelopeDigestMismatch => "ENVELOPE_DIGEST_MISMATCH",
             Self::InvalidQualityState => "INVALID_QUALITY_STATE",
@@ -218,6 +220,44 @@ fn from_serde_error(error: serde_json::Error) -> SourceEventError {
     SourceEventError::new(reason, field)
 }
 
+/// Widened probe used only after the typed parse has already failed. It never
+/// replaces that parse: duplicate, unknown and missing members have been
+/// rejected by it first. `i128` accepts negative and wide integers so the
+/// offending field can be named with its normative code.
+#[derive(Deserialize)]
+struct IntegerProbe {
+    #[serde(default)]
+    connection_epoch: Option<i128>,
+    #[serde(default)]
+    provider_sequence: Option<i128>,
+    #[serde(default)]
+    source_timestamp_ns: Option<i128>,
+}
+
+fn invalid_integer_error(input: &str) -> Option<SourceEventError> {
+    let probe = serde_json::from_str::<IntegerProbe>(input).ok()?;
+    let is_out_of_u64 = |value: Option<i128>| value.is_some_and(|v| u64::try_from(v).is_err());
+    if is_out_of_u64(probe.connection_epoch) {
+        return Some(SourceEventError::new(
+            SourceEventReason::InvalidConnectionEpoch,
+            "connection_epoch",
+        ));
+    }
+    if is_out_of_u64(probe.provider_sequence) {
+        return Some(SourceEventError::new(
+            SourceEventReason::InvalidProviderSequence,
+            "provider_sequence",
+        ));
+    }
+    if is_out_of_u64(probe.source_timestamp_ns) {
+        return Some(SourceEventError::new(
+            SourceEventReason::InvalidSourceTimestamp,
+            "source_timestamp_ns",
+        ));
+    }
+    None
+}
+
 impl SourceEventEnvelope {
     /// Canonical JSON of all fields except `envelope_digest`.
     ///
@@ -276,7 +316,14 @@ impl SourceEventEnvelope {
     /// Returns the typed rejection for any invalid field. There is no partial
     /// envelope on failure.
     pub fn from_json(input: &str) -> Result<Self, SourceEventError> {
-        let event: Self = serde_json::from_str(input).map_err(from_serde_error)?;
+        let event: Self = serde_json::from_str(input).map_err(|error| {
+            if error.to_string().contains("expected u64")
+                && let Some(invalid) = invalid_integer_error(input)
+            {
+                return invalid;
+            }
+            from_serde_error(error)
+        })?;
         event.validate()?;
         Ok(event)
     }
@@ -667,7 +714,7 @@ mod tests {
             error.reason_code(),
             "NON_MONOTONIC_CAPTURE_SEQUENCE",
             "zero capture sequence has its own code"
-        );
+        ); // capture zero has a distinct code
         let mut canonical_zero = base_event();
         canonical_zero.canonical_sequence = 0;
         let error = canonical_zero
@@ -677,7 +724,7 @@ mod tests {
             error.reason_code(),
             "NON_MONOTONIC_CANONICAL_SEQUENCE",
             "zero canonical sequence has its own code"
-        );
+        ); // canonical zero has a distinct code
     }
 
     #[test]
@@ -829,6 +876,41 @@ mod tests {
             json.contains("\"provider_sequence\":null"),
             "absence is encoded as null, never as a number"
         );
+    }
+
+    #[test]
+    fn out_of_range_integers_map_to_field_normative_codes() {
+        let base = serde_json::to_string(&sample()).expect("serializable sample");
+        let cases = [
+            (
+                base.replace("\"connection_epoch\":7", "\"connection_epoch\":-1"),
+                "INVALID_CONNECTION_EPOCH",
+                "connection_epoch",
+            ),
+            (
+                base.replace("\"provider_sequence\":null", "\"provider_sequence\":-1"),
+                "INVALID_PROVIDER_SEQUENCE",
+                "provider_sequence",
+            ),
+            (
+                base.replace(
+                    "\"source_timestamp_ns\":1700000000000000000",
+                    "\"source_timestamp_ns\":-1",
+                ),
+                "INVALID_SOURCE_TIMESTAMP",
+                "source_timestamp_ns",
+            ),
+        ];
+        for (json, code, field) in cases {
+            let error = SourceEventEnvelope::from_json(&json)
+                .expect_err("a negative u64 field is rejected on decode");
+            assert_eq!(
+                error.reason_code(),
+                code,
+                "the normative code names the field"
+            );
+            assert_eq!(error.field, field, "the offending field is named");
+        }
     }
 
     #[test]

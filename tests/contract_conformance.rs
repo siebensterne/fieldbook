@@ -65,32 +65,25 @@ fn every_golden_v1_fixture_conforms() {
 
     let mut seen = BTreeSet::new();
     for file in manifest.files {
-        assert!(
-            seen.insert(file.id.clone()),
-            "fixture ids are unique: {}",
-            file.id
-        );
+        let duplicate_message = format!("fixture id {} appears twice", file.id);
+        assert!(seen.insert(file.id.clone()), "{duplicate_message}");
         let file_name = Path::new(&file.path)
             .file_name()
             .expect("each manifest path names a fixture file");
         let bytes = fs::read(fixtures_dir.join(file_name))
             .expect("each manifest-listed fixture file is present");
-        assert_eq!(
-            sha256_hex(&bytes),
-            file.sha256,
-            "{} is byte-identical to the canonical fixture",
-            file.id
-        );
+        let digest_message = format!("{} bytes match the manifest", file.id);
+        assert_eq!(sha256_hex(&bytes), file.sha256, "{digest_message}");
         let fixture: Fixture = serde_json::from_slice(&bytes).expect("each fixture is valid JSON");
         assert_eq!(fixture.id, file.id, "fixture and manifest ids agree");
         assert_eq!(
             fixture.expect, file.expectations,
             "fixture and manifest expectations agree"
         );
+        let mode_message = format!("{} declares a supported mode", fixture.id);
         assert!(
             fixture.mode == "events" || fixture.mode == "raw",
-            "{} declares a supported mode",
-            fixture.id
+            "{mode_message}"
         );
 
         let inputs: Vec<String> = if fixture.mode == "events" {
@@ -102,12 +95,8 @@ fn every_golden_v1_fixture_conforms() {
         } else {
             fixture.raw_events.clone()
         };
-        assert_eq!(
-            inputs.len(),
-            fixture.expect.len(),
-            "{} has one expectation per event",
-            fixture.id
-        );
+        let count_message = format!("{} has one expectation per event", fixture.id);
+        assert_eq!(inputs.len(), fixture.expect.len(), "{count_message}");
 
         // Ledgers are scoped to (source_id, session_ref) and shared across the
         // ordered event list of one fixture; they start empty per fixture.
@@ -116,22 +105,20 @@ fn every_golden_v1_fixture_conforms() {
             let outcome =
                 SourceEventEnvelope::from_json(input).and_then(|event| ledger.admit(&event));
             match (expectation.accepted, expectation.rejected_code.as_deref()) {
-                (Some(true), None) => assert!(
-                    outcome.is_ok(),
-                    "{} event {} must be accepted: {:?}",
-                    fixture.id,
-                    index,
-                    outcome
-                ),
+                (Some(true), None) => {
+                    let accept_message = format!(
+                        "{} event {} must be accepted: {:?}",
+                        fixture.id, index, outcome
+                    );
+                    assert!(outcome.is_ok(), "{accept_message}");
+                }
                 (None, Some(code)) => {
                     let error = outcome.expect_err("a rejected fixture event must be rejected");
-                    assert_eq!(
-                        error.reason_code(),
-                        code,
+                    let code_message = format!(
                         "{} event {} has the exact normative code",
-                        fixture.id,
-                        index
+                        fixture.id, index
                     );
+                    assert_eq!(error.reason_code(), code, "{code_message}");
                 }
                 _ => panic!("{} event {} has an invalid expectation", fixture.id, index),
             }

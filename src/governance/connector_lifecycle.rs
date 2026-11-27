@@ -1143,11 +1143,12 @@ mod tests {
                 &request(OperationScope::DecodeTransform),
             )
             .expect_err("even a valid preflight cannot restore a denied scope");
+        let expected_phase = ConnectorState::Decode;
         assert_eq!(
             replayed.state(),
-            ConnectorState::Decode,
+            expected_phase,
             "the replayed phase is unchanged"
-        );
+        ); // denial left the phase alone
     }
 
     #[test]
