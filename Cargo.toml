@@ -106,6 +106,13 @@ name = "postgres_batch_live"
 [[test]]
 name = "postgres_live"
 
+# Neutral pipeline benchmark harness. `harness = false` leaves control to the
+# binary so it can emit a machine-readable JSON artifact and expose
+# `--self-test`. No dependency is added; the harness uses the standard library.
+[[bench]]
+name = "neutral_pipeline"
+harness = false
+
 # Debug information is only needed for workspace frames. Dependencies never
 # need DWARF here, and line tables keep backtraces usable for workspace code.
 # This cuts both compile time and the size of the target directory.
