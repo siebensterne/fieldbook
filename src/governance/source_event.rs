@@ -12,6 +12,10 @@
 //! keys sorted lexicographically, no whitespace, `null` for an absent optional
 //! value. A digest is never synthesized by a reader; a producer may call
 //! [`SourceEventEnvelope::seal`] to set it before publishing the metadata.
+//!
+//! Rejections expose the normative v1 reason codes from the source-event
+//! contract. Internal Rust variants may be finer grained, but
+//! [`SourceEventReason::as_str`] is the stable external vocabulary.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -26,12 +30,12 @@ pub const SOURCE_EVENT_SCHEMA_VERSION: u32 = 1;
 
 /// Stable reason codes for source-event rejection.
 ///
-/// The strings returned by [`Self::as_str`] are part of the audit contract and
-/// do not change with display wording.
+/// The strings returned by [`Self::as_str`] are the normative v1 codes and are
+/// part of the audit contract; they do not change with display wording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceEventReason {
     UnsupportedSchemaVersion,
-    MissingField,
+    UnknownOrMissingMember,
     MalformedJson,
     EmptyString,
     InvalidConnectionEpoch,
@@ -39,36 +43,40 @@ pub enum SourceEventReason {
     InvalidProviderSequence,
     InvalidDigestFormat,
     EnvelopeDigestMismatch,
+    InvalidQualityState,
+    InvalidContinuityState,
     ValidatedRequiresDecoderVersion,
     ValidatedRequiresReferenceDataRevision,
     ValidatedContinuityRequired,
     QuarantinedNotAdmittable,
-    SequenceNotIncreasing,
+    NonMonotonicCaptureSequence,
+    NonMonotonicCanonicalSequence,
     CanonicalizationFailed,
 }
 
 impl SourceEventReason {
-    /// Stable machine-readable reason code.
+    /// Stable machine-readable normative v1 reason code.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::UnsupportedSchemaVersion => "UNSUPPORTED_SCHEMA_VERSION",
-            Self::MissingField => "MISSING_FIELD",
-            Self::MalformedJson => "MALFORMED_JSON",
-            Self::EmptyString => "EMPTY_STRING",
+            Self::UnsupportedSchemaVersion => "SCHEMA_VERSION_MISMATCH",
+            Self::UnknownOrMissingMember | Self::MalformedJson | Self::CanonicalizationFailed => {
+                "UNKNOWN_OR_MISSING_MEMBER"
+            }
+            Self::EmptyString => "EMPTY_REQUIRED_STRING",
             Self::InvalidConnectionEpoch => "INVALID_CONNECTION_EPOCH",
             Self::InvalidReceiveTime => "INVALID_RECEIVE_TIME",
             Self::InvalidProviderSequence => "INVALID_PROVIDER_SEQUENCE",
             Self::InvalidDigestFormat => "INVALID_DIGEST_FORMAT",
             Self::EnvelopeDigestMismatch => "ENVELOPE_DIGEST_MISMATCH",
-            Self::ValidatedRequiresDecoderVersion => "VALIDATED_REQUIRES_DECODER_VERSION",
-            Self::ValidatedRequiresReferenceDataRevision => {
-                "VALIDATED_REQUIRES_REFERENCE_DATA_REVISION"
-            }
-            Self::ValidatedContinuityRequired => "VALIDATED_CONTINUITY_REQUIRED",
-            Self::QuarantinedNotAdmittable => "QUARANTINED_NOT_ADMITTED",
-            Self::SequenceNotIncreasing => "SEQUENCE_NOT_INCREASING",
-            Self::CanonicalizationFailed => "CANONICALIZATION_FAILED",
+            Self::InvalidQualityState => "INVALID_QUALITY_STATE",
+            Self::InvalidContinuityState => "INVALID_CONTINUITY_STATE",
+            Self::ValidatedRequiresDecoderVersion
+            | Self::ValidatedRequiresReferenceDataRevision => "VALIDATED_MISSING_REVISIONS",
+            Self::ValidatedContinuityRequired => "VALIDATED_CONTINUITY_UNRESOLVED",
+            Self::QuarantinedNotAdmittable => "QUARANTINED_NOT_ADMISSIBLE",
+            Self::NonMonotonicCaptureSequence => "NON_MONOTONIC_CAPTURE_SEQUENCE",
+            Self::NonMonotonicCanonicalSequence => "NON_MONOTONIC_CANONICAL_SEQUENCE",
         }
     }
 }
@@ -95,7 +103,7 @@ impl SourceEventError {
         }
     }
 
-    /// Stable reason code of this rejection.
+    /// Stable normative reason code of this rejection.
     #[must_use]
     pub const fn reason_code(&self) -> &'static str {
         self.reason.as_str()
@@ -174,28 +182,6 @@ pub struct SourceEventEnvelope {
     pub continuity_state: ContinuityState,
 }
 
-/// Every field required by the v1 wire shape.
-const REQUIRED_FIELDS: [&str; 18] = [
-    "schema_version",
-    "source_id",
-    "source_product_ref",
-    "session_ref",
-    "decoder_version",
-    "reference_data_revision",
-    "rights_evidence_ref",
-    "connection_epoch",
-    "capture_sequence",
-    "canonical_sequence",
-    "provider_sequence",
-    "source_timestamp_ns",
-    "receive_utc_ns",
-    "receive_monotonic_ns",
-    "raw_frame_digest",
-    "envelope_digest",
-    "quality_state",
-    "continuity_state",
-];
-
 fn is_digest(text: &str) -> bool {
     text.len() == 64
         && text
@@ -203,12 +189,41 @@ fn is_digest(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Name of the field a serde error refers to, if it names one.
+fn serde_error_field(message: &str) -> String {
+    message.split('`').nth(1).unwrap_or("json").to_owned()
+}
+
+/// Classify a typed-deserialization failure without ever collapsing the input
+/// into a `serde_json::Value` (which would silently discard duplicate members).
+fn from_serde_error(error: serde_json::Error) -> SourceEventError {
+    let message = error.to_string();
+    let reason = if message.contains("duplicate field")
+        || message.contains("missing field")
+        || message.contains("unknown field")
+    {
+        SourceEventReason::UnknownOrMissingMember
+    } else if message.contains("unknown variant") && message.contains("`CAPTURED`") {
+        SourceEventReason::InvalidQualityState
+    } else if message.contains("unknown variant") && message.contains("`CONTINUOUS`") {
+        SourceEventReason::InvalidContinuityState
+    } else {
+        SourceEventReason::MalformedJson
+    };
+    let field = match reason {
+        SourceEventReason::InvalidQualityState => "quality_state".to_owned(),
+        SourceEventReason::InvalidContinuityState => "continuity_state".to_owned(),
+        _ => serde_error_field(&message),
+    };
+    SourceEventError::new(reason, field)
+}
+
 impl SourceEventEnvelope {
     /// Canonical JSON of all fields except `envelope_digest`.
     ///
     /// A `BTreeMap` is used instead of relying on the serializer's map
     /// ordering, so sorted keys hold even when `serde_json` is built with the
-    /// `preserve_order` feature.
+    /// `preserve_order` feature. This is the unchanged v1 digest input.
     ///
     /// # Errors
     /// Returns [`SourceEventReason::CanonicalizationFailed`] if the value
@@ -250,32 +265,18 @@ impl SourceEventEnvelope {
         Ok(self)
     }
 
-    /// Decode a complete v1 envelope and validate it before returning.
-    /// Missing fields are rejected explicitly; unknown fields are rejected by
-    /// `serde(deny_unknown_fields)`.
+    /// Decode a complete v1 envelope into the typed struct and validate it.
+    ///
+    /// Parsing goes straight into [`SourceEventEnvelope`]: `deny_unknown_fields`
+    /// rejects extra members and serde rejects duplicate members instead of
+    /// letting a later `Value` parse overwrite them. The digest is then built
+    /// from the serialized typed fields, preserving the v1 wire shape.
     ///
     /// # Errors
     /// Returns the typed rejection for any invalid field. There is no partial
     /// envelope on failure.
     pub fn from_json(input: &str) -> Result<Self, SourceEventError> {
-        let value: serde_json::Value = serde_json::from_str(input)
-            .map_err(|_| SourceEventError::new(SourceEventReason::MalformedJson, "json"))?;
-        let Some(object) = value.as_object() else {
-            return Err(SourceEventError::new(
-                SourceEventReason::MalformedJson,
-                "json",
-            ));
-        };
-        for field in REQUIRED_FIELDS {
-            if !object.contains_key(field) {
-                return Err(SourceEventError::new(
-                    SourceEventReason::MissingField,
-                    (*field).to_owned(),
-                ));
-            }
-        }
-        let event: Self = serde_json::from_value(value)
-            .map_err(|_| SourceEventError::new(SourceEventReason::MalformedJson, "json"))?;
+        let event: Self = serde_json::from_str(input).map_err(from_serde_error)?;
         event.validate()?;
         Ok(event)
     }
@@ -327,6 +328,20 @@ impl SourceEventEnvelope {
             return Err(SourceEventError::new(
                 SourceEventReason::InvalidConnectionEpoch,
                 "connection_epoch",
+            ));
+        }
+        // A zero sequence is never a valid starting watermark: reject it
+        // before any ledger can record a high-water mark.
+        if self.capture_sequence == 0 {
+            return Err(SourceEventError::new(
+                SourceEventReason::NonMonotonicCaptureSequence,
+                "capture_sequence",
+            ));
+        }
+        if self.canonical_sequence == 0 {
+            return Err(SourceEventError::new(
+                SourceEventReason::NonMonotonicCanonicalSequence,
+                "canonical_sequence",
             ));
         }
         if self.receive_utc_ns == 0 || self.receive_monotonic_ns == 0 {
@@ -398,49 +413,60 @@ impl SourceEventEnvelope {
     }
 }
 
-/// Per-session monotonicity of `capture_sequence` and `canonical_sequence`.
+/// Monotonicity of `capture_sequence` and `canonical_sequence` per
+/// `(source_id, session_ref)` scope.
 ///
 /// State changes only after the whole event passes admission; a rejection
-/// leaves the recorded high-water marks untouched.
+/// leaves the recorded high-water marks untouched. Two sources that share one
+/// session therefore keep independent histories.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionSequences {
-    last: BTreeMap<String, (u64, u64)>,
+    last: BTreeMap<(String, String), (u64, u64)>,
 }
 
 impl SessionSequences {
-    /// Empty session tracker.
+    /// Empty sequence tracker.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Admit one event into a session and advance its high-water marks.
+    /// Admit one event into its `(source_id, session_ref)` scope and advance
+    /// that scope's high-water marks.
     ///
     /// # Errors
-    /// Returns the typed rejection with [`SourceEventReason::SequenceNotIncreasing`]
-    /// when either sequence repeats or decreases, or the event-level rejection
-    /// when the event itself is not admissible.
+    /// Returns [`SourceEventReason::NonMonotonicCaptureSequence`] or
+    /// [`SourceEventReason::NonMonotonicCanonicalSequence`] when the relevant
+    /// sequence repeats or decreases, or the event-level rejection when the
+    /// event itself is not admissible. Rejections never touch a watermark.
     pub fn admit(&mut self, event: &SourceEventEnvelope) -> Result<(), SourceEventError> {
         event.admission()?;
-        if let Some((capture, canonical)) = self.last.get(&event.session_ref).copied()
-            && (event.capture_sequence <= capture || event.canonical_sequence <= canonical)
-        {
-            return Err(SourceEventError::new(
-                SourceEventReason::SequenceNotIncreasing,
-                "session_ref",
-            ));
+        let key = (event.source_id.clone(), event.session_ref.clone());
+        if let Some((capture, canonical)) = self.last.get(&key).copied() {
+            if event.capture_sequence <= capture {
+                return Err(SourceEventError::new(
+                    SourceEventReason::NonMonotonicCaptureSequence,
+                    "capture_sequence",
+                ));
+            }
+            if event.canonical_sequence <= canonical {
+                return Err(SourceEventError::new(
+                    SourceEventReason::NonMonotonicCanonicalSequence,
+                    "canonical_sequence",
+                ));
+            }
         }
-        self.last.insert(
-            event.session_ref.clone(),
-            (event.capture_sequence, event.canonical_sequence),
-        );
+        self.last
+            .insert(key, (event.capture_sequence, event.canonical_sequence));
         Ok(())
     }
 
-    /// Highest admitted pair for one session, if any.
+    /// Highest admitted pair for one `(source_id, session_ref)` scope, if any.
     #[must_use]
-    pub fn last(&self, session_ref: &str) -> Option<(u64, u64)> {
-        self.last.get(session_ref).copied()
+    pub fn last(&self, source_id: &str, session_ref: &str) -> Option<(u64, u64)> {
+        self.last
+            .get(&(source_id.to_owned(), session_ref.to_owned()))
+            .copied()
     }
 }
 
@@ -513,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_field_is_rejected_without_partial_acceptance() {
+    fn missing_field_is_rejected_with_the_normative_code() {
         let mut value: serde_json::Value =
             serde_json::to_value(sample()).expect("serializable sample");
         value
@@ -523,11 +549,52 @@ mod tests {
         let json = serde_json::to_string(&value).expect("serializable value");
         let error = SourceEventEnvelope::from_json(&json).expect_err("missing field is rejected");
         assert_eq!(
-            error.reason,
-            SourceEventReason::MissingField,
-            "reason is stable"
+            error.reason_code(),
+            "UNKNOWN_OR_MISSING_MEMBER",
+            "missing member maps to the normative code"
         );
         assert_eq!(error.field, "source_id", "the absent field is named");
+    }
+
+    #[test]
+    fn duplicate_member_is_rejected_before_digest_recomputation() {
+        let json = format!(
+            "{{\"schema_version\":1,\"source_id\":\"a\",\"source_id\":\"a\",\
+             \"source_product_ref\":\"p\",\"session_ref\":\"s\",\
+             \"decoder_version\":\"d\",\"reference_data_revision\":\"r\",\
+             \"rights_evidence_ref\":\"e\",\"connection_epoch\":1,\
+             \"capture_sequence\":1,\"canonical_sequence\":1,\
+             \"provider_sequence\":null,\"source_timestamp_ns\":null,\
+             \"receive_utc_ns\":1,\"receive_monotonic_ns\":1,\
+             \"raw_frame_digest\":\"{}\",\"envelope_digest\":\"{}\",\
+             \"quality_state\":\"CAPTURED\",\"continuity_state\":\"CONTINUOUS\"}}",
+            "a".repeat(64),
+            "0".repeat(64)
+        );
+        let error = SourceEventEnvelope::from_json(&json)
+            .expect_err("a duplicate member is never silently overwritten");
+        assert_eq!(
+            error.reason_code(),
+            "UNKNOWN_OR_MISSING_MEMBER",
+            "duplicate member maps to the normative code"
+        );
+    }
+
+    #[test]
+    fn unknown_member_is_rejected_with_the_normative_code() {
+        let mut value: serde_json::Value =
+            serde_json::to_value(sample()).expect("serializable sample");
+        value
+            .as_object_mut()
+            .expect("object value")
+            .insert("extra".to_owned(), serde_json::json!(1));
+        let json = serde_json::to_string(&value).expect("serializable value");
+        let error = SourceEventEnvelope::from_json(&json).expect_err("unknown member is rejected");
+        assert_eq!(
+            error.reason_code(),
+            "UNKNOWN_OR_MISSING_MEMBER",
+            "unknown member maps to the normative code"
+        );
     }
 
     #[test]
@@ -550,9 +617,9 @@ mod tests {
             .validate()
             .expect_err("uppercase hex is not a valid digest");
         assert_eq!(
-            error.reason,
-            SourceEventReason::InvalidDigestFormat,
-            "uppercase digest has the format reason"
+            error.reason_code(),
+            "INVALID_DIGEST_FORMAT",
+            "uppercase digest has the format code"
         );
         let mut short = sample();
         short.envelope_digest = "a".repeat(63);
@@ -573,9 +640,9 @@ mod tests {
         event.receive_monotonic_ns = 0;
         let error = event.validate().expect_err("zero epoch is rejected");
         assert_eq!(
-            error.reason,
-            SourceEventReason::InvalidConnectionEpoch,
-            "zero epoch has a stable reason"
+            error.reason_code(),
+            "INVALID_CONNECTION_EPOCH",
+            "zero epoch has a stable code"
         );
         let mut event = base_event();
         event.receive_monotonic_ns = 0;
@@ -583,9 +650,33 @@ mod tests {
             .validate()
             .expect_err("zero monotonic receive time is rejected");
         assert_eq!(
-            error.reason,
-            SourceEventReason::InvalidReceiveTime,
-            "zero monotonic receive time has a stable reason"
+            error.reason_code(),
+            "INVALID_RECEIVE_TIME",
+            "zero monotonic receive time has a stable code"
+        );
+    }
+
+    #[test]
+    fn zero_sequences_are_rejected_with_distinct_normative_codes() {
+        let mut capture_zero = base_event();
+        capture_zero.capture_sequence = 0;
+        let error = capture_zero
+            .validate()
+            .expect_err("a zero capture sequence is rejected");
+        assert_eq!(
+            error.reason_code(),
+            "NON_MONOTONIC_CAPTURE_SEQUENCE",
+            "zero capture sequence has its own code"
+        );
+        let mut canonical_zero = base_event();
+        canonical_zero.canonical_sequence = 0;
+        let error = canonical_zero
+            .validate()
+            .expect_err("a zero canonical sequence is rejected");
+        assert_eq!(
+            error.reason_code(),
+            "NON_MONOTONIC_CANONICAL_SEQUENCE",
+            "zero canonical sequence has its own code"
         );
     }
 
@@ -595,43 +686,124 @@ mod tests {
         let first = sample();
         tracker.admit(&first).expect("first event is admitted");
         assert_eq!(
-            tracker.last("session-a"),
+            tracker.last("source-a", "session-a"),
             Some((10, 20)),
             "high-water marks are recorded"
         );
         let error = tracker.admit(&first).expect_err("duplicate is rejected");
         assert_eq!(
-            error.reason,
-            SourceEventReason::SequenceNotIncreasing,
-            "duplicate has a stable reason"
+            error.reason_code(),
+            "NON_MONOTONIC_CAPTURE_SEQUENCE",
+            "a repeated capture sequence has its own code"
         );
         assert_eq!(
-            tracker.last("session-a"),
+            tracker.last("source-a", "session-a"),
             Some((10, 20)),
             "a rejected event does not advance state"
         );
-        let mut decreasing = base_event();
-        decreasing.capture_sequence = 9;
-        decreasing.canonical_sequence = 19;
-        let decreasing = decreasing.seal().expect("decreasing event seals");
+        let mut decreasing_canonical = base_event();
+        decreasing_canonical.capture_sequence = 11;
+        decreasing_canonical.canonical_sequence = 19;
+        let decreasing_canonical = decreasing_canonical
+            .seal()
+            .expect("decreasing canonical event seals");
         let error = tracker
-            .admit(&decreasing)
-            .expect_err("decrease is rejected");
+            .admit(&decreasing_canonical)
+            .expect_err("a decrease is rejected");
         assert_eq!(
-            error.reason,
-            SourceEventReason::SequenceNotIncreasing,
-            "decreasing sequences have a stable reason"
+            error.reason_code(),
+            "NON_MONOTONIC_CANONICAL_SEQUENCE",
+            "a repeated canonical sequence has its own code"
         );
-        let mut other = base_event();
-        other.session_ref = "session-b".to_owned();
-        let other = other.seal().expect("other session event seals");
+        let mut other_session = base_event();
+        other_session.session_ref = "session-b".to_owned();
+        let other_session = other_session.seal().expect("other session event seals");
         tracker
-            .admit(&other)
+            .admit(&other_session)
             .expect("another session has its own order");
         assert_eq!(
-            tracker.last("session-b"),
+            tracker.last("source-a", "session-b"),
             Some((10, 20)),
             "sessions are tracked independently"
+        );
+    }
+
+    #[test]
+    fn rejected_event_does_not_advance_the_watermark() {
+        let mut tracker = SessionSequences::new();
+        let first = sample();
+        tracker.admit(&first).expect("first event is admitted");
+
+        let mut quarantined = base_event();
+        quarantined.capture_sequence = 11;
+        quarantined.canonical_sequence = 21;
+        quarantined.quality_state = QualityState::Quarantined;
+        let quarantined = quarantined.seal().expect("quarantined record seals");
+        let error = tracker
+            .admit(&quarantined)
+            .expect_err("a quarantined record is not admitted");
+        assert_eq!(
+            error.reason_code(),
+            "QUARANTINED_NOT_ADMISSIBLE",
+            "quarantine blocks admission"
+        );
+        assert_eq!(
+            tracker.last("source-a", "session-a"),
+            Some((10, 20)),
+            "a rejected record leaves the watermark untouched"
+        );
+
+        let mut next = base_event();
+        next.capture_sequence = 11;
+        next.canonical_sequence = 21;
+        let next = next.seal().expect("the next event seals");
+        tracker
+            .admit(&next)
+            .expect("the rejected record did not consume sequence 11/21");
+        assert_eq!(
+            tracker.last("source-a", "session-a"),
+            Some((11, 21)),
+            "the same sequences advance after a clean admission"
+        );
+    }
+
+    #[test]
+    fn two_sources_sharing_a_session_have_independent_histories() {
+        let mut tracker = SessionSequences::new();
+        let mut source_a = base_event();
+        source_a.source_id = "source-a".to_owned();
+        let source_a = source_a.seal().expect("source a seals");
+        let mut source_b = base_event();
+        source_b.source_id = "source-b".to_owned();
+        let source_b = source_b.seal().expect("source b seals");
+        tracker
+            .admit(&source_a)
+            .expect("source a starts its history");
+        tracker
+            .admit(&source_b)
+            .expect("source b starts the same history independently");
+        assert_eq!(
+            tracker.last("source-a", "session-a"),
+            Some((10, 20)),
+            "source a has its own watermark"
+        );
+        assert_eq!(
+            tracker.last("source-b", "session-a"),
+            Some((10, 20)),
+            "source b has the same watermark in the same session"
+        );
+        let mut source_b_next = base_event();
+        source_b_next.source_id = "source-b".to_owned();
+        source_b_next.capture_sequence = 11;
+        source_b_next.canonical_sequence = 21;
+        let source_b_next = source_b_next.seal().expect("source b next seals");
+        tracker
+            .admit(&source_b_next)
+            .expect("source b advances without affecting source a");
+        assert_eq!(
+            tracker.last("source-a", "session-a"),
+            Some((10, 20)),
+            "source a is unchanged"
         );
     }
 
@@ -643,9 +815,9 @@ mod tests {
             .validate()
             .expect_err("provider sequence zero is rejected");
         assert_eq!(
-            error.reason,
-            SourceEventReason::InvalidProviderSequence,
-            "zero provider sequence has a stable reason"
+            error.reason_code(),
+            "INVALID_PROVIDER_SEQUENCE",
+            "zero provider sequence has a stable code"
         );
         assert_eq!(
             error.field, "provider_sequence",
@@ -660,6 +832,42 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_required_strings_are_empty() {
+        let mut source_id = base_event();
+        source_id.source_id = "   ".to_owned();
+        let mut product_ref = base_event();
+        product_ref.source_product_ref = " \t ".to_owned();
+        let mut session_ref = base_event();
+        session_ref.session_ref = "\n".to_owned();
+        let mut rights_ref = base_event();
+        rights_ref.rights_evidence_ref = "   ".to_owned();
+        let mut decoder = base_event();
+        decoder.quality_state = QualityState::Captured;
+        decoder.decoder_version = "   ".to_owned();
+        let mut revision = base_event();
+        revision.quality_state = QualityState::Captured;
+        revision.reference_data_revision = "   ".to_owned();
+        let cases = [
+            (source_id, "source_id"),
+            (product_ref, "source_product_ref"),
+            (session_ref, "session_ref"),
+            (rights_ref, "rights_evidence_ref"),
+            (decoder, "decoder_version"),
+            (revision, "reference_data_revision"),
+        ];
+        for (event, field) in cases {
+            let error = event
+                .validate()
+                .expect_err("a whitespace-only required string is rejected");
+            assert_eq!(
+                error.reason_code(),
+                "EMPTY_REQUIRED_STRING",
+                "{field} treats whitespace as empty"
+            );
+        }
+    }
+
+    #[test]
     fn empty_rights_evidence_ref_is_rejected() {
         let mut event = base_event();
         event.rights_evidence_ref = String::new();
@@ -667,9 +875,9 @@ mod tests {
             .validate()
             .expect_err("empty rights reference is rejected");
         assert_eq!(
-            error.reason,
-            SourceEventReason::EmptyString,
-            "empty rights reference has a stable reason"
+            error.reason_code(),
+            "EMPTY_REQUIRED_STRING",
+            "empty rights reference has the normative code"
         );
         assert_eq!(
             error.field, "rights_evidence_ref",
@@ -685,9 +893,9 @@ mod tests {
             .validate()
             .expect_err("VALIDATED needs a reference data revision");
         assert_eq!(
-            error.reason,
-            SourceEventReason::ValidatedRequiresReferenceDataRevision,
-            "the VALIDATED-specific reason wins"
+            error.reason_code(),
+            "VALIDATED_MISSING_REVISIONS",
+            "the VALIDATED-specific code wins"
         );
         let mut event = base_event();
         event.decoder_version = String::new();
@@ -695,34 +903,26 @@ mod tests {
             .validate()
             .expect_err("VALIDATED needs a decoder version");
         assert_eq!(
-            error.reason,
-            SourceEventReason::ValidatedRequiresDecoderVersion,
+            error.reason_code(),
+            "VALIDATED_MISSING_REVISIONS",
             "decoder version is required for VALIDATED"
         );
     }
 
     #[test]
     fn validated_with_gap_or_unknown_continuity_is_rejected() {
-        let mut event = base_event();
-        event.continuity_state = ContinuityState::GapSuspected;
-        let error = event
-            .validate()
-            .expect_err("VALIDATED cannot claim a suspected gap");
-        assert_eq!(
-            error.reason,
-            SourceEventReason::ValidatedContinuityRequired,
-            "gap suspicion blocks VALIDATED"
-        );
-        let mut event = base_event();
-        event.continuity_state = ContinuityState::Unknown;
-        let error = event
-            .validate()
-            .expect_err("VALIDATED cannot claim unknown continuity");
-        assert_eq!(
-            error.reason,
-            SourceEventReason::ValidatedContinuityRequired,
-            "unknown continuity blocks VALIDATED"
-        );
+        for continuity in [ContinuityState::GapSuspected, ContinuityState::Unknown] {
+            let mut event = base_event();
+            event.continuity_state = continuity;
+            let error = event
+                .validate()
+                .expect_err("unresolved continuity is never admitted as VALIDATED");
+            assert_eq!(
+                error.reason_code(),
+                "VALIDATED_CONTINUITY_UNRESOLVED",
+                "unresolved continuity has the normative code"
+            );
+        }
     }
 
     #[test]
@@ -737,7 +937,7 @@ mod tests {
         let error = event.admission().expect_err("quarantine blocks admission");
         assert_eq!(
             error.reason_code(),
-            "QUARANTINED_NOT_ADMITTED",
+            "QUARANTINED_NOT_ADMISSIBLE",
             "quarantine denial has a stable code"
         );
         let mut tracker = SessionSequences::new();
@@ -745,10 +945,14 @@ mod tests {
             .admit(&event)
             .expect_err("tracker also blocks quarantine");
         assert_eq!(
-            error.reason,
-            SourceEventReason::QuarantinedNotAdmittable,
+            error.reason_code(),
+            "QUARANTINED_NOT_ADMISSIBLE",
             "the tracker uses the same admission rule"
         );
-        assert_eq!(tracker.last("session-a"), None, "no state was changed");
+        assert_eq!(
+            tracker.last("source-a", "session-a"),
+            None,
+            "no state was changed"
+        );
     }
 }
