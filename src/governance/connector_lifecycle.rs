@@ -317,7 +317,10 @@ impl ConnectorLifecycle {
 
     /// Consume operation-level rights evidence and record the decision.
     ///
-    /// A denial leaves `rights_admitted` false; it never advances the phase.
+    /// A denial immediately clears any earlier admission and never advances
+    /// the phase. Capture stays impossible until a fresh valid preflight
+    /// succeeds. Preflight may be repeated at a later phase; its log record
+    /// names the phase where it actually ran.
     ///
     /// # Errors
     /// Returns the fail-closed denial from [`evaluate_preflight`].
@@ -331,15 +334,9 @@ impl ConnectorLifecycle {
             Ok(()) => (DecisionKind::Admitted, None),
             Err(error) => (DecisionKind::Denied, Some(error.reason)),
         };
-        self.record(
-            ConnectorState::Preflight,
-            ConnectorState::Preflight,
-            kind,
-            reason_code,
-        );
-        if outcome.is_ok() {
-            self.rights_admitted = true;
-        }
+        let phase = self.state;
+        self.record(phase, phase, kind, reason_code);
+        self.rights_admitted = outcome.is_ok();
         outcome
     }
 
@@ -398,13 +395,15 @@ impl ConnectorLifecycle {
             }
             match record.kind {
                 DecisionKind::Admitted => {
-                    if record.to != ConnectorState::Preflight || lifecycle.rights_admitted {
-                        return Err(Self::mismatch("preflight admission is not repeatable"));
+                    if record.to != record.from || record.reason_code.is_some() {
+                        return Err(Self::mismatch("preflight admission changed the phase"));
                     }
                     lifecycle.rights_admitted = true;
                 }
                 DecisionKind::Advanced => {
-                    if decide_transition(record.from, record.to, lifecycle.rights_admitted).is_err()
+                    if record.reason_code.is_some()
+                        || decide_transition(record.from, record.to, lifecycle.rights_admitted)
+                            .is_err()
                     {
                         return Err(Self::mismatch("advanced transition is not legal"));
                     }
@@ -419,12 +418,24 @@ impl ConnectorLifecycle {
                     };
                     match reason {
                         LifecycleReason::RightsNotAdmitted => {
-                            if record.from != ConnectorState::Preflight {
-                                return Err(Self::mismatch("rights denial outside preflight"));
+                            lifecycle.rights_admitted = false;
+                        }
+                        LifecycleReason::CaptureBeforePreflight => {
+                            match decide_transition(
+                                record.from,
+                                ConnectorState::Capture,
+                                lifecycle.rights_admitted,
+                            ) {
+                                Err(error)
+                                    if error.reason == LifecycleReason::CaptureBeforePreflight => {}
+                                _ => {
+                                    return Err(Self::mismatch(
+                                        "capture denial is not reproducible",
+                                    ));
+                                }
                             }
                         }
-                        LifecycleReason::InvalidTransition
-                        | LifecycleReason::CaptureBeforePreflight => {
+                        LifecycleReason::InvalidTransition => {
                             if decide_transition(record.from, record.to, lifecycle.rights_admitted)
                                 .is_ok()
                             {
@@ -749,6 +760,189 @@ mod tests {
             error.reason,
             LifecycleReason::LogMismatch,
             "stable replay reason"
+        );
+    }
+
+    #[test]
+    fn denial_after_admission_clears_rights_at_every_later_phase() {
+        let phases = [
+            ConnectorState::Connect,
+            ConnectorState::Discover,
+            ConnectorState::Subscribe,
+            ConnectorState::Capture,
+            ConnectorState::Decode,
+            ConnectorState::Validate,
+            ConnectorState::Archive,
+            ConnectorState::Publish,
+        ];
+        for phase in phases {
+            let mut lifecycle = ConnectorLifecycle::new();
+            lifecycle
+                .preflight(Some(&admitted_evidence()), &request())
+                .expect("the first preflight is admitted");
+            for target in phases.iter().take_while(|candidate| **candidate != phase) {
+                lifecycle
+                    .transition(*target)
+                    .expect("ordered transition succeeds");
+            }
+            lifecycle
+                .transition(phase)
+                .expect("the target phase is reachable");
+            assert_eq!(
+                lifecycle.state(),
+                phase,
+                "the machine reached the target phase"
+            );
+
+            let mut expired = admitted_evidence();
+            expired.valid_until_utc_ns = Some(request().observed_at_utc_ns);
+            let error = lifecycle
+                .preflight(Some(&expired), &request())
+                .expect_err("expired evidence is denied at every later phase");
+            assert_eq!(
+                error.reason_code(),
+                RIGHTS_NOT_ADMITTED,
+                "the denial code is exact"
+            );
+            assert!(
+                !lifecycle.rights_admitted(),
+                "a denial clears any earlier admission"
+            );
+            assert_eq!(lifecycle.state(), phase, "a denial does not move the phase");
+
+            let denied = lifecycle
+                .transition(ConnectorState::Capture)
+                .expect_err("capture is impossible after a denial");
+            assert_eq!(
+                denied.reason_code(),
+                "CAPTURE_BEFORE_PREFLIGHT",
+                "the rights gate blocks a direct capture attempt"
+            );
+            assert_eq!(
+                lifecycle.state(),
+                phase,
+                "the denied capture changed nothing"
+            );
+
+            lifecycle
+                .preflight(Some(&admitted_evidence()), &request())
+                .expect("a fresh valid preflight restores admission");
+            assert!(lifecycle.rights_admitted(), "admission is restored");
+            let replayed =
+                ConnectorLifecycle::replay(lifecycle.log()).expect("the mixed log replays");
+            assert_eq!(
+                replayed, lifecycle,
+                "replay mirrors the machine at every phase"
+            );
+        }
+    }
+
+    #[test]
+    fn every_denial_kind_clears_prior_admission() {
+        let mut unknown = admitted_evidence();
+        unknown.state = RightsEvidenceState::Unknown;
+        let mut expired = admitted_evidence();
+        expired.valid_until_utc_ns = Some(request().observed_at_utc_ns);
+        let mut out_of_scope = admitted_evidence();
+        out_of_scope.state = RightsEvidenceState::OutOfScope;
+        for evidence in [None, Some(&unknown), Some(&expired), Some(&out_of_scope)] {
+            let mut lifecycle = through_subscribe();
+            lifecycle
+                .preflight(evidence, &request())
+                .expect_err("each non-admitted evidence kind denies");
+            assert!(
+                !lifecycle.rights_admitted(),
+                "each denial clears the earlier admission"
+            );
+            let denied = lifecycle
+                .transition(ConnectorState::Capture)
+                .expect_err("capture stays gated");
+            assert_eq!(
+                denied.reason_code(),
+                "CAPTURE_BEFORE_PREFLIGHT",
+                "all denial kinds block capture"
+            );
+        }
+    }
+
+    #[test]
+    fn preflight_records_the_phase_where_it_ran() {
+        let mut lifecycle = through_subscribe();
+        let before = lifecycle.log().len();
+        lifecycle
+            .preflight(Some(&admitted_evidence()), &request())
+            .expect("a repeated valid preflight is accepted at Subscribe");
+        let record = &lifecycle.log()[before];
+        assert_eq!(
+            record.from,
+            ConnectorState::Subscribe,
+            "from is the actual phase"
+        );
+        assert_eq!(
+            record.to,
+            ConnectorState::Subscribe,
+            "preflight does not move a phase"
+        );
+    }
+
+    #[test]
+    fn replay_is_faithful_with_repeated_preflights_and_mixed_denials() {
+        let mut lifecycle = through_subscribe();
+        lifecycle
+            .preflight(Some(&admitted_evidence()), &request())
+            .expect("a repeated valid preflight is accepted at Subscribe");
+        lifecycle
+            .transition(ConnectorState::Capture)
+            .expect("capture follows a fresh admission");
+        lifecycle
+            .preflight(None, &request())
+            .expect_err("missing evidence is denied at Capture");
+        assert!(
+            !lifecycle.rights_admitted(),
+            "missing evidence clears admission"
+        );
+        let denied = lifecycle
+            .transition(ConnectorState::Capture)
+            .expect_err("capture is gated again");
+        assert_eq!(
+            denied.reason_code(),
+            "CAPTURE_BEFORE_PREFLIGHT",
+            "the denial is recorded at the current phase"
+        );
+        lifecycle
+            .preflight(Some(&admitted_evidence()), &request())
+            .expect("a fresh admission is accepted at Capture");
+        lifecycle
+            .transition(ConnectorState::Decode)
+            .expect("decode follows a fresh admission");
+        let mut unknown = admitted_evidence();
+        unknown.state = RightsEvidenceState::Unknown;
+        lifecycle
+            .preflight(Some(&unknown), &request())
+            .expect_err("unknown evidence is denied at Decode");
+        lifecycle
+            .preflight(Some(&admitted_evidence()), &request())
+            .expect("another fresh admission is accepted at Decode");
+        lifecycle
+            .transition(ConnectorState::Validate)
+            .expect("validate follows a fresh admission");
+        lifecycle.quarantine().expect("quarantine follows validate");
+        lifecycle.close().expect("quarantine closes");
+
+        let replayed = ConnectorLifecycle::replay(lifecycle.log()).expect("the mixed log replays");
+        assert_eq!(replayed, lifecycle, "replay rebuilds the exact machine");
+        assert_eq!(
+            replayed.state(),
+            ConnectorState::Closed,
+            "the final phase is closed"
+        );
+        assert!(
+            replayed.rights_admitted(),
+            "the last preflight was admitted"
+        );
+        assert!(
+            replayed.reached_capture(),
+            "capture is present in the replay"
         );
     }
 }
