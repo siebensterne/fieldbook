@@ -20,6 +20,8 @@
 #   verify       matrix, architecture and generated-path gates
 #   bench-compile  compile the neutral benchmark harness without running it
 #   bench-self-test  run the tiny deterministic benchmark self-test
+#   bench-production-compile  compile the real-component benchmark harness only
+#   bench-production-self-test  run the tiny real-component benchmark self-test
 #   tools        install the pinned Python tools
 #
 # Recipe lines use tabs (required by make). Every target is phony: there is no
@@ -28,7 +30,8 @@
 .PHONY: all help check check-static ci assure style format-fix fmt lint test \
 	docs e2e verify python-check ruff-check q-check standards-check \
 	python-fmt shell-check json-check makefile-check \
-	rust-check tools bench-compile bench-self-test
+	rust-check tools bench-compile bench-self-test \
+	bench-production-compile bench-production-self-test
 
 .DEFAULT_GOAL := check
 
@@ -57,6 +60,8 @@ help:
 	@echo "verify       matrix, architecture and generated-path gates"
 	@echo "bench-compile  compile the neutral benchmark harness without running it"
 	@echo "bench-self-test  run the tiny deterministic benchmark self-test"
+	@echo "bench-production-compile  compile the real-component benchmark harness only"
+	@echo "bench-production-self-test  run the tiny real-component benchmark self-test"
 	@echo "tools        install the pinned Python tools"
 
 check: style ci
@@ -135,6 +140,14 @@ bench-compile:
 
 bench-self-test:
 	cargo bench --bench neutral_pipeline --locked -- --self-test
+
+# Opt-in real-component harness targets. These compile the harness and run only
+# the tiny deterministic self-test; no performance threshold or gate is set.
+bench-production-compile:
+	cargo bench --no-run --locked
+
+bench-production-self-test:
+	cargo bench --bench production_components --locked -- --self-test
 
 tools:
 	python3 -m pip install -r requirements-dev.txt
