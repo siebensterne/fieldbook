@@ -9,6 +9,15 @@ sample counts and quantiles from those raw observations. It fails closed on any
 mismatch, absent field, missing start load average, duplicate seed or
 repetition-count discrepancy. Output is JSON only.
 
+PROVENANCE BINDING: in normal mode the declared provenance digests are also
+recomputed from the exact packaged files at the measured revision, read with
+`git show <measured revision>:<path>`, and the declared tree object id from
+`git rev-parse <measured revision>^{tree}`. Any drift in harness source,
+verifier source, Cargo.lock, toolchain declarations, binary or workload
+digests, or in the aggregate raw-observation digest fails the run. The
+measured revision is declared separately from the later branch base so that
+post-measurement source changes are never silently attributed to the data.
+
 DIGEST INPUT FORMAT (byte-exact): for one stage, concatenate one line per raw
 observation, ordered by process index ascending (the order of `processes` in the
 evidence file), then repetition index ascending, then the observation order in
@@ -31,7 +40,9 @@ import hashlib
 import json
 import math
 import statistics
+import subprocess
 import sys
+from collections.abc import Callable
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
@@ -39,6 +50,40 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVIDENCE = ROOT / "measurements/perf/neutral-production-corrected-baseline-2026-11-28.json"
 EXPECTED_BASE_SHA = "2ef503ff397186abfcd7fc619f0d1703d73aa9d1"
+EXPECTED_PRODUCTION_SOURCE_REVISION = "e2bd10c5f39ec271a030a863384dc6effcf15f1c"
+BINDING_BASE_SHA = "2df4b8e94b9b9c7eea95488c89659c788ca14c49"
+PACKAGED_PROVENANCE_FILES = {
+    "benchmark_harness_digest": "benches/production_components.rs",
+    "benchmark_verifier_digest": "scripts/verify_benchmark_evidence.py",
+    "cargo_lock_digest": "Cargo.lock",
+}
+PROVENANCE_KEYS = (
+    "production_source_revision",
+    "production_source_tree_digest",
+    "benchmark_harness_digest",
+    "benchmark_verifier_digest",
+    "cargo_lock_digest",
+    "rustc_version",
+    "target_triple",
+    "build_profile",
+    "compiler_flags",
+    "benchmark_binary_digest",
+    "workload_digest",
+    "raw_observation_digest",
+    "measurement_revision_vs_base",
+)
+FileReader = Callable[[str], bytes]
+TreeReader = Callable[[str], str]
+SELF_TEST_SOURCES = {
+    "benches/production_components.rs": b"self-test harness source\n",
+    "scripts/verify_benchmark_evidence.py": b"self-test verifier source\n",
+    "Cargo.lock": b"self-test Cargo.lock\n",
+}
+SELF_TEST_TREE = "d" * 40
+SELF_TEST_BINARY_DIGEST = "sha256:" + "a" * 64
+SELF_TEST_TOOLCHAIN = "rustc 1.99.1 (self-test)"
+SELF_TEST_TARGET = "x86_64-unknown-linux-gnu"
+SELF_TEST_PROFILE = "release (cargo bench)"
 EXPECTED_STAGES = (
     "sbe_append",
     "sbe_flush",
@@ -151,6 +196,131 @@ def artifact_digest(artifact: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def git_bytes(*args: str) -> bytes:
+    """Run a git command at the repository root and return its exact stdout bytes."""
+    result = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, check=False)
+    if result.returncode != 0:
+        error = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"git {' '.join(args)}: {error}")
+    return result.stdout
+
+
+def packaged_file_reader(revision: str) -> FileReader:
+    """Return a reader of exact packaged file bytes at the measured revision."""
+
+    def read(path: str) -> bytes:
+        """Return the exact bytes of one packaged file at the measured revision."""
+        return git_bytes("show", f"{revision}:{path}")
+
+    return read
+
+
+def tree_reader() -> TreeReader:
+    """Return a reader of the git tree object id for a revision."""
+
+    def read(revision: str) -> str:
+        """Return the lowercase hex SHA-1 tree object id of a git revision."""
+        return git_bytes("rev-parse", f"{revision}^{{tree}}").decode("utf-8").strip()
+
+    return read
+
+
+def self_test_file_reader(path: str) -> bytes:
+    """Return deterministic synthetic file bytes for one packaged path."""
+    return SELF_TEST_SOURCES[path]
+
+
+def self_test_tree_reader(_revision: str) -> str:
+    """Return the deterministic synthetic tree object id."""
+    return SELF_TEST_TREE
+
+
+def verify_binding_provenance(checks: list[dict[str, Any]], evidence: dict[str, Any]) -> None:
+    """Check toolchain, binary and workload declarations against packaged bindings."""
+    bindings = [process["artifact_json"]["binding"] for process in evidence["processes"]]
+    binding_keys = {
+        "rustc_version": "toolchain",
+        "target_triple": "target_triple",
+        "build_profile": "build_profile",
+        "compiler_flags": "compiler_flags",
+        "benchmark_binary_digest": "binary_digest",
+    }
+    for key, binding_key in binding_keys.items():
+        actual = [binding[binding_key] for binding in bindings]
+        record(checks, key, all(value == evidence[key] for value in actual), str(actual[0]))
+    workloads = evidence["workload_digest"]["per_process"]
+    declared = [binding["workload_digest"] for binding in bindings]
+    record(checks, "workload_digest", workloads == declared, ",".join(declared))
+    for index, process in enumerate(evidence["processes"]):
+        record(
+            checks,
+            f"workload_digest_process[{index}]",
+            process["workload_digest"] == declared[index],
+            declared[index],
+        )
+
+
+def verify_provenance(
+    checks: list[dict[str, Any]],
+    evidence: dict[str, Any],
+    revision: str,
+    read_file: FileReader,
+    read_tree: TreeReader,
+) -> None:
+    """Verify every declared provenance digest against the measured revision."""
+    missing = [key for key in PROVENANCE_KEYS if key not in evidence]
+    record(checks, "provenance_schema", not missing, ",".join(missing))
+    if missing:
+        return
+    declared_revision = evidence["production_source_revision"]
+    record(
+        checks,
+        "provenance_revision",
+        declared_revision == EXPECTED_PRODUCTION_SOURCE_REVISION == revision
+        and evidence["measurement_revision_vs_base"]["measured_revision"] == declared_revision,
+        declared_revision,
+    )
+    try:
+        tree = read_tree(revision)
+    except (RuntimeError, OSError, UnicodeError) as error:
+        record(checks, "production_source_tree_digest", False, f"{type(error).__name__}: {error}")
+    else:
+        record(
+            checks,
+            "production_source_tree_digest",
+            tree == evidence["production_source_tree_digest"],
+            tree or evidence["production_source_tree_digest"],
+        )
+    for key, path in PACKAGED_PROVENANCE_FILES.items():
+        try:
+            actual = hashlib.sha256(read_file(path)).hexdigest()
+        except (RuntimeError, OSError) as error:
+            record(checks, key, False, f"{type(error).__name__}: {error}")
+        else:
+            record(checks, key, actual == evidence[key], actual)
+    verify_binding_provenance(checks, evidence)
+    try:
+        raw = hashlib.sha256(
+            b"".join(digest_bytes(stage, evidence["processes"]) for stage in EXPECTED_STAGES)
+        ).hexdigest()
+    except (KeyError, TypeError, ValueError, IndexError) as error:
+        record(checks, "raw_observation_digest", False, f"{type(error).__name__}: {error}")
+    else:
+        record(checks, "raw_observation_digest", raw == evidence["raw_observation_digest"], raw)
+    relation = evidence["measurement_revision_vs_base"]
+    record(
+        checks,
+        "measurement_revision_vs_base",
+        relation["binding_base"] == BINDING_BASE_SHA
+        and relation["legacy_harness_captured_base_sha"] == evidence["base_sha"]
+        and relation["later_source_changes_not_measured"] is True
+        and "NOT measured" in relation["statement"]
+        and declared_revision != evidence["base_sha"]
+        and declared_revision != BINDING_BASE_SHA,
+        json.dumps(relation, sort_keys=True),
+    )
+
+
 def verify(evidence: dict[str, Any]) -> list[dict[str, Any]]:
     """Recompute every declared digest and statistic, returning all check results."""
     checks: list[dict[str, Any]] = []
@@ -163,6 +333,23 @@ def verify(evidence: dict[str, Any]) -> list[dict[str, Any]]:
         record(checks, "verification_completed", True, "all stages recomputed")
     except (KeyError, TypeError, ValueError, IndexError, ZeroDivisionError) as error:
         record(checks, "verification_completed", False, f"{type(error).__name__}: {error}")
+    return checks
+
+
+def verify_with_provenance(
+    evidence: dict[str, Any],
+    revision: str,
+    read_file: FileReader,
+    read_tree: TreeReader,
+) -> list[dict[str, Any]]:
+    """Run all evidence checks plus provenance checks, failing closed on error."""
+    checks = verify(evidence)
+    try:
+        verify_provenance(checks, evidence, revision, read_file, read_tree)
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
+        record(checks, "provenance_completed", False, f"{type(error).__name__}: {error}")
+    else:
+        record(checks, "provenance_completed", True, "all provenance checks evaluated")
     return checks
 
 
@@ -368,7 +555,12 @@ def self_test() -> dict[str, Any]:
         evidence = synthetic_evidence()
         if mutated is not None:
             mutated(evidence)
-        outcome = verify(evidence)
+        outcome = verify_with_provenance(
+            evidence,
+            EXPECTED_PRODUCTION_SOURCE_REVISION,
+            self_test_file_reader,
+            self_test_tree_reader,
+        )
         passed = all(check["passed"] for check in outcome)
         cases.append(
             {
@@ -392,6 +584,17 @@ def synthetic_evidence() -> dict[str, Any]:
     """Build a fully consistent, deliberately tiny evidence object for self-tests."""
     processes: list[dict[str, Any]] = []
     for process_index in range(5):
+        workload = f"fnv1a128:{process_index:032x}"
+        binding = {
+            "seed": 1000 + process_index,
+            "start_load_average": "1.00 0.50 0.25",
+            "toolchain": SELF_TEST_TOOLCHAIN,
+            "binary_digest": SELF_TEST_BINARY_DIGEST,
+            "target_triple": SELF_TEST_TARGET,
+            "compiler_flags": "(none)",
+            "build_profile": SELF_TEST_PROFILE,
+            "workload_digest": workload,
+        }
         repetitions: list[dict[str, Any]] = []
         artifacts: list[dict[str, Any]] = []
         for rep_index in range(5):
@@ -407,10 +610,7 @@ def synthetic_evidence() -> dict[str, Any]:
             artifacts.append(
                 {
                     "repetition_index": rep_index,
-                    "binding": {
-                        "seed": 1000 + process_index,
-                        "start_load_average": "1.00 0.50 0.25",
-                    },
+                    "binding": dict(binding),
                     "results": [
                         {"name": name, "raw_ns": values, "count": len(values)}
                         for name, values in stage_values.items()
@@ -427,10 +627,7 @@ def synthetic_evidence() -> dict[str, Any]:
             "errors": 0,
         }
         artifact = {
-            "binding": {
-                "seed": 1000 + process_index,
-                "start_load_average": "1.00 0.50 0.25",
-            },
+            "binding": dict(binding),
             "repetitions_executed": 5,
             "repetitions_retained": 5,
             "results": artifacts[0]["results"],
@@ -441,6 +638,8 @@ def synthetic_evidence() -> dict[str, Any]:
                 "process_index": process_index,
                 "seed": 1000 + process_index,
                 "source_sha": EXPECTED_BASE_SHA,
+                "binary_digest": SELF_TEST_BINARY_DIGEST,
+                "workload_digest": workload,
                 "start_load_average": "1.00 0.50 0.25",
                 "repetitions_executed": 5,
                 "repetitions_retained": 5,
@@ -491,6 +690,12 @@ def synthetic_evidence() -> dict[str, Any]:
             "per_process": per_process,
             "between_process_spread": spread_values,
         }
+    file_digests = {
+        path: hashlib.sha256(blob).hexdigest() for path, blob in SELF_TEST_SOURCES.items()
+    }
+    raw_observation_digest = hashlib.sha256(
+        b"".join(digest_bytes(stage, processes) for stage in EXPECTED_STAGES)
+    ).hexdigest()
     return {
         "schema_version": 1,
         "artifact": DEFAULT_EVIDENCE.name,
@@ -510,6 +715,27 @@ def synthetic_evidence() -> dict[str, Any]:
             "no_performance_gate": True,
             "tail_quantiles_provisional": True,
             "not_production_certificate": True,
+        },
+        "production_source_revision": EXPECTED_PRODUCTION_SOURCE_REVISION,
+        "production_source_tree_digest": SELF_TEST_TREE,
+        "benchmark_harness_digest": file_digests["benches/production_components.rs"],
+        "benchmark_verifier_digest": file_digests["scripts/verify_benchmark_evidence.py"],
+        "cargo_lock_digest": file_digests["Cargo.lock"],
+        "rustc_version": SELF_TEST_TOOLCHAIN,
+        "target_triple": SELF_TEST_TARGET,
+        "build_profile": SELF_TEST_PROFILE,
+        "compiler_flags": "(none)",
+        "benchmark_binary_digest": SELF_TEST_BINARY_DIGEST,
+        "workload_digest": {
+            "per_process": [f"fnv1a128:{index:032x}" for index in range(5)],
+        },
+        "raw_observation_digest": raw_observation_digest,
+        "measurement_revision_vs_base": {
+            "measured_revision": EXPECTED_PRODUCTION_SOURCE_REVISION,
+            "binding_base": BINDING_BASE_SHA,
+            "legacy_harness_captured_base_sha": EXPECTED_BASE_SHA,
+            "later_source_changes_not_measured": True,
+            "statement": "self-test source later changes were NOT measured",
         },
         "processes": processes,
         "stages": stages,
@@ -558,6 +784,18 @@ def self_test_cases() -> list[tuple[str, Any, bool]]:
         """Break the before/after correctness digest identity."""
         evidence["processes"][0]["correctness_after"]["event_order_digest"] = "changed"
 
+    def drift_harness(evidence: dict[str, Any]) -> None:
+        """Drift the declared harness source digest."""
+        evidence["benchmark_harness_digest"] = "0" * 64
+
+    def drift_verifier(evidence: dict[str, Any]) -> None:
+        """Drift the declared verifier source digest."""
+        evidence["benchmark_verifier_digest"] = "0" * 64
+
+    def drift_lock(evidence: dict[str, Any]) -> None:
+        """Drift the declared Cargo.lock digest."""
+        evidence["cargo_lock_digest"] = "0" * 64
+
     return [
         ("SELF-001-clean", None, True),
         ("SELF-002-bad-digest", tamper_digest, False),
@@ -569,6 +807,9 @@ def self_test_cases() -> list[tuple[str, Any, bool]]:
         ("SELF-008-missing-stage", drop_stage, False),
         ("SELF-009-bad-spread", tamper_spread, False),
         ("SELF-010-correctness-mismatch", tamper_correctness, False),
+        ("SELF-011-harness-digest-drift", drift_harness, False),
+        ("SELF-012-verifier-digest-drift", drift_verifier, False),
+        ("SELF-013-lock-digest-drift", drift_lock, False),
     ]
 
 
@@ -645,7 +886,12 @@ def main() -> int:
             }
         )
         return 1
-    checks = verify(evidence)
+    checks = verify_with_provenance(
+        evidence,
+        EXPECTED_PRODUCTION_SOURCE_REVISION,
+        packaged_file_reader(EXPECTED_PRODUCTION_SOURCE_REVISION),
+        tree_reader(),
+    )
     failed = [check for check in checks if not check["passed"]]
     stages = evidence.get("stages", {})
     observations = sum(int(stage.get("sample_count_pooled", 0)) for stage in stages.values())
@@ -655,6 +901,7 @@ def main() -> int:
             "mode": "verify",
             "evidence": str(evidence_path),
             "evidence_sha256": hashlib.sha256(raw).hexdigest(),
+            "measured_revision": EXPECTED_PRODUCTION_SOURCE_REVISION,
             "ok": not failed,
             "checks_total": len(checks),
             "failed": len(failed),
