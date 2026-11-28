@@ -17,6 +17,9 @@ use fieldbook::governance::source_event::SourceEventEnvelope;
 use fieldbook::util::sha256_hex;
 use serde::Deserialize;
 
+/// Number of files in the canonical P1.3 fixture set, including the manifest.
+const CANONICAL_FIXTURE_COUNT: usize = 30;
+
 /// One expectation: exactly one of `accepted` or `rejected_code` is present.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct Expectation {
@@ -35,8 +38,19 @@ struct ManifestFile {
 }
 
 #[derive(Debug, Deserialize)]
+struct FixtureGroups {
+    ledger: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureFormat {
+    p13_fixture_groups: FixtureGroups,
+}
+
+#[derive(Debug, Deserialize)]
 struct Manifest {
     files: Vec<ManifestFile>,
+    fixture_format: FixtureFormat,
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,8 +73,20 @@ fn every_golden_v1_fixture_conforms() {
         serde_json::from_slice(&manifest_bytes).expect("the manifest is valid JSON");
     assert_eq!(
         manifest.files.len(),
-        14,
-        "the canonical fixture set contains 14 files"
+        CANONICAL_FIXTURE_COUNT,
+        "the canonical fixture set contains every P1.3 fixture"
+    );
+
+    let ledger_ids: BTreeSet<&str> = manifest
+        .fixture_format
+        .p13_fixture_groups
+        .ledger
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        ledger_ids.contains("P13-LEDGER-QUARANTINE"),
+        "the manifest declares the quarantine ledger fixture"
     );
 
     let mut seen = BTreeSet::new();
@@ -98,12 +124,21 @@ fn every_golden_v1_fixture_conforms() {
         let count_message = format!("{} has one expectation per event", fixture.id);
         assert_eq!(inputs.len(), fixture.expect.len(), "{count_message}");
 
+        let ledger_mode = ledger_ids.contains(fixture.id.as_str());
         // Ledgers are scoped to (source_id, session_ref) and shared across the
         // ordered event list of one fixture; they start empty per fixture.
         let mut ledger = SessionSequences::new();
         for (index, (input, expectation)) in inputs.iter().zip(&fixture.expect).enumerate() {
-            let outcome =
-                SourceEventEnvelope::from_json(input).and_then(|event| ledger.admit(&event));
+            let parsed = SourceEventEnvelope::from_json(input);
+            let scope = parsed
+                .as_ref()
+                .ok()
+                .map(|event| (event.source_id.clone(), event.session_ref.clone()));
+            let before = scope
+                .as_ref()
+                .and_then(|(source_id, session_ref)| ledger.last(source_id, session_ref));
+            let outcome = parsed.and_then(|event| ledger.admit(&event));
+
             match (expectation.accepted, expectation.rejected_code.as_deref()) {
                 (Some(true), None) => {
                     let accept_message = format!(
@@ -111,6 +146,21 @@ fn every_golden_v1_fixture_conforms() {
                         fixture.id, index, outcome
                     );
                     assert!(outcome.is_ok(), "{accept_message}");
+                    if let Some((source_id, session_ref)) = &scope {
+                        let after = ledger.last(source_id, session_ref);
+                        assert!(after.is_some(), "an accepted event records a watermark");
+                        if ledger_mode && before.is_none() {
+                            // A quarantined event with these starting sequences was
+                            // rejected just before this one; the watermark is absent.
+                            let event = SourceEventEnvelope::from_json(input)
+                                .expect("an accepted fixture event is parseable");
+                            assert_eq!(
+                                after,
+                                Some((event.capture_sequence, event.canonical_sequence)),
+                                "the admitted event starts the ledger at its own sequence"
+                            );
+                        }
+                    }
                 }
                 (None, Some(code)) => {
                     let error = outcome.expect_err("a rejected fixture event must be rejected");
@@ -119,10 +169,22 @@ fn every_golden_v1_fixture_conforms() {
                         fixture.id, index
                     );
                     assert_eq!(error.reason_code(), code, "{code_message}");
+                    if let Some((source_id, session_ref)) = &scope {
+                        let after = ledger.last(source_id, session_ref);
+                        let ledger_message = format!(
+                            "{} event {} leaves the sequence ledger untouched",
+                            fixture.id, index
+                        );
+                        assert_eq!(after, before, "{ledger_message}");
+                    }
                 }
                 _ => panic!("{} event {} has an invalid expectation", fixture.id, index),
             }
         }
     }
-    assert_eq!(seen.len(), 14, "every canonical fixture was exercised");
+    assert_eq!(
+        seen.len(),
+        CANONICAL_FIXTURE_COUNT,
+        "every canonical fixture was exercised"
+    );
 }
