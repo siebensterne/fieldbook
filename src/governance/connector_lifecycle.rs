@@ -4,36 +4,60 @@
 //! The machine records decisions about a sequence of phases:
 //! `Preflight` → `Connect` → `Discover` → `Subscribe` → `Capture` → `Decode` →
 //! `Validate` → `Archive` → `Publish`, with `Quarantine` and `Closed` as
-//! cleanup branches reachable from every nonterminal phase. There is no
-//! concrete provider, socket, storage or market payload in this module.
+//! cleanup branches reachable from every nonterminal phase, and `Revoked` and
+//! `Retracted` as post-publication withdrawal branches. There is no concrete
+//! provider, socket, storage or market payload in this module.
+//!
+//! THIS MODULE DOES NOT GRANT REAL RIGHTS. It grants no legal permission, no
+//! access to any source, no collection capability and no authority over any
+//! artifact. It is a pure decision recorder: the only authority it recognises
+//! is a verified MAC produced by a configured `LeaseAuthority` key at the
+//! trusted boundary. Caller-declared evidence, caller-declared time and a
+//! caller-supplied `authority_digest` are references, never proof.
 //!
 //! Rights are bound to *operations*, never to one global boolean. The six
 //! operation scopes are provider connection/collection, local capture/storage,
 //! decoding/transformation, retention, publication/downstream use and research
-//! use. Every externally relevant transition consumes a single-use operation
-//! lease: a typed authority backed by the exact source/provider identity,
-//! product/instrument scope, operation, retention and permitted-use terms,
-//! validity interval and evidence decision digest. A lease is issued only at
-//! the integration boundary from a trusted clock observation. The pure state
-//! machine never reads a clock: caller-supplied timestamps and
-//! `RightsEvidenceState::Admitted` are declarations, not a rights grant.
+//! use. Every externally relevant transition consumes an authority-signed
+//! operation lease bound to the immutable session subject
+//! `(source_id, provider, product, instrument scope)`, exact operation,
+//! retention maximum, permitted uses and validity interval. Each operation
+//! passes the actual target identity; a mismatched target denies before any
+//! state change.
 //!
-//! A denial revokes the affected scope permanently; an expired or reused lease
-//! denies the individual operation without restoring any revoked scope.
-//! Cleanup (`Quarantine`/`Closed`) needs no capability, grants none, publishes
-//! nothing, extends no retention and admits no data. Publication remains a
-//! separate authorised transition from `Archive` only.
+//! Time comes only from a fresh observation obtained *inside* the operation
+//! boundary from a sealed trusted time source. The machine rejects any
+//! observation that rolls back a previously observed value, so wall-clock
+//! rollback fails closed. `SystemUtcClock` is the only production source;
+//! injectable clocks exist only in test builds.
+//!
+//! Lease consumption is claimed through a shared `IdempotencyClaim`. The pure
+//! state machine can guarantee that a claim is attempted only after every
+//! check succeeds and before a decision is committed, and that a failed claim
+//! changes no lifecycle state. It cannot, on its own, guarantee exactly-once
+//! behaviour across process restarts or crashes: that requires the injected
+//! store to make the claim durable and atomic with the caller's side effect.
+//!
+//! Audit records carry a keyed, chained MAC. `verify_audit_log` fails closed
+//! without an authority key and rejects any tampered record. `replay_state`
+//! proves only deterministic lifecycle-state reconstruction; it never proves
+//! authority, authenticity or that any right was actually granted.
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;
+use sha2::Digest;
+use sha2::Sha256;
 
 use crate::util::sha256_hex;
 
 /// Exact denial code for rights evidence that is unknown, missing, expired,
-/// out of scope, already denied or backed by a non-current lease.
+/// out of scope, already denied, unauthenticated or backed by a non-current
+/// lease.
 pub const RIGHTS_NOT_ADMITTED: &str = "RIGHTS_NOT_ADMITTED";
 
 /// Stable reason codes for lifecycle denials and replay rejection.
@@ -107,6 +131,8 @@ pub enum ConnectorState {
     Publish,
     Quarantine,
     Closed,
+    Revoked,
+    Retracted,
 }
 
 impl ConnectorState {
@@ -125,6 +151,8 @@ impl ConnectorState {
             Self::Publish => "publish",
             Self::Quarantine => "quarantine",
             Self::Closed => "closed",
+            Self::Revoked => "revoked",
+            Self::Retracted => "retracted",
         }
     }
 
@@ -132,6 +160,8 @@ impl ConnectorState {
     ///
     /// Every nonterminal phase can abort into `Quarantine` and then `Closed`.
     /// `Publish` has exactly one predecessor: an authorised `Archive` step.
+    /// A published artifact can only be withdrawn into `Revoked` or `Retracted`
+    /// and then closed; neither withdrawal permits further publication.
     #[must_use]
     pub const fn allows(self, target: Self) -> bool {
         match self {
@@ -143,15 +173,16 @@ impl ConnectorState {
             Self::Decode => matches!(target, Self::Validate | Self::Quarantine | Self::Closed),
             Self::Validate => matches!(target, Self::Archive | Self::Quarantine | Self::Closed),
             Self::Archive => matches!(target, Self::Publish | Self::Quarantine | Self::Closed),
-            Self::Publish => matches!(target, Self::Closed),
-            Self::Quarantine => matches!(target, Self::Closed),
-            Self::Closed => false,
+            Self::Publish => matches!(target, Self::Revoked | Self::Retracted | Self::Closed),
+            Self::Quarantine | Self::Closed | Self::Revoked | Self::Retracted => {
+                matches!(target, Self::Closed)
+            }
         }
     }
 }
 
 /// Operation-scoped rights capability. A phase may only advance when the
-/// scope for its operation has a current, unconsumed lease.
+/// scope for its operation has a current, unconsumed, authority-signed lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationScope {
@@ -228,6 +259,10 @@ impl LeaseSubject {
 }
 
 /// Retention and permitted-use terms a lease is bound to.
+///
+/// `retention_until_utc_ns` is a MAXIMUM retention limit, never an extension:
+/// an operation at or beyond that instant is denied, and cleanup never moves
+/// the limit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LeaseTerms {
     pub retention_until_utc_ns: u64,
@@ -270,9 +305,8 @@ impl OperationRequest {
 }
 
 /// Caller-supplied rights evidence bound to one operation, identity and term
-/// set. Presence of this value is not a grant: authority is derived from the
-/// evidence digest, declared state, exact bindings, validity interval and a
-/// trusted clock observation at the integration boundary.
+/// set. Presence of this value is not a grant: it is only a reference that the
+/// authority signs at the trusted boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperationRightsEvidence {
     pub evidence_ref: String,
@@ -283,8 +317,8 @@ pub struct OperationRightsEvidence {
     pub valid_until_utc_ns: Option<u64>,
     pub subject: LeaseSubject,
     pub terms: LeaseTerms,
-    /// Digest of the authority's decision; supplied by the caller, never
-    /// synthesized or upgraded by this pure state machine.
+    /// Digest of the authority's decision, supplied by the caller as a
+    /// reference. It is covered by the authority MAC but is never proof.
     pub authority_digest: String,
 }
 
@@ -300,12 +334,36 @@ pub enum DecisionKind {
     Advanced,
     /// A phase transition was denied; the phase did not change.
     Denied,
+    /// The one-shot research-use decision consumed its lease.
+    ResearchUsed,
+    /// A published artifact was revoked and marked inactive.
+    PublicationRevoked,
+    /// A published artifact was retracted and marked inactive.
+    PublicationRetracted,
+}
+
+impl DecisionKind {
+    /// Stable audit spelling of this decision kind.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Admitted => "admitted",
+            Self::PreflightDenied => "preflight_denied",
+            Self::Advanced => "advanced",
+            Self::Denied => "denied",
+            Self::ResearchUsed => "research_used",
+            Self::PublicationRevoked => "publication_revoked",
+            Self::PublicationRetracted => "publication_retracted",
+        }
+    }
 }
 
 /// One immutable decision record. Sequence numbers start at one and are
 /// consecutive in a log. `to` names the requested target even when a
-/// transition is denied, so replay can reproduce the denial exactly.
-/// `lease_digest` is present only for transitions that consumed a lease.
+/// transition is denied, so state replay can reproduce the denial exactly.
+/// `lease_digest` is present only for decisions that consumed a lease.
+/// `authority_mac` is a keyed, chained MAC over every other field; it is the
+/// authenticated authority evidence checked by `verify_audit_log`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordedDecision {
     pub sequence: u64,
@@ -315,24 +373,35 @@ pub struct RecordedDecision {
     pub reason_code: Option<LifecycleReason>,
     pub scope: Option<OperationScope>,
     pub lease_digest: Option<String>,
+    pub observed_at_utc_ns: u64,
+    pub authority_mac: String,
 }
 
-/// Trusted UTC clock seam. The pure machine never calls this trait; only the
-/// integration boundary does, through [`observe`].
-pub trait TrustedUtcClock {
+/// Sealing prevents an arbitrary caller type from masquerading as a trusted
+/// time source or authority verifier in production builds.
+mod private {
+    pub trait Sealed {}
+}
+
+/// Sealed trusted time source. Only the integration boundary can supply a
+/// reading; caller-supplied clocks are never accepted as authority. The trait
+/// is sealed, and injectable implementations exist only in test builds.
+pub trait TrustedTimeSource: private::Sealed {
     /// Current UTC time in nanoseconds since the Unix epoch.
     ///
     /// # Errors
-    /// Returns [`LifecycleReason::RightsNotAdmitted`] when a trustworthy
-    /// reading is unavailable, so evaluation fails closed.
+    /// Returns `RIGHTS_NOT_ADMITTED` when a trustworthy reading is
+    /// unavailable, so evaluation fails closed.
     fn now_utc_ns(&self) -> Result<u64, LifecycleError>;
 }
 
-/// System-clock implementation of the trusted boundary clock.
+/// System-clock implementation of the trusted boundary time source.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemUtcClock;
 
-impl TrustedUtcClock for SystemUtcClock {
+impl private::Sealed for SystemUtcClock {}
+
+impl TrustedTimeSource for SystemUtcClock {
     fn now_utc_ns(&self) -> Result<u64, LifecycleError> {
         let elapsed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -342,26 +411,22 @@ impl TrustedUtcClock for SystemUtcClock {
     }
 }
 
-/// Opaque, digest-sealed clock observation. Only [`observe`] can produce one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Single-use trusted time observation. It is deliberately not `Clone`, is
+/// created only by `observe`, and is consumed inside an operation boundary;
+/// a caller cannot supply or replay one.
+///
+/// ```compile_fail
+/// use fieldbook::governance::connector_lifecycle::{observe, SystemUtcClock};
+/// let observation = observe(&SystemUtcClock).expect("a trusted clock reading");
+/// let _copy = observation.clone();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct TrustedObservation {
     now_utc_ns: u64,
-    seal: String,
 }
 
 impl TrustedObservation {
-    fn seal(now_utc_ns: u64) -> String {
-        digest_parts(&[
-            "fieldbook-p13-trusted-observation-v1".to_owned(),
-            now_utc_ns.to_string(),
-        ])
-    }
-
-    fn authentic(&self) -> bool {
-        self.seal == Self::seal(self.now_utc_ns)
-    }
-
-    /// Trusted reading used by lease issuance and currency checks.
+    /// Trusted reading obtained at the operation boundary.
     #[must_use]
     pub const fn as_utc_ns(&self) -> u64 {
         self.now_utc_ns
@@ -371,14 +436,11 @@ impl TrustedObservation {
 /// Read the trusted clock once at the integration boundary.
 ///
 /// # Errors
-/// Returns [`LifecycleReason::RightsNotAdmitted`] when the clock cannot give a
-/// trustworthy reading.
-pub fn observe(clock: &impl TrustedUtcClock) -> Result<TrustedObservation, LifecycleError> {
-    let now_utc_ns = clock.now_utc_ns()?;
-    Ok(TrustedObservation {
-        now_utc_ns,
-        seal: TrustedObservation::seal(now_utc_ns),
-    })
+/// Returns `RIGHTS_NOT_ADMITTED` when the source cannot give a trustworthy
+/// reading.
+pub fn observe(source: &impl TrustedTimeSource) -> Result<TrustedObservation, LifecycleError> {
+    let now_utc_ns = source.now_utc_ns()?;
+    Ok(TrustedObservation { now_utc_ns })
 }
 
 fn digest_parts(parts: &[String]) -> String {
@@ -398,10 +460,171 @@ fn is_authority_digest(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn hmac_sha256_hex(key: &[u8; 32], payload: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for (index, byte) in key.iter().enumerate() {
+        ipad[index] ^= byte;
+        opad[index] ^= byte;
+    }
+    let mut inner = Vec::with_capacity(BLOCK.saturating_add(payload.len()));
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(payload);
+    let inner_digest = Sha256::digest(&inner);
+    let mut outer = Vec::with_capacity(BLOCK.saturating_add(inner_digest.len()));
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_digest);
+    sha256_hex(&outer)
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left_byte, right_byte) in left.bytes().zip(right.bytes()) {
+        difference |= left_byte ^ right_byte;
+    }
+    difference == 0
+}
+
+/// Proof that a specific payload was accepted by the configured authority.
+/// The token is returned only by a successful `LeaseAuthority::verify` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthorityVerification {
+    payload_digest: String,
+}
+
+impl AuthorityVerification {
+    /// Digest of the payload that the authority authenticated.
+    #[must_use]
+    pub fn payload_digest(&self) -> &str {
+        &self.payload_digest
+    }
+}
+
+/// Authority-verification boundary. The pure machine holds no key of its own:
+/// every operation must obtain an `AuthorityVerification` from the configured
+/// authority before any state change. An unconfigured authority denies
+/// everything.
+pub trait LeaseAuthority: private::Sealed {
+    /// Produce the authority MAC for one canonical payload.
+    ///
+    /// # Errors
+    /// Returns `RIGHTS_NOT_ADMITTED` when no trusted key is configured.
+    fn sign(&self, payload: &[u8]) -> Result<String, LifecycleError>;
+
+    /// Verify a MAC over one canonical payload and return the decision token.
+    ///
+    /// # Errors
+    /// Returns `RIGHTS_NOT_ADMITTED` when no key is configured or the MAC is
+    /// not authentic. Verification never falls back to an unkeyed digest.
+    fn verify(&self, payload: &[u8], mac: &str) -> Result<AuthorityVerification, LifecycleError>;
+}
+
+/// Production authority implementation. `unconfigured` has no trusted key and
+/// therefore fails closed for both signing and verification; a key must be
+/// injected by the trusted boundary before any lease can be issued.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyedLeaseAuthority {
+    key: Option<[u8; 32]>,
+}
+
+impl KeyedLeaseAuthority {
+    /// Create an authority with no trusted key. Every decision is denied.
+    #[must_use]
+    pub const fn unconfigured() -> Self {
+        Self { key: None }
+    }
+
+    /// Create an authority from a key supplied by the trusted boundary.
+    #[must_use]
+    pub const fn from_key(key: [u8; 32]) -> Self {
+        Self { key: Some(key) }
+    }
+}
+
+impl private::Sealed for KeyedLeaseAuthority {}
+
+impl LeaseAuthority for KeyedLeaseAuthority {
+    fn sign(&self, payload: &[u8]) -> Result<String, LifecycleError> {
+        let key = self
+            .key
+            .ok_or_else(|| rights_denial("no trusted authority key is configured"))?;
+        Ok(hmac_sha256_hex(&key, payload))
+    }
+
+    fn verify(&self, payload: &[u8], mac: &str) -> Result<AuthorityVerification, LifecycleError> {
+        let key = self
+            .key
+            .ok_or_else(|| rights_denial("no trusted authority key is configured"))?;
+        let expected = hmac_sha256_hex(&key, payload);
+        if !constant_time_eq(&expected, mac) {
+            return Err(rights_denial(
+                "lease is not signed by the trusted authority",
+            ));
+        }
+        Ok(AuthorityVerification {
+            payload_digest: sha256_hex(payload),
+        })
+    }
+}
+
+/// Atomic lease-claim seam. The claim must be shared by all attempts for one
+/// decision. A durable implementation is supplied by the caller at the
+/// integration boundary; the in-memory implementation here proves the
+/// in-process semantics only.
+pub trait IdempotencyClaim {
+    /// Atomically claim one lease digest. Return `false` when it was already
+    /// claimed, so the caller must deny the duplicate without a side effect.
+    ///
+    /// # Errors
+    /// Returns `RIGHTS_NOT_ADMITTED` when the store cannot decide atomically.
+    fn claim(&self, lease_digest: &str) -> Result<bool, LifecycleError>;
+}
+
+/// Shared in-memory claim store. It is atomic within one process, not durable
+/// across restarts; a restart-safe store must be injected for that guarantee.
+#[derive(Debug, Default)]
+pub struct AtomicIdempotency {
+    claimed: Mutex<BTreeSet<String>>,
+}
+
+impl AtomicIdempotency {
+    /// Create an empty claim store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl IdempotencyClaim for AtomicIdempotency {
+    fn claim(&self, lease_digest: &str) -> Result<bool, LifecycleError> {
+        let mut claimed = self
+            .claimed
+            .lock()
+            .map_err(|_| rights_denial("idempotency claim store is poisoned"))?;
+        Ok(claimed.insert(lease_digest.to_owned()))
+    }
+}
+
+impl<T: IdempotencyClaim + ?Sized> IdempotencyClaim for Arc<T> {
+    fn claim(&self, lease_digest: &str) -> Result<bool, LifecycleError> {
+        (**self).claim(lease_digest)
+    }
+}
+
 /// Single-use operation authorisation issued from validated evidence at the
-/// integration boundary. Fields are private so a caller cannot synthesize a
-/// grant from a caller-supplied timestamp or an `Admitted` declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// integration boundary. Fields are private and the type deliberately has no
+/// public `Deserialize` implementation: a caller cannot synthesize a grant
+/// from JSON. Authenticity comes only from the authority MAC in `signature`.
+///
+/// ```compile_fail
+/// use fieldbook::governance::connector_lifecycle::OperationLease;
+/// let _: OperationLease = serde_json::from_str("{}").expect("cannot forge a lease from JSON");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OperationLease {
     lease_ref: String,
     subject: LeaseSubject,
@@ -411,7 +634,7 @@ pub struct OperationLease {
     not_before_utc_ns: u64,
     valid_until_utc_ns: u64,
     authority_digest: String,
-    seal: String,
+    signature: String,
 }
 
 impl OperationLease {
@@ -423,9 +646,8 @@ impl OperationLease {
         let valid_until_utc_ns = evidence
             .valid_until_utc_ns
             .unwrap_or(observation.as_utc_ns());
-        let lease_ref = request.lease_ref.clone();
-        let mut lease = Self {
-            lease_ref,
+        Self {
+            lease_ref: request.lease_ref.clone(),
             subject: request.subject.clone(),
             operation_ref: request.operation_ref.clone(),
             scope: request.required_scope,
@@ -433,13 +655,14 @@ impl OperationLease {
             not_before_utc_ns: evidence.valid_from_utc_ns,
             valid_until_utc_ns,
             authority_digest: evidence.authority_digest.clone(),
-            seal: String::new(),
-        };
-        lease.seal = lease.compute_seal();
-        lease
+            signature: String::new(),
+        }
     }
 
-    fn compute_seal(&self) -> String {
+    /// Canonical bytes covered by the authority MAC. The MAC itself is
+    /// excluded, and every authoritative field is included.
+    #[must_use]
+    pub fn signing_payload(&self) -> Vec<u8> {
         let permitted_uses = self
             .terms
             .permitted_uses
@@ -448,7 +671,7 @@ impl OperationLease {
             .collect::<Vec<_>>()
             .join(",");
         digest_parts(&[
-            "fieldbook-p13-operation-lease-v1".to_owned(),
+            "fieldbook-p15-operation-lease-v1".to_owned(),
             self.lease_ref.clone(),
             self.subject.source_id.clone(),
             self.subject.provider_id.clone(),
@@ -462,26 +685,27 @@ impl OperationLease {
             self.valid_until_utc_ns.to_string(),
             self.authority_digest.clone(),
         ])
+        .into_bytes()
     }
 
-    fn recompute_seal(&self) -> String {
-        self.compute_seal()
+    /// Authority MAC over `signing_payload`. Also the single-use claim key.
+    #[must_use]
+    pub fn signature(&self) -> &str {
+        &self.signature
     }
 
-    /// Whether this lease is authentic, unexpired and active at the trusted
-    /// observation. A caller-declared time cannot satisfy this check.
+    /// Whether this lease's validity interval contains the trusted observation.
+    /// Authenticity is checked separately by `verify` before any operation.
     #[must_use]
     pub fn is_current_at(&self, observation: &TrustedObservation) -> bool {
-        observation.authentic()
-            && self.seal == self.recompute_seal()
-            && observation.as_utc_ns() >= self.not_before_utc_ns
+        observation.as_utc_ns() >= self.not_before_utc_ns
             && observation.as_utc_ns() < self.valid_until_utc_ns
     }
 
-    /// Digest used to enforce single use and bind the lease to the decision log.
+    /// Authority-authenticated digest used for single use and the decision log.
     #[must_use]
     pub fn digest(&self) -> String {
-        self.seal.clone()
+        self.signature.clone()
     }
 
     /// Operation scope this lease authorises.
@@ -496,13 +720,13 @@ impl OperationLease {
         &self.operation_ref
     }
 
-    /// Exact identity this lease is bound to.
+    /// Exact immutable identity this lease is bound to.
     #[must_use]
     pub const fn subject(&self) -> &LeaseSubject {
         &self.subject
     }
 
-    /// Retention and permitted-use terms this lease is bound to.
+    /// Retention maximum and permitted uses this lease is bound to.
     #[must_use]
     pub const fn terms(&self) -> &LeaseTerms {
         &self.terms
@@ -510,23 +734,22 @@ impl OperationLease {
 }
 
 /// Pure preflight evaluation over caller-supplied declarations and a trusted
-/// clock observation. This is the only way to issue an [`OperationLease`].
+/// clock observation. This is the only way to issue an `OperationLease`, and
+/// it requires the authority to sign the lease payload.
 ///
 /// # Errors
-/// Returns [`LifecycleReason::RightsNotAdmitted`] when the observation is not
-/// authentic, the request or evidence is incomplete, the evidence is bound to
-/// another operation/identity/terms, its declared state is not admitted, the
-/// required scope is absent, the authority digest is malformed, or the trusted
-/// observation lies outside the evidence's validity interval. The caller's
-/// `declared_observed_at_utc_ns` is ignored: it is not a rights grant.
+/// Returns `RIGHTS_NOT_ADMITTED` when the request or evidence is incomplete,
+/// the evidence is bound to another operation/identity/terms, its declared
+/// state is not admitted, the required scope is absent, the authority digest
+/// is malformed, the trusted observation lies outside the validity interval,
+/// the retention maximum has elapsed, or the authority has no key. The
+/// caller's `declared_observed_at_utc_ns` is ignored: it is not a rights grant.
 pub fn evaluate_preflight(
     evidence: Option<&OperationRightsEvidence>,
     request: &OperationRequest,
     observation: &TrustedObservation,
+    authority: &impl LeaseAuthority,
 ) -> Result<OperationLease, LifecycleError> {
-    if !observation.authentic() {
-        return Err(rights_denial("trusted clock observation is not authentic"));
-    }
     if !request.complete() {
         return Err(rights_denial("operation request is incomplete"));
     }
@@ -586,14 +809,19 @@ pub fn evaluate_preflight(
             "rights evidence expired at the trusted observation",
         ));
     }
-    Ok(OperationLease::new(evidence, request, observation))
+    if now >= request.terms.retention_until_utc_ns {
+        return Err(rights_denial("lease retention maximum has already elapsed"));
+    }
+    let lease = OperationLease::new(evidence, request, observation);
+    let signature = authority.sign(&lease.signing_payload())?;
+    Ok(OperationLease { signature, ..lease })
 }
 
 /// Operation scope required by an ordered phase transition.
 ///
-/// Cleanup branches (`Quarantine` and `Closed`) need no capability: they are
-/// always allowed so a denied machine can still be closed without publishing,
-/// extending retention or admitting data.
+/// Cleanup branches (`Quarantine`, `Closed`, `Revoked`, `Retracted`) need no
+/// capability: they are always allowed so a denied machine can still be withdrawn
+/// without publishing, extending retention or admitting data.
 #[must_use]
 pub const fn required_scope_for_transition(
     from: ConnectorState,
@@ -631,6 +859,20 @@ pub const fn required_operation_for_transition(
     }
 }
 
+/// Operation-to-permitted-use policy. A lease may be used only for the use
+/// named by the operation it was issued for; no other use is implied.
+#[must_use]
+pub const fn required_permitted_use(scope: OperationScope) -> &'static str {
+    match scope {
+        OperationScope::ProviderConnection => "provider_connection",
+        OperationScope::LocalCapture => "local_capture",
+        OperationScope::DecodeTransform => "decode_transform",
+        OperationScope::Retention => "retention",
+        OperationScope::Publication => "publication",
+        OperationScope::ResearchUse => "local_research",
+    }
+}
+
 fn scope_allows(
     admitted: &BTreeSet<OperationScope>,
     denied: &BTreeSet<OperationScope>,
@@ -640,14 +882,14 @@ fn scope_allows(
 }
 
 /// Pure scope-level transition decision. Phase order is checked first, then
-/// the operation scope bound to the requested transition. Lease currency is
-/// checked separately by [`ConnectorLifecycle::advance`].
+/// the operation scope bound to the requested transition. Lease currency and
+/// authority are checked separately by `ConnectorLifecycle::advance`.
 ///
 /// # Errors
-/// Returns [`LifecycleReason::InvalidTransition`] for an out-of-order request,
-/// [`LifecycleReason::CaptureBeforePreflight`] when capture lacks its own
-/// scope, or [`LifecycleReason::RightsNotAdmitted`] when any other required
-/// scope is not currently admitted.
+/// Returns `InvalidTransition` for an out-of-order request,
+/// `CaptureBeforePreflight` when capture lacks its own scope, or
+/// `RIGHTS_NOT_ADMITTED` when any other required scope is not currently
+/// admitted.
 pub fn decide_transition(
     from: ConnectorState,
     to: ConnectorState,
@@ -678,35 +920,109 @@ pub fn decide_transition(
     Ok(())
 }
 
-/// Lifecycle state, operation-scoped rights, consumed leases and recorded
-/// decisions. No I/O and no clock read is performed by any method on this type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Initial link of the audit MAC chain.
+const INITIAL_AUDIT_MAC: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+struct DecisionInput {
+    from: ConnectorState,
+    to: ConnectorState,
+    kind: DecisionKind,
+    reason_code: Option<LifecycleReason>,
+    scope: Option<OperationScope>,
+    lease_digest: Option<String>,
+    observed_at_utc_ns: u64,
+}
+
+fn audit_payload(record: &RecordedDecision, previous_mac: &str) -> Vec<u8> {
+    digest_parts(&[
+        "fieldbook-p15-audit-v1".to_owned(),
+        record.sequence.to_string(),
+        record.from.as_str().to_owned(),
+        record.to.as_str().to_owned(),
+        record.kind.as_str().to_owned(),
+        record
+            .reason_code
+            .map(LifecycleReason::as_str)
+            .unwrap_or("-")
+            .to_owned(),
+        record
+            .scope
+            .map(OperationScope::as_str)
+            .unwrap_or("-")
+            .to_owned(),
+        record.lease_digest.clone().unwrap_or_default(),
+        record.observed_at_utc_ns.to_string(),
+        previous_mac.to_owned(),
+    ])
+    .into_bytes()
+}
+
+/// Lifecycle state, immutable session subject, operation-scoped rights,
+/// consumed lease claims, trusted-time watermark and authenticated decisions.
+/// There is no I/O and no clock access on any method: time enters only via an
+/// injected sealed source at the operation boundary. `ConnectorLifecycle` is
+/// deliberately not `Clone`: a cloned state could bypass the shared claim
+/// store and replay a consumed lease.
+///
+/// ```compile_fail
+/// use fieldbook::governance::connector_lifecycle::{ConnectorLifecycle, LeaseSubject};
+/// let subject = LeaseSubject {
+///     source_id: "s".to_owned(), provider_id: "p".to_owned(),
+///     product_ref: "x".to_owned(), instrument_ref: "i".to_owned(),
+/// };
+/// let lifecycle = ConnectorLifecycle::new(subject).expect("a complete subject");
+/// let _clone = lifecycle.clone();
+/// ```
+#[derive(Debug, PartialEq, Eq)]
 pub struct ConnectorLifecycle {
     state: ConnectorState,
+    subject: LeaseSubject,
     admitted_scopes: BTreeSet<OperationScope>,
     denied_scopes: BTreeSet<OperationScope>,
     used_leases: BTreeSet<String>,
     log: Vec<RecordedDecision>,
+    last_observation_ns: u64,
+    artifact_active: bool,
 }
 
 impl ConnectorLifecycle {
-    /// New machine at `Preflight` with no admitted or denied scope and an
-    /// empty log.
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
+    /// New machine at `Preflight`, bound immutably to one subject.
+    ///
+    /// # Errors
+    /// Returns `RIGHTS_NOT_ADMITTED` when the subject is incomplete, so a
+    /// session can never operate on an unspecified target.
+    pub fn new(subject: LeaseSubject) -> Result<Self, LifecycleError> {
+        if !subject.complete() {
+            return Err(rights_denial("session subject is incomplete"));
+        }
+        Ok(Self {
             state: ConnectorState::Preflight,
+            subject,
             admitted_scopes: BTreeSet::new(),
             denied_scopes: BTreeSet::new(),
             used_leases: BTreeSet::new(),
             log: Vec::new(),
-        }
+            last_observation_ns: 0,
+            artifact_active: false,
+        })
     }
 
     /// Current phase.
     #[must_use]
     pub const fn state(&self) -> ConnectorState {
         self.state
+    }
+
+    /// Immutable subject this lifecycle session is bound to.
+    #[must_use]
+    pub const fn subject(&self) -> &LeaseSubject {
+        &self.subject
+    }
+
+    /// Whether a published artifact is currently active.
+    #[must_use]
+    pub const fn artifact_active(&self) -> bool {
+        self.artifact_active
     }
 
     /// Scopes currently admitted and not denied.
@@ -721,7 +1037,7 @@ impl ConnectorLifecycle {
         &self.denied_scopes
     }
 
-    /// Digests of leases already consumed by an advanced transition.
+    /// Digests of leases already claimed by a committed decision.
     #[must_use]
     pub fn used_leases(&self) -> &BTreeSet<String> {
         &self.used_leases
@@ -753,22 +1069,36 @@ impl ConnectorLifecycle {
         })
     }
 
-    /// Consume operation evidence and issue a lease for one scope.
-    ///
-    /// An admission enables only the requested scope. A denial revokes that
-    /// scope permanently: later preflights for it deny instead of restoring an
-    /// earlier admission. The phase never moves. The returned lease is the
-    /// only authorisation a later advanced transition will accept.
+    fn fresh_observation(
+        &mut self,
+        source: &impl TrustedTimeSource,
+    ) -> Result<TrustedObservation, LifecycleError> {
+        let observation = observe(source)?;
+        let now = observation.as_utc_ns();
+        if now < self.last_observation_ns {
+            return Err(rights_denial("trusted time observation rolled back"));
+        }
+        self.last_observation_ns = now;
+        Ok(observation)
+    }
+
+    /// Consume operation evidence and issue an authority-signed lease for one
+    /// scope. The request subject must be the immutable session subject. An
+    /// admission enables only the requested scope; a denial revokes that scope
+    /// permanently. The phase never moves.
     ///
     /// # Errors
-    /// Returns the fail-closed denial from [`evaluate_preflight`], or a denial
-    /// when the scope was previously denied.
+    /// Returns the fail-closed denial from `evaluate_preflight`, a denial when
+    /// the scope was previously denied or the target is not the session
+    /// subject, or an error when the decision cannot be audit-signed.
     pub fn preflight(
         &mut self,
         evidence: Option<&OperationRightsEvidence>,
         request: &OperationRequest,
-        observation: &TrustedObservation,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
     ) -> Result<OperationLease, LifecycleError> {
+        let observation = self.fresh_observation(source)?;
         let scope = request.required_scope;
         let phase = self.state;
         let outcome = if self.denied_scopes.contains(&scope) {
@@ -776,81 +1106,126 @@ impl ConnectorLifecycle {
                 "scope {} was denied earlier and cannot be restored",
                 scope.as_str()
             )))
+        } else if request.subject != self.subject {
+            Err(rights_denial(
+                "request target is not the session lease subject",
+            ))
         } else {
-            evaluate_preflight(evidence, request, observation)
+            evaluate_preflight(evidence, request, &observation, authority)
+        };
+        let (kind, reason_code) = match &outcome {
+            Ok(_) => (DecisionKind::Admitted, None),
+            Err(error) => (DecisionKind::PreflightDenied, Some(error.reason)),
         };
         match &outcome {
             Ok(_) => {
                 self.admitted_scopes.insert(scope);
-                self.record(
-                    phase,
-                    phase,
-                    DecisionKind::Admitted,
-                    None,
-                    Some(scope),
-                    None,
-                );
             }
-            Err(error) => {
+            Err(_) => {
                 self.admitted_scopes.remove(&scope);
                 self.denied_scopes.insert(scope);
-                self.record(
-                    phase,
-                    phase,
-                    DecisionKind::PreflightDenied,
-                    Some(error.reason),
-                    Some(scope),
-                    None,
-                );
             }
         }
+        self.record(
+            DecisionInput {
+                from: phase,
+                to: phase,
+                kind,
+                reason_code,
+                scope: Some(scope),
+                lease_digest: None,
+                observed_at_utc_ns: observation.as_utc_ns(),
+            },
+            authority,
+        )?;
         outcome
     }
 
-    /// Revoke an operation scope after a lease was issued. Outstanding leases
-    /// for that scope can no longer authorise any operation.
-    pub fn revoke(&mut self, scope: OperationScope) {
+    /// Revoke an operation scope. Outstanding leases for that scope can no
+    /// longer authorise any operation.
+    ///
+    /// # Errors
+    /// Returns an error when the trusted boundary cannot supply time or audit
+    /// evidence.
+    pub fn revoke(
+        &mut self,
+        scope: OperationScope,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
+        let observation = self.fresh_observation(source)?;
         self.admitted_scopes.remove(&scope);
         self.denied_scopes.insert(scope);
         let phase = self.state;
         self.record(
-            phase,
-            phase,
-            DecisionKind::PreflightDenied,
-            Some(LifecycleReason::RightsNotAdmitted),
-            Some(scope),
-            None,
-        );
+            DecisionInput {
+                from: phase,
+                to: phase,
+                kind: DecisionKind::PreflightDenied,
+                reason_code: Some(LifecycleReason::RightsNotAdmitted),
+                scope: Some(scope),
+                lease_digest: None,
+                observed_at_utc_ns: observation.as_utc_ns(),
+            },
+            authority,
+        )
     }
 
-    /// Apply an advanced phase transition using one current lease.
+    /// Apply an advanced phase transition using one current, authority-signed
+    /// lease and the actual target identity.
     ///
-    /// The lease must be bound to the operation and scope of this transition,
-    /// be authentic and current at the trusted observation, and be unused. A
-    /// scope-level rights denial revokes the scope permanently; a lease that
-    /// is expired, misbound or already consumed denies only that operation.
+    /// The lease must be bound to the operation, scope, subject, permitted use
+    /// and retention maximum of this transition, be current at a fresh trusted
+    /// observation, verify under the configured authority, and be claimed
+    /// atomically by the shared idempotency store. A scope-level rights denial
+    /// revokes the scope permanently; a lease-specific denial denies only the
+    /// operation.
     ///
     /// # Errors
-    /// Returns [`LifecycleReason::InvalidTransition`] for cleanup targets and
-    /// out-of-order steps, or [`LifecycleReason::RightsNotAdmitted`] when the
-    /// scope or lease does not authorise this operation.
+    /// Returns `InvalidTransition` for cleanup targets and out-of-order steps,
+    /// or `RIGHTS_NOT_ADMITTED` when the scope, target, authority, time or
+    /// lease does not authorise this operation.
     pub fn advance(
         &mut self,
         target: ConnectorState,
         lease: &OperationLease,
-        observation: &TrustedObservation,
+        target_subject: &LeaseSubject,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+        idempotency: &impl IdempotencyClaim,
     ) -> Result<(), LifecycleError> {
+        let observation = self.fresh_observation(source)?;
         let from = self.state;
         let scope = required_scope_for_transition(from, target);
         let mut outcome =
             decide_transition(from, target, &self.admitted_scopes, &self.denied_scopes);
         if outcome.is_ok() {
             outcome = match scope {
-                Some(scope) => self.check_lease(from, target, scope, lease, observation),
+                Some(scope) => {
+                    let operation_ref = required_operation_for_transition(from, target);
+                    self.check_lease(
+                        scope,
+                        operation_ref.unwrap_or(""),
+                        lease,
+                        target_subject,
+                        &observation,
+                        authority,
+                    )
+                    .map(|_| ())
+                }
                 None => Err(LifecycleError::new(
                     LifecycleReason::InvalidTransition,
                     "cleanup targets require quarantine or close, not a lease",
                 )),
+            };
+        }
+        if outcome.is_ok() {
+            outcome = match idempotency.claim(&lease.digest()) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(rights_denial(
+                    "operation lease was already consumed by an idempotency claim",
+                )),
+                Err(error) => Err(error),
             };
         }
         let lease_digest = if outcome.is_ok() {
@@ -862,14 +1237,21 @@ impl ConnectorLifecycle {
             Ok(()) => {
                 self.used_leases.insert(lease.digest());
                 self.record(
-                    from,
-                    target,
-                    DecisionKind::Advanced,
-                    None,
-                    scope,
-                    lease_digest,
-                );
+                    DecisionInput {
+                        from,
+                        to: target,
+                        kind: DecisionKind::Advanced,
+                        reason_code: None,
+                        scope,
+                        lease_digest,
+                        observed_at_utc_ns: observation.as_utc_ns(),
+                    },
+                    authority,
+                )?;
                 self.state = target;
+                if target == ConnectorState::Publish {
+                    self.artifact_active = true;
+                }
             }
             Err(error) => {
                 let revoked = error.reason != LifecycleReason::InvalidTransition
@@ -879,13 +1261,17 @@ impl ConnectorLifecycle {
                     self.denied_scopes.insert(scope);
                 }
                 self.record(
-                    from,
-                    target,
-                    DecisionKind::Denied,
-                    Some(error.reason),
-                    scope,
-                    None,
-                );
+                    DecisionInput {
+                        from,
+                        to: target,
+                        kind: DecisionKind::Denied,
+                        reason_code: Some(error.reason),
+                        scope,
+                        lease_digest: None,
+                        observed_at_utc_ns: observation.as_utc_ns(),
+                    },
+                    authority,
+                )?;
             }
         }
         outcome
@@ -893,25 +1279,47 @@ impl ConnectorLifecycle {
 
     fn check_lease(
         &self,
-        from: ConnectorState,
-        target: ConnectorState,
         scope: OperationScope,
+        operation_ref: &str,
         lease: &OperationLease,
+        target_subject: &LeaseSubject,
         observation: &TrustedObservation,
-    ) -> Result<(), LifecycleError> {
+        authority: &impl LeaseAuthority,
+    ) -> Result<AuthorityVerification, LifecycleError> {
         if lease.scope() != scope {
             return Err(rights_denial("lease is bound to another operation scope"));
         }
-        if required_operation_for_transition(from, target) != Some(lease.operation_ref()) {
+        if operation_ref != lease.operation_ref() {
             return Err(rights_denial("lease is bound to another operation"));
         }
+        if lease.subject() != target_subject
+            || target_subject != &self.subject
+            || lease.subject() != &self.subject
+        {
+            return Err(rights_denial(
+                "lease subject does not match the actual operation target",
+            ));
+        }
+        if !lease
+            .terms()
+            .permitted_uses
+            .contains(required_permitted_use(scope))
+        {
+            return Err(rights_denial("lease does not permit this operation use"));
+        }
+        if observation.as_utc_ns() >= lease.terms().retention_until_utc_ns {
+            return Err(rights_denial(
+                "lease retention maximum has elapsed at the operation time",
+            ));
+        }
+        let verification = authority.verify(&lease.signing_payload(), lease.signature())?;
         if !lease.is_current_at(observation) {
             return Err(rights_denial("operation lease is not current"));
         }
         if self.used_leases.contains(&lease.digest()) {
             return Err(rights_denial("operation lease was already consumed"));
         }
-        Ok(())
+        Ok(verification)
     }
 
     fn lease_only_denial(error: &LifecycleError) -> bool {
@@ -919,25 +1327,39 @@ impl ConnectorLifecycle {
     }
 
     /// Abort into `Quarantine` from any nonterminal phase. Cleanup needs no
-    /// capability and changes no rights, retention or admission state.
+    /// capability: it changes no rights, retention or admission state and
+    /// marks any published artifact inactive.
     ///
     /// # Errors
-    /// Returns [`LifecycleReason::InvalidTransition`] only from a terminal
-    /// phase.
-    pub fn quarantine(&mut self) -> Result<(), LifecycleError> {
-        self.cleanup(ConnectorState::Quarantine)
+    /// Returns `InvalidTransition` only from a terminal phase.
+    pub fn quarantine(
+        &mut self,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
+        self.cleanup(ConnectorState::Quarantine, source, authority)
     }
 
     /// Close from `Publish`, `Quarantine` or any nonterminal phase. Cleanup
     /// needs no capability and changes no rights, retention or admission state.
     ///
     /// # Errors
-    /// Returns [`LifecycleReason::InvalidTransition`] only from `Closed`.
-    pub fn close(&mut self) -> Result<(), LifecycleError> {
-        self.cleanup(ConnectorState::Closed)
+    /// Returns `InvalidTransition` only from `Closed`.
+    pub fn close(
+        &mut self,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
+        self.cleanup(ConnectorState::Closed, source, authority)
     }
 
-    fn cleanup(&mut self, target: ConnectorState) -> Result<(), LifecycleError> {
+    fn cleanup(
+        &mut self,
+        target: ConnectorState,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
+        let observation = self.fresh_observation(source)?;
         let from = self.state;
         let outcome =
             if from.allows(target) && required_scope_for_transition(from, target).is_none() {
@@ -952,61 +1374,199 @@ impl ConnectorLifecycle {
                     ),
                 ))
             };
-        match &outcome {
-            Ok(()) => {
-                self.record(from, target, DecisionKind::Advanced, None, None, None);
-                self.state = target;
-            }
-            Err(error) => self.record(
+        let (kind, reason_code) = match &outcome {
+            Ok(()) => (DecisionKind::Advanced, None),
+            Err(error) => (DecisionKind::Denied, Some(error.reason)),
+        };
+        self.record(
+            DecisionInput {
                 from,
-                target,
-                DecisionKind::Denied,
-                Some(error.reason),
-                None,
-                None,
-            ),
+                to: target,
+                kind,
+                reason_code,
+                scope: None,
+                lease_digest: None,
+                observed_at_utc_ns: observation.as_utc_ns(),
+            },
+            authority,
+        )?;
+        if outcome.is_ok() {
+            self.state = target;
+            self.artifact_active = false;
         }
         outcome
     }
 
-    /// Explicit gate for research use, which has no phase in this machine but
-    /// still needs a current lease bound to its own operation scope.
+    /// One-shot research-use gate. Research use has no lifecycle phase, so
+    /// this method consumes its lease through the shared idempotency store and
+    /// records a `ResearchUsed` decision. A second use of the same lease is
+    /// denied; there is no reusable research method here.
     ///
     /// # Errors
-    /// Returns [`LifecycleReason::RightsNotAdmitted`] unless research use is
-    /// admitted and the lease is current and bound to `research_use`.
+    /// Returns `RIGHTS_NOT_ADMITTED` unless research use is admitted and the
+    /// lease is authentic, current, bound to the target, permitted for
+    /// `local_research` and not already claimed.
     pub fn research_use(
-        &self,
+        &mut self,
         lease: &OperationLease,
-        observation: &TrustedObservation,
+        target_subject: &LeaseSubject,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+        idempotency: &impl IdempotencyClaim,
     ) -> Result<(), LifecycleError> {
+        let observation = self.fresh_observation(source)?;
         let scope = OperationScope::ResearchUse;
-        if !self.scope_admitted(scope) {
-            return Err(rights_denial("research use is not currently admitted"));
+        let phase = self.state;
+        let mut outcome = if !self.scope_admitted(scope) {
+            Err(rights_denial("research use is not currently admitted"))
+        } else {
+            self.check_lease(
+                scope,
+                "research_use",
+                lease,
+                target_subject,
+                &observation,
+                authority,
+            )
+            .map(|_| ())
+        };
+        if outcome.is_ok() {
+            outcome = match idempotency.claim(&lease.digest()) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(rights_denial(
+                    "research use lease was already consumed by an idempotency claim",
+                )),
+                Err(error) => Err(error),
+            };
         }
-        if lease.scope() != scope || lease.operation_ref() != "research_use" {
-            return Err(rights_denial(
-                "lease is not bound to the research use operation",
-            ));
+        let (kind, reason_code, lease_digest) = match &outcome {
+            Ok(()) => (DecisionKind::ResearchUsed, None, Some(lease.digest())),
+            Err(error) => (DecisionKind::Denied, Some(error.reason), None),
+        };
+        if outcome.is_ok() {
+            self.used_leases.insert(lease.digest());
         }
-        if !lease.is_current_at(observation) {
-            return Err(rights_denial("research use lease is not current"));
-        }
-        Ok(())
+        self.record(
+            DecisionInput {
+                from: phase,
+                to: phase,
+                kind,
+                reason_code,
+                scope: Some(scope),
+                lease_digest,
+                observed_at_utc_ns: observation.as_utc_ns(),
+            },
+            authority,
+        )?;
+        outcome
     }
 
-    /// Reconstruct a machine from a recorded decision log.
-    ///
-    /// The log is treated as untrusted input: consecutive sequence numbers,
-    /// from-state agreement, legal advanced transitions, scope and lease
-    /// binding, single-use leases, cleanup records with no capability, and
-    /// denied decisions that leave the phase unchanged are all re-verified.
+    /// Revoke a published artifact. It is marked inactive and can only be
+    /// closed afterwards; further publication is impossible. Revocation needs
+    /// no capability because leaving an unauthorised artifact active is never
+    /// acceptable.
     ///
     /// # Errors
-    /// Returns [`LifecycleReason::LogMismatch`] if any record is inconsistent
-    /// with the decisions that would have produced it.
-    pub fn replay(records: &[RecordedDecision]) -> Result<Self, LifecycleError> {
-        let mut lifecycle = Self::new();
+    /// Returns `InvalidTransition` unless the artifact is currently published.
+    pub fn revoke_publication(
+        &mut self,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
+        self.withdraw(
+            ConnectorState::Revoked,
+            DecisionKind::PublicationRevoked,
+            source,
+            authority,
+        )
+    }
+
+    /// Retract a published artifact. It is marked inactive and can only be
+    /// closed afterwards; further publication is impossible.
+    ///
+    /// # Errors
+    /// Returns `InvalidTransition` unless the artifact is currently published.
+    pub fn retract_publication(
+        &mut self,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
+        self.withdraw(
+            ConnectorState::Retracted,
+            DecisionKind::PublicationRetracted,
+            source,
+            authority,
+        )
+    }
+
+    fn withdraw(
+        &mut self,
+        target: ConnectorState,
+        success_kind: DecisionKind,
+        source: &impl TrustedTimeSource,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
+        let observation = self.fresh_observation(source)?;
+        let from = self.state;
+        let outcome = if from == ConnectorState::Publish && self.artifact_active {
+            Ok(())
+        } else {
+            Err(LifecycleError::new(
+                LifecycleReason::InvalidTransition,
+                format!("{} has no active artifact to withdraw", from.as_str()),
+            ))
+        };
+        let (kind, reason_code) = match &outcome {
+            Ok(()) => (success_kind, None),
+            Err(error) => (DecisionKind::Denied, Some(error.reason)),
+        };
+        self.record(
+            DecisionInput {
+                from,
+                to: target,
+                kind,
+                reason_code,
+                scope: None,
+                lease_digest: None,
+                observed_at_utc_ns: observation.as_utc_ns(),
+            },
+            authority,
+        )?;
+        if outcome.is_ok() {
+            self.state = target;
+            self.artifact_active = false;
+        }
+        outcome
+    }
+
+    /// Deterministic lifecycle-STATE replay of an untrusted decision log.
+    ///
+    /// This proves only that the recorded decisions reproduce the same phase,
+    /// scope, lease-claim and cleanup state. It does NOT verify authority,
+    /// authenticity, signatures or that any real right was granted; use
+    /// `verify_audit_log` for that. The subject is supplied by the caller and
+    /// is not derived from the log.
+    ///
+    /// # Errors
+    /// Returns `LogMismatch` if any record is inconsistent with the decisions
+    /// that would have produced it.
+    pub fn replay_state(
+        records: &[RecordedDecision],
+        subject: LeaseSubject,
+    ) -> Result<Self, LifecycleError> {
+        if !subject.complete() {
+            return Err(Self::mismatch("replay subject is incomplete"));
+        }
+        let mut lifecycle = Self {
+            state: ConnectorState::Preflight,
+            subject,
+            admitted_scopes: BTreeSet::new(),
+            denied_scopes: BTreeSet::new(),
+            used_leases: BTreeSet::new(),
+            log: Vec::new(),
+            last_observation_ns: 0,
+            artifact_active: false,
+        };
         for (index, record) in records.iter().enumerate() {
             let expected = u64::try_from(index + 1).unwrap_or(u64::MAX);
             if record.sequence != expected {
@@ -1015,132 +1575,201 @@ impl ConnectorLifecycle {
             if record.from != lifecycle.state {
                 return Err(Self::mismatch("recorded from-state does not match replay"));
             }
-            match record.kind {
-                DecisionKind::Admitted => {
-                    if record.to != record.from
-                        || record.reason_code.is_some()
-                        || record.lease_digest.is_some()
-                    {
-                        return Err(Self::mismatch("preflight admission changed the phase"));
-                    }
-                    let Some(scope) = record.scope else {
-                        return Err(Self::mismatch("preflight admission has no scope"));
-                    };
-                    if lifecycle.denied_scopes.contains(&scope) {
-                        return Err(Self::mismatch("a denied scope was restored"));
-                    }
-                    lifecycle.admitted_scopes.insert(scope);
-                }
-                DecisionKind::PreflightDenied => {
-                    if record.to != record.from || record.lease_digest.is_some() {
-                        return Err(Self::mismatch("preflight denial changed the phase"));
-                    }
-                    let Some(reason) = record.reason_code else {
-                        return Err(Self::mismatch("preflight denial has no reason"));
-                    };
-                    if reason != LifecycleReason::RightsNotAdmitted {
-                        return Err(Self::mismatch("preflight denial has the wrong reason"));
-                    }
-                    let Some(scope) = record.scope else {
-                        return Err(Self::mismatch("preflight denial has no scope"));
-                    };
-                    lifecycle.admitted_scopes.remove(&scope);
-                    lifecycle.denied_scopes.insert(scope);
-                }
-                DecisionKind::Advanced => {
-                    if record.reason_code.is_some()
-                        || decide_transition(
-                            record.from,
-                            record.to,
-                            &lifecycle.admitted_scopes,
-                            &lifecycle.denied_scopes,
-                        )
-                        .is_err()
-                    {
-                        return Err(Self::mismatch("advanced transition is not legal"));
-                    }
-                    if record.scope != required_scope_for_transition(record.from, record.to) {
-                        return Err(Self::mismatch("advanced scope does not match the phase"));
-                    }
-                    match record.scope {
-                        Some(_) => {
-                            let Some(digest) = &record.lease_digest else {
-                                return Err(Self::mismatch("advanced transition has no lease"));
-                            };
-                            if !is_authority_digest(digest)
-                                || !lifecycle.used_leases.insert(digest.clone())
-                            {
-                                return Err(Self::mismatch("lease digest is reused or malformed"));
-                            }
-                            if record.to == ConnectorState::Publish
-                                && record.scope != Some(OperationScope::Publication)
-                            {
-                                return Err(Self::mismatch("publication is not authorised"));
-                            }
-                        }
-                        None => {
-                            if record.lease_digest.is_some()
-                                || !matches!(
-                                    record.to,
-                                    ConnectorState::Quarantine | ConnectorState::Closed
-                                )
-                            {
-                                return Err(Self::mismatch("cleanup granted a capability"));
-                            }
-                        }
-                    }
-                    lifecycle.state = record.to;
-                }
-                DecisionKind::Denied => {
-                    let Some(reason) = record.reason_code else {
-                        return Err(Self::mismatch("denied decision has no reason"));
-                    };
-                    let Err(error) = decide_transition(
-                        record.from,
-                        record.to,
-                        &lifecycle.admitted_scopes,
-                        &lifecycle.denied_scopes,
-                    ) else {
-                        return Err(Self::mismatch("denied transition is legal"));
-                    };
-                    if error.reason != reason {
-                        return Err(Self::mismatch("denied reason is not reproducible"));
-                    }
-                    if record.scope != required_scope_for_transition(record.from, record.to)
-                        || record.lease_digest.is_some()
-                    {
-                        return Err(Self::mismatch("denied scope does not match the phase"));
-                    }
-                    if let Some(scope) = record.scope {
-                        lifecycle.admitted_scopes.remove(&scope);
-                        lifecycle.denied_scopes.insert(scope);
-                    }
-                }
+            if record.observed_at_utc_ns < lifecycle.last_observation_ns {
+                return Err(Self::mismatch("replayed trusted observation rolled back"));
             }
+            lifecycle.last_observation_ns = record.observed_at_utc_ns;
+            if !is_authority_digest(&record.authority_mac) {
+                return Err(Self::mismatch("decision has no authority evidence"));
+            }
+            lifecycle.apply_record(record)?;
             lifecycle.log.push(record.clone());
         }
         Ok(lifecycle)
     }
 
+    fn apply_record(&mut self, record: &RecordedDecision) -> Result<(), LifecycleError> {
+        match record.kind {
+            DecisionKind::Admitted => {
+                if record.to != record.from
+                    || record.reason_code.is_some()
+                    || record.lease_digest.is_some()
+                {
+                    return Err(Self::mismatch("preflight admission changed the phase"));
+                }
+                let Some(scope) = record.scope else {
+                    return Err(Self::mismatch("preflight admission has no scope"));
+                };
+                if self.denied_scopes.contains(&scope) {
+                    return Err(Self::mismatch("a denied scope was restored"));
+                }
+                self.admitted_scopes.insert(scope);
+            }
+            DecisionKind::PreflightDenied => {
+                if record.to != record.from || record.lease_digest.is_some() {
+                    return Err(Self::mismatch("preflight denial changed the phase"));
+                }
+                let Some(reason) = record.reason_code else {
+                    return Err(Self::mismatch("preflight denial has no reason"));
+                };
+                if reason != LifecycleReason::RightsNotAdmitted {
+                    return Err(Self::mismatch("preflight denial has the wrong reason"));
+                }
+                let Some(scope) = record.scope else {
+                    return Err(Self::mismatch("preflight denial has no scope"));
+                };
+                self.admitted_scopes.remove(&scope);
+                self.denied_scopes.insert(scope);
+            }
+            DecisionKind::Advanced => {
+                if record.reason_code.is_some()
+                    || decide_transition(
+                        record.from,
+                        record.to,
+                        &self.admitted_scopes,
+                        &self.denied_scopes,
+                    )
+                    .is_err()
+                {
+                    return Err(Self::mismatch("advanced transition is not legal"));
+                }
+                if record.scope != required_scope_for_transition(record.from, record.to) {
+                    return Err(Self::mismatch("advanced scope does not match the phase"));
+                }
+                match record.scope {
+                    Some(_) => {
+                        let Some(digest) = &record.lease_digest else {
+                            return Err(Self::mismatch("advanced transition has no lease"));
+                        };
+                        if !is_authority_digest(digest) || !self.used_leases.insert(digest.clone())
+                        {
+                            return Err(Self::mismatch("lease digest is reused or malformed"));
+                        }
+                        if record.to == ConnectorState::Publish
+                            && record.scope != Some(OperationScope::Publication)
+                        {
+                            return Err(Self::mismatch("publication is not authorised"));
+                        }
+                    }
+                    None => {
+                        if record.lease_digest.is_some()
+                            || !matches!(
+                                record.to,
+                                ConnectorState::Quarantine | ConnectorState::Closed
+                            )
+                        {
+                            return Err(Self::mismatch("cleanup granted a capability"));
+                        }
+                    }
+                }
+                self.state = record.to;
+                if record.to == ConnectorState::Publish {
+                    self.artifact_active = true;
+                }
+                if matches!(
+                    record.to,
+                    ConnectorState::Quarantine | ConnectorState::Closed
+                ) {
+                    self.artifact_active = false;
+                }
+            }
+            DecisionKind::Denied => {
+                let Some(reason) = record.reason_code else {
+                    return Err(Self::mismatch("denied decision has no reason"));
+                };
+                if record.lease_digest.is_some() {
+                    return Err(Self::mismatch("denied decision consumed a lease"));
+                }
+                if record.to == record.from && record.scope == Some(OperationScope::ResearchUse) {
+                    if reason != LifecycleReason::RightsNotAdmitted {
+                        return Err(Self::mismatch("research denial has the wrong reason"));
+                    }
+                    // A one-shot research-use denial consumes no lease and
+                    // never revokes the scope permanently.
+                    return Ok(());
+                }
+                let Err(error) = decide_transition(
+                    record.from,
+                    record.to,
+                    &self.admitted_scopes,
+                    &self.denied_scopes,
+                ) else {
+                    return Err(Self::mismatch("denied transition is legal"));
+                };
+                if error.reason != reason {
+                    return Err(Self::mismatch("denied reason is not reproducible"));
+                }
+                if record.scope != required_scope_for_transition(record.from, record.to) {
+                    return Err(Self::mismatch("denied scope does not match the phase"));
+                }
+                if let Some(scope) = record.scope {
+                    self.admitted_scopes.remove(&scope);
+                    self.denied_scopes.insert(scope);
+                }
+            }
+            DecisionKind::ResearchUsed => {
+                if record.to != record.from
+                    || record.reason_code.is_some()
+                    || record.scope != Some(OperationScope::ResearchUse)
+                {
+                    return Err(Self::mismatch("research use changed the phase"));
+                }
+                let Some(digest) = &record.lease_digest else {
+                    return Err(Self::mismatch("research use has no lease"));
+                };
+                if !is_authority_digest(digest) || !self.used_leases.insert(digest.clone()) {
+                    return Err(Self::mismatch(
+                        "research lease digest is reused or malformed",
+                    ));
+                }
+            }
+            DecisionKind::PublicationRevoked | DecisionKind::PublicationRetracted => {
+                let expected = if record.kind == DecisionKind::PublicationRevoked {
+                    ConnectorState::Revoked
+                } else {
+                    ConnectorState::Retracted
+                };
+                if record.from != ConnectorState::Publish
+                    || record.to != expected
+                    || record.reason_code.is_some()
+                    || record.scope.is_some()
+                    || record.lease_digest.is_some()
+                    || !self.artifact_active
+                {
+                    return Err(Self::mismatch("publication withdrawal is not legal"));
+                }
+                self.state = expected;
+                self.artifact_active = false;
+            }
+        }
+        Ok(())
+    }
+
     fn record(
         &mut self,
-        from: ConnectorState,
-        to: ConnectorState,
-        kind: DecisionKind,
-        reason_code: Option<LifecycleReason>,
-        scope: Option<OperationScope>,
-        lease_digest: Option<String>,
-    ) {
+        input: DecisionInput,
+        authority: &impl LeaseAuthority,
+    ) -> Result<(), LifecycleError> {
         let sequence = u64::try_from(self.log.len() + 1).unwrap_or(u64::MAX);
-        self.log.push(RecordedDecision {
+        let previous = self
+            .log
+            .last()
+            .map_or(INITIAL_AUDIT_MAC, |record| record.authority_mac.as_str());
+        let mut record = RecordedDecision {
             sequence,
-            from,
-            to,
-            kind,
-            reason_code,
-            scope,
-            lease_digest,
-        });
+            from: input.from,
+            to: input.to,
+            kind: input.kind,
+            reason_code: input.reason_code,
+            scope: input.scope,
+            lease_digest: input.lease_digest,
+            observed_at_utc_ns: input.observed_at_utc_ns,
+            authority_mac: String::new(),
+        };
+        let payload = audit_payload(&record, previous);
+        record.authority_mac = authority.sign(&payload)?;
+        self.log.push(record);
+        Ok(())
     }
 
     fn mismatch(detail: &'static str) -> LifecycleError {
@@ -1148,39 +1777,135 @@ impl ConnectorLifecycle {
     }
 }
 
-impl Default for ConnectorLifecycle {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Result of an authenticated audit-log verification. State replay alone is
+/// never an authority result; this token additionally requires an authority
+/// key and an intact MAC chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditVerification {
+    pub record_count: usize,
+    pub final_state: ConnectorState,
+    pub subject: LeaseSubject,
+    pub authority_digest: String,
 }
 
+/// Verify that an audit log is authenticated and tamper-evident, then replay
+/// its lifecycle state. Fails closed without a configured authority key, with
+/// an empty log, with a broken MAC chain or with any tampered decision.
+///
+/// # Errors
+/// Returns `RIGHTS_NOT_ADMITTED` when authority evidence is missing or
+/// unauthenticated, or `LogMismatch` when the state is not reproducible.
+pub fn verify_audit_log(
+    records: &[RecordedDecision],
+    subject: LeaseSubject,
+    authority: &impl LeaseAuthority,
+) -> Result<AuditVerification, LifecycleError> {
+    if records.is_empty() {
+        return Err(rights_denial(
+            "audit log is empty: there is no authenticated authority evidence",
+        ));
+    }
+    let mut previous: &str = INITIAL_AUDIT_MAC;
+    let mut consumed = 0usize;
+    for (index, record) in records.iter().enumerate() {
+        if record.sequence != u64::try_from(index + 1).unwrap_or(u64::MAX) {
+            return Err(ConnectorLifecycle::mismatch(
+                "audit decision sequence is not consecutive",
+            ));
+        }
+        let payload = audit_payload(record, previous);
+        authority.verify(&payload, &record.authority_mac)?;
+        if let Some(digest) = &record.lease_digest {
+            if !is_authority_digest(digest) {
+                return Err(rights_denial("audit lease evidence is malformed"));
+            }
+            consumed = consumed.saturating_add(1);
+        }
+        previous = record.authority_mac.as_str();
+    }
+    if consumed == 0 {
+        return Err(rights_denial(
+            "audit log has no authority-issued lease evidence",
+        ));
+    }
+    let replayed = ConnectorLifecycle::replay_state(records, subject.clone())?;
+    Ok(AuditVerification {
+        record_count: records.len(),
+        final_state: replayed.state(),
+        subject: replayed.subject().clone(),
+        authority_digest: previous.to_owned(),
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::Ordering;
+    use std::thread;
 
     const OBSERVED_AT: u64 = 1_700_000_000_000_000_000;
     const VALID_UNTIL: u64 = 1_700_000_000_100_000_000;
     const LONG_SESSION_LATER: u64 = 1_800_000_000_000_000_000;
+    const RETENTION_LIMIT: u64 = 1_900_000_000_000_000_000;
+    const TEST_KEY: [u8; 32] = [0x11; 32];
+
+    /// TEST-ONLY authority verifier. It never appears in a production build.
+    #[derive(Debug, Clone, Copy)]
+    struct TestLeaseAuthority;
+
+    impl private::Sealed for TestLeaseAuthority {}
+
+    impl LeaseAuthority for TestLeaseAuthority {
+        fn sign(&self, payload: &[u8]) -> Result<String, LifecycleError> {
+            Ok(hmac_sha256_hex(&TEST_KEY, payload))
+        }
+
+        fn verify(
+            &self,
+            payload: &[u8],
+            mac: &str,
+        ) -> Result<AuthorityVerification, LifecycleError> {
+            let expected = hmac_sha256_hex(&TEST_KEY, payload);
+            if !constant_time_eq(&expected, mac) {
+                return Err(rights_denial(
+                    "test authority rejected an unauthentic lease",
+                ));
+            }
+            Ok(AuthorityVerification {
+                payload_digest: sha256_hex(payload),
+            })
+        }
+    }
+
+    fn authority() -> &'static TestLeaseAuthority {
+        static AUTHORITY: TestLeaseAuthority = TestLeaseAuthority;
+        &AUTHORITY
+    }
 
     #[derive(Debug)]
     struct FixedClock {
-        now: Cell<u64>,
+        now: AtomicU64,
     }
 
     impl FixedClock {
         fn at(now: u64) -> Self {
             Self {
-                now: Cell::new(now),
+                now: AtomicU64::new(now),
             }
+        }
+
+        fn set(&self, now: u64) {
+            self.now.store(now, Ordering::Relaxed);
         }
     }
 
-    impl TrustedUtcClock for FixedClock {
+    impl private::Sealed for FixedClock {}
+
+    impl TrustedTimeSource for FixedClock {
         fn now_utc_ns(&self) -> Result<u64, LifecycleError> {
-            Ok(self.now.get())
+            Ok(self.now.load(Ordering::Relaxed))
         }
     }
 
@@ -1197,11 +1922,43 @@ mod tests {
         }
     }
 
+    fn other_source() -> LeaseSubject {
+        LeaseSubject {
+            source_id: "other-source".to_owned(),
+            ..subject()
+        }
+    }
+
+    fn other_instrument() -> LeaseSubject {
+        LeaseSubject {
+            instrument_ref: "other-instrument".to_owned(),
+            ..subject()
+        }
+    }
+
     fn terms() -> LeaseTerms {
         LeaseTerms {
-            retention_until_utc_ns: 1_900_000_000_000_000_000,
-            permitted_uses: BTreeSet::from(["local_research".to_owned()]),
+            retention_until_utc_ns: RETENTION_LIMIT,
+            permitted_uses: BTreeSet::from([
+                "provider_connection".to_owned(),
+                "local_capture".to_owned(),
+                "decode_transform".to_owned(),
+                "retention".to_owned(),
+                "publication".to_owned(),
+                "local_research".to_owned(),
+            ]),
         }
+    }
+
+    fn terms_with_uses(uses: &[&str]) -> LeaseTerms {
+        LeaseTerms {
+            retention_until_utc_ns: RETENTION_LIMIT,
+            permitted_uses: uses.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    }
+
+    fn lifecycle() -> ConnectorLifecycle {
+        ConnectorLifecycle::new(subject()).expect("a complete subject binds a session")
     }
 
     static LEASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -1218,6 +1975,12 @@ mod tests {
         }
     }
 
+    fn request_with_terms(scope: OperationScope, bound_terms: &LeaseTerms) -> OperationRequest {
+        let mut value = request(scope);
+        value.terms = bound_terms.clone();
+        value
+    }
+
     fn valid_evidence(scope: OperationScope) -> OperationRightsEvidence {
         OperationRightsEvidence {
             evidence_ref: format!("evidence-{}", scope.as_str()),
@@ -1232,6 +1995,15 @@ mod tests {
         }
     }
 
+    fn evidence_with_terms(
+        scope: OperationScope,
+        bound_terms: &LeaseTerms,
+    ) -> OperationRightsEvidence {
+        let mut value = valid_evidence(scope);
+        value.terms = bound_terms.clone();
+        value
+    }
+
     fn evidence_valid(
         scope: OperationScope,
         valid_from_utc_ns: u64,
@@ -1243,13 +2015,22 @@ mod tests {
         evidence
     }
 
-    fn issue(scope: OperationScope, clock: &FixedClock) -> OperationLease {
+    fn evaluate(
+        evidence: &OperationRightsEvidence,
+        bound_request: &OperationRequest,
+        clock: &FixedClock,
+    ) -> Result<OperationLease, LifecycleError> {
         evaluate_preflight(
-            Some(&valid_evidence(scope)),
-            &request(scope),
+            Some(evidence),
+            bound_request,
             &observation(clock),
+            authority(),
         )
-        .expect("valid evidence issues a lease")
+    }
+
+    fn issue(scope: OperationScope, clock: &FixedClock) -> OperationLease {
+        evaluate(&valid_evidence(scope), &request(scope), clock)
+            .expect("valid evidence issues a signed lease")
     }
 
     fn issue_valid(
@@ -1258,16 +2039,12 @@ mod tests {
         valid_until_utc_ns: u64,
         clock: &FixedClock,
     ) -> OperationLease {
-        evaluate_preflight(
-            Some(&evidence_valid(
-                scope,
-                valid_from_utc_ns,
-                valid_until_utc_ns,
-            )),
+        evaluate(
+            &evidence_valid(scope, valid_from_utc_ns, valid_until_utc_ns),
             &request(scope),
-            &observation(clock),
+            clock,
         )
-        .expect("valid evidence issues a lease")
+        .expect("valid evidence issues a signed lease")
     }
 
     fn admit(lifecycle: &mut ConnectorLifecycle, scope: OperationScope, clock: &FixedClock) {
@@ -1275,7 +2052,8 @@ mod tests {
             .preflight(
                 Some(&valid_evidence(scope)),
                 &request(scope),
-                &observation(clock),
+                clock,
+                authority(),
             )
             .expect("admitted evidence passes preflight for the requested scope");
     }
@@ -1295,7 +2073,8 @@ mod tests {
                     valid_until_utc_ns,
                 )),
                 &request(scope),
-                &observation(clock),
+                clock,
+                authority(),
             )
             .expect("admitted evidence passes preflight for the requested scope");
     }
@@ -1307,19 +2086,22 @@ mod tests {
             .preflight(
                 Some(&unknown),
                 &request(scope),
-                &observation(&FixedClock::at(OBSERVED_AT)),
+                &FixedClock::at(OBSERVED_AT),
+                authority(),
             )
             .expect_err("unknown evidence denies the requested scope");
     }
 
     fn advance(lifecycle: &mut ConnectorLifecycle, target: ConnectorState, clock: &FixedClock) {
         if target == ConnectorState::Closed {
-            lifecycle.close().expect("cleanup closes the machine");
+            lifecycle
+                .close(clock, authority())
+                .expect("cleanup closes the machine");
             return;
         }
         if target == ConnectorState::Quarantine {
             lifecycle
-                .quarantine()
+                .quarantine(clock, authority())
                 .expect("cleanup quarantines the machine");
             return;
         }
@@ -1328,12 +2110,19 @@ mod tests {
         admit(lifecycle, scope, clock);
         let lease = issue(scope, clock);
         lifecycle
-            .advance(target, &lease, &observation(clock))
+            .advance(
+                target,
+                &lease,
+                &subject(),
+                clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect("an ordered transition with a current lease succeeds");
     }
 
     fn through_subscribe(clock: &FixedClock) -> ConnectorLifecycle {
-        let mut lifecycle = ConnectorLifecycle::new();
+        let mut lifecycle = lifecycle();
         for target in [
             ConnectorState::Connect,
             ConnectorState::Discover,
@@ -1346,9 +2135,9 @@ mod tests {
 
     fn through_phase(target: ConnectorState, clock: &FixedClock) -> ConnectorLifecycle {
         if target == ConnectorState::Preflight {
-            return ConnectorLifecycle::new();
+            return lifecycle();
         }
-        let mut lifecycle = ConnectorLifecycle::new();
+        let mut lifecycle = lifecycle();
         for phase in [
             ConnectorState::Connect,
             ConnectorState::Discover,
@@ -1366,6 +2155,12 @@ mod tests {
         lifecycle
     }
 
+    fn through_published(clock: &FixedClock) -> ConnectorLifecycle {
+        let mut lifecycle = through_phase(ConnectorState::Archive, clock);
+        advance(&mut lifecycle, ConnectorState::Publish, clock);
+        lifecycle
+    }
+
     fn nonterminal_phases() -> [ConnectorState; 8] {
         [
             ConnectorState::Preflight,
@@ -1378,16 +2173,15 @@ mod tests {
             ConnectorState::Archive,
         ]
     }
-
     #[test]
     fn unknown_rights_are_denied_with_the_stable_code() {
         let clock = FixedClock::at(OBSERVED_AT);
         let scope = OperationScope::ProviderConnection;
         let mut unknown = valid_evidence(scope);
         unknown.state = RightsEvidenceState::Unknown;
-        let mut lifecycle = ConnectorLifecycle::new();
+        let mut lifecycle = lifecycle();
         let error = lifecycle
-            .preflight(Some(&unknown), &request(scope), &observation(&clock))
+            .preflight(Some(&unknown), &request(scope), &clock, authority())
             .expect_err("unknown rights are denied");
         assert_eq!(
             error.reason_code(),
@@ -1409,7 +2203,14 @@ mod tests {
         );
         let lease = issue(scope, &clock);
         let blocked = lifecycle
-            .advance(ConnectorState::Connect, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("a denied connection scope blocks connect");
         assert_eq!(
             blocked.reason_code(),
@@ -1423,7 +2224,7 @@ mod tests {
         let clock = FixedClock::at(OBSERVED_AT);
         let obs = observation(&clock);
         let scope = OperationScope::ProviderConnection;
-        let error = evaluate_preflight(None, &request(scope), &obs)
+        let error = evaluate_preflight(None, &request(scope), &obs, authority())
             .expect_err("missing evidence is denied");
         assert_eq!(
             error.reason_code(),
@@ -1432,12 +2233,12 @@ mod tests {
         );
         let mut expired = valid_evidence(scope);
         expired.valid_until_utc_ns = Some(OBSERVED_AT);
-        let error = evaluate_preflight(Some(&expired), &request(scope), &obs)
+        let error = evaluate_preflight(Some(&expired), &request(scope), &obs, authority())
             .expect_err("expired evidence is denied");
         assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED, "expiry code");
         let mut out_of_scope = valid_evidence(scope);
         out_of_scope.state = RightsEvidenceState::OutOfScope;
-        let error = evaluate_preflight(Some(&out_of_scope), &request(scope), &obs)
+        let error = evaluate_preflight(Some(&out_of_scope), &request(scope), &obs, authority())
             .expect_err("out-of-scope evidence is denied");
         assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED, "scope-state code");
     }
@@ -1452,22 +2253,38 @@ mod tests {
         evidence.subject.instrument_ref = "another-instrument".to_owned();
         let mut wrong_terms = request(scope);
         wrong_terms.terms.permitted_uses = BTreeSet::from(["other_use".to_owned()]);
-        for request in [&wrong_operation, &wrong_terms] {
-            evaluate_preflight(Some(&valid_evidence(scope)), request, &observation(&clock))
-                .expect_err("a mismatched request is denied");
+        for bound_request in [&wrong_operation, &wrong_terms] {
+            evaluate_preflight(
+                Some(&valid_evidence(scope)),
+                bound_request,
+                &observation(&clock),
+                authority(),
+            )
+            .expect_err("a mismatched request is denied");
         }
-        evaluate_preflight(Some(&evidence), &request(scope), &observation(&clock))
-            .expect_err("identity-bound evidence is denied");
+        evaluate_preflight(
+            Some(&evidence),
+            &request(scope),
+            &observation(&clock),
+            authority(),
+        )
+        .expect_err("identity-bound evidence is denied");
         evidence = valid_evidence(scope);
         evidence.authority_digest = "z".repeat(64);
-        evaluate_preflight(Some(&evidence), &request(scope), &observation(&clock))
-            .expect_err("a malformed authority digest is denied");
+        evaluate_preflight(
+            Some(&evidence),
+            &request(scope),
+            &observation(&clock),
+            authority(),
+        )
+        .expect_err("a malformed authority digest is denied");
         let mut declared = request(scope);
         declared.declared_observed_at_utc_ns = LONG_SESSION_LATER;
         let lease = evaluate_preflight(
             Some(&valid_evidence(scope)),
             &declared,
             &observation(&clock),
+            authority(),
         )
         .expect("a caller-declared time is not a grant and cannot revoke one");
         assert!(
@@ -1482,8 +2299,13 @@ mod tests {
         let scope = OperationScope::LocalCapture;
         let mut evidence = valid_evidence(scope);
         evidence.granted_scopes = BTreeSet::from([OperationScope::Retention]);
-        let error = evaluate_preflight(Some(&evidence), &request(scope), &observation(&clock))
-            .expect_err("a scope absent from the evidence is denied");
+        let error = evaluate_preflight(
+            Some(&evidence),
+            &request(scope),
+            &observation(&clock),
+            authority(),
+        )
+        .expect_err("a scope absent from the evidence is denied");
         assert_eq!(
             error.reason_code(),
             RIGHTS_NOT_ADMITTED,
@@ -1495,11 +2317,19 @@ mod tests {
     #[test]
     fn ordering_is_enforced_even_after_admitted_preflight() {
         let clock = FixedClock::at(OBSERVED_AT);
-        let mut lifecycle = ConnectorLifecycle::new();
+        let mut lifecycle = lifecycle();
         admit(&mut lifecycle, OperationScope::ProviderConnection, &clock);
         let lease = issue(OperationScope::ProviderConnection, &clock);
+        let store = AtomicIdempotency::new();
         let error = lifecycle
-            .advance(ConnectorState::Capture, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Capture,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &store,
+            )
             .expect_err("capture cannot skip phases");
         assert_eq!(
             error.reason_code(),
@@ -1507,7 +2337,14 @@ mod tests {
             "out-of-order transition has a stable code"
         );
         let error = lifecycle
-            .advance(ConnectorState::Discover, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Discover,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &store,
+            )
             .expect_err("discover cannot precede connect");
         assert_eq!(
             error.reason,
@@ -1520,26 +2357,51 @@ mod tests {
             "state is unchanged"
         );
         lifecycle
-            .advance(ConnectorState::Connect, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &store,
+            )
             .expect("connect follows preflight");
         let error = lifecycle
-            .advance(ConnectorState::Connect, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &store,
+            )
             .expect_err("a repeated phase is not a transition");
         assert_eq!(
             error.reason,
             LifecycleReason::InvalidTransition,
             "repeated phase is denied"
         );
+        assert!(
+            !lifecycle.used_leases().is_empty(),
+            "only the successful transition consumed the lease"
+        );
     }
 
     #[test]
     fn denied_provider_scope_blocks_all_later_provider_phases() {
         let clock = FixedClock::at(OBSERVED_AT);
-        let mut lifecycle = ConnectorLifecycle::new();
+        let mut lifecycle = lifecycle();
         deny(&mut lifecycle, OperationScope::ProviderConnection);
         let lease = issue(OperationScope::ProviderConnection, &clock);
         let connect = lifecycle
-            .advance(ConnectorState::Connect, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("a denied connection capability blocks connect");
         assert_eq!(
             connect.reason_code(),
@@ -1551,11 +2413,19 @@ mod tests {
             .preflight(
                 Some(&valid_evidence(scope)),
                 &request(scope),
-                &observation(&clock),
+                &clock,
+                authority(),
             )
             .expect_err("the denied capability is never restored");
         let capture = lifecycle
-            .advance(ConnectorState::Capture, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Capture,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("capture is unreachable from preflight");
         assert_eq!(
             capture.reason_code(),
@@ -1580,7 +2450,14 @@ mod tests {
         deny(&mut lifecycle, OperationScope::DecodeTransform);
         let lease = issue(OperationScope::DecodeTransform, &clock);
         let error = lifecycle
-            .advance(ConnectorState::Decode, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Decode,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("decode needs the denied transform scope");
         assert_eq!(
             error.reason_code(),
@@ -1591,7 +2468,8 @@ mod tests {
             .preflight(
                 Some(&valid_evidence(OperationScope::DecodeTransform)),
                 &request(OperationScope::DecodeTransform),
-                &observation(&clock),
+                &clock,
+                authority(),
             )
             .expect_err("a later admission cannot restore a denied scope");
         assert!(
@@ -1612,7 +2490,14 @@ mod tests {
         deny(&mut lifecycle, OperationScope::DecodeTransform);
         let lease = issue(OperationScope::DecodeTransform, &clock);
         let error = lifecycle
-            .advance(ConnectorState::Validate, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Validate,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("validate needs the denied transform scope");
         assert_eq!(
             error.reason_code(),
@@ -1633,7 +2518,14 @@ mod tests {
         deny(&mut lifecycle, OperationScope::Retention);
         let lease = issue(OperationScope::Retention, &clock);
         let error = lifecycle
-            .advance(ConnectorState::Archive, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Archive,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("archive needs the denied retention scope");
         assert_eq!(
             error.reason_code(),
@@ -1658,7 +2550,14 @@ mod tests {
         deny(&mut lifecycle, OperationScope::Publication);
         let lease = issue(OperationScope::Publication, &clock);
         let error = lifecycle
-            .advance(ConnectorState::Publish, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Publish,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("publish needs the denied publication scope");
         assert_eq!(
             error.reason_code(),
@@ -1680,17 +2579,28 @@ mod tests {
     fn quarantine_branch_bypasses_publication() {
         let clock = FixedClock::at(OBSERVED_AT);
         let mut lifecycle = through_phase(ConnectorState::Validate, &clock);
-        lifecycle.quarantine().expect("quarantine follows validate");
+        lifecycle
+            .quarantine(&clock, authority())
+            .expect("quarantine follows validate");
         let lease = issue(OperationScope::Publication, &clock);
         let error = lifecycle
-            .advance(ConnectorState::Archive, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Archive,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("quarantine cannot archive");
         assert_eq!(
             error.reason,
             LifecycleReason::InvalidTransition,
             "quarantine blocks the publication path"
         );
-        lifecycle.close().expect("quarantine closes");
+        lifecycle
+            .close(&clock, authority())
+            .expect("quarantine closes");
         assert_eq!(
             lifecycle.state(),
             ConnectorState::Closed,
@@ -1715,9 +2625,11 @@ mod tests {
         let denied_before = lifecycle.denied_scopes().clone();
         let leases_before = lifecycle.used_leases().clone();
         lifecycle
-            .quarantine()
+            .quarantine(&clock, authority())
             .expect("cleanup is allowed after denial");
-        lifecycle.close().expect("closing is allowed after denial");
+        lifecycle
+            .close(&clock, authority())
+            .expect("closing is allowed after denial");
         assert_eq!(
             lifecycle.state(),
             ConnectorState::Closed,
@@ -1752,7 +2664,14 @@ mod tests {
         );
         let lease = issue(OperationScope::Publication, &clock);
         let error = lifecycle
-            .advance(ConnectorState::Publish, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Publish,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("a closed machine cannot publish");
         assert_eq!(
             error.reason,
@@ -1768,10 +2687,19 @@ mod tests {
             let mut lifecycle = through_phase(phase, &clock);
             let scope = required_scope_for_transition(phase, advanced_target(phase))
                 .expect("every nonterminal phase has an advanced successor");
-            lifecycle.revoke(scope);
+            lifecycle
+                .revoke(scope, &clock, authority())
+                .expect("revocation records an authenticated decision");
             let lease = issue(scope, &clock);
             let denied = lifecycle
-                .advance(advanced_target(phase), &lease, &observation(&clock))
+                .advance(
+                    advanced_target(phase),
+                    &lease,
+                    &subject(),
+                    &clock,
+                    authority(),
+                    &AtomicIdempotency::new(),
+                )
                 .expect_err("a revoked scope denies the next operation");
             let denial_message = format!(
                 "denial is reachable from {}: {}",
@@ -1786,16 +2714,18 @@ mod tests {
                 "{denial_message}"
             );
             lifecycle
-                .quarantine()
+                .quarantine(&clock, authority())
                 .expect("quarantine is reachable from every nonterminal phase");
             assert_eq!(
                 lifecycle.state(),
                 ConnectorState::Quarantine,
                 "abort lands in quarantine"
             );
-            lifecycle.close().expect("quarantine then closes");
-            let replayed =
-                ConnectorLifecycle::replay(lifecycle.log()).expect("the decision log replays");
+            lifecycle
+                .close(&clock, authority())
+                .expect("quarantine then closes");
+            let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+                .expect("the decision log replays");
             assert_eq!(replayed, lifecycle, "replay reproduces the machine");
             assert_eq!(
                 replayed.state(),
@@ -1839,8 +2769,9 @@ mod tests {
         ] {
             advance(&mut lifecycle, target, &clock);
         }
-        let replayed = ConnectorLifecycle::replay(lifecycle.log()).expect("the full log replays");
-        assert_eq!(replayed, lifecycle, "replay reconstructs the same machine");
+        let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+            .expect("the full log replays");
+        assert_eq!(replayed, lifecycle, "state replay reconstructs the machine");
         assert_eq!(
             replayed.state(),
             ConnectorState::Closed,
@@ -1858,8 +2789,8 @@ mod tests {
         let lifecycle = through_subscribe(&clock);
         let mut records = lifecycle.log().to_vec();
         records[2].sequence = 99;
-        let error =
-            ConnectorLifecycle::replay(&records).expect_err("tampered sequence is rejected");
+        let error = ConnectorLifecycle::replay_state(&records, subject())
+            .expect_err("tampered sequence is rejected");
         assert_eq!(
             error.reason,
             LifecycleReason::LogMismatch,
@@ -1867,8 +2798,8 @@ mod tests {
         );
         let mut records = lifecycle.log().to_vec();
         records[1].to = ConnectorState::Capture;
-        let error =
-            ConnectorLifecycle::replay(&records).expect_err("tampered transition is rejected");
+        let error = ConnectorLifecycle::replay_state(&records, subject())
+            .expect_err("tampered transition is rejected");
         assert_eq!(
             error.reason,
             LifecycleReason::LogMismatch,
@@ -1876,7 +2807,8 @@ mod tests {
         );
         let mut records = lifecycle.log().to_vec();
         records[0].scope = Some(OperationScope::Retention);
-        let error = ConnectorLifecycle::replay(&records).expect_err("tampered scope is rejected");
+        let error = ConnectorLifecycle::replay_state(&records, subject())
+            .expect_err("tampered scope is rejected");
         assert_eq!(
             error.reason,
             LifecycleReason::LogMismatch,
@@ -1884,7 +2816,8 @@ mod tests {
         );
         let mut records = lifecycle.log().to_vec();
         records[1].lease_digest = Some("tampered".to_owned());
-        let error = ConnectorLifecycle::replay(&records).expect_err("a tampered lease is rejected");
+        let error = ConnectorLifecycle::replay_state(&records, subject())
+            .expect_err("a tampered lease is rejected");
         assert_eq!(
             error.reason,
             LifecycleReason::LogMismatch,
@@ -1899,11 +2832,21 @@ mod tests {
         deny(&mut lifecycle, OperationScope::DecodeTransform);
         let lease = issue(OperationScope::DecodeTransform, &clock);
         lifecycle
-            .advance(ConnectorState::Validate, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Validate,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("validate is blocked by the denial");
-        let mut replayed =
-            ConnectorLifecycle::replay(lifecycle.log()).expect("a denied log replays faithfully");
-        assert_eq!(replayed, lifecycle, "replay mirrors the denied machine");
+        let mut replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+            .expect("a denied log replays faithfully");
+        assert_eq!(
+            replayed, lifecycle,
+            "state replay mirrors the denied machine"
+        );
         assert!(
             replayed.scope_denied(OperationScope::DecodeTransform),
             "the denied state is reproduced"
@@ -1916,7 +2859,8 @@ mod tests {
             .preflight(
                 Some(&valid_evidence(OperationScope::DecodeTransform)),
                 &request(OperationScope::DecodeTransform),
-                &observation(&clock),
+                &clock,
+                authority(),
             )
             .expect_err("even a valid preflight cannot restore a denied scope");
         let expected_phase = ConnectorState::Decode;
@@ -1937,11 +2881,10 @@ mod tests {
         expired.valid_until_utc_ns = Some(OBSERVED_AT);
         let mut out_of_scope = valid_evidence(scope);
         out_of_scope.state = RightsEvidenceState::OutOfScope;
-        let obs = observation(&clock);
         for evidence in [None, Some(&unknown), Some(&expired), Some(&out_of_scope)] {
             let mut lifecycle = through_phase(ConnectorState::Capture, &clock);
             lifecycle
-                .preflight(evidence, &request(scope), &obs)
+                .preflight(evidence, &request(scope), &clock, authority())
                 .expect_err("each non-admitted evidence kind denies");
             assert!(
                 lifecycle.scope_denied(scope),
@@ -1949,7 +2892,14 @@ mod tests {
             );
             let lease = issue(scope, &clock);
             let denied = lifecycle
-                .advance(ConnectorState::Decode, &lease, &obs)
+                .advance(
+                    ConnectorState::Decode,
+                    &lease,
+                    &subject(),
+                    &clock,
+                    authority(),
+                    &AtomicIdempotency::new(),
+                )
                 .expect_err("the denied capability blocks decode");
             assert_eq!(
                 denied.reason_code(),
@@ -1978,6 +2928,10 @@ mod tests {
             record.lease_digest.is_none(),
             "issuance is not an advanced transition"
         );
+        assert!(
+            is_authority_digest(&record.authority_mac),
+            "every decision carries authority evidence"
+        );
     }
 
     #[test]
@@ -1992,16 +2946,30 @@ mod tests {
         deny(&mut lifecycle, OperationScope::ResearchUse);
         let research_lease = issue(OperationScope::ResearchUse, &clock);
         lifecycle
-            .research_use(&research_lease, &observation(&clock))
+            .research_use(
+                &research_lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("research use stays denied after a denial");
         admit(&mut lifecycle, OperationScope::Retention, &clock);
         advance(&mut lifecycle, ConnectorState::Validate, &clock);
         advance(&mut lifecycle, ConnectorState::Archive, &clock);
-        lifecycle.quarantine().expect("quarantine follows archive");
-        lifecycle.close().expect("quarantine closes");
+        lifecycle
+            .quarantine(&clock, authority())
+            .expect("quarantine follows archive");
+        lifecycle
+            .close(&clock, authority())
+            .expect("quarantine closes");
 
-        let replayed = ConnectorLifecycle::replay(lifecycle.log()).expect("the mixed log replays");
-        assert_eq!(replayed, lifecycle, "replay rebuilds the exact machine");
+        let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+            .expect("the mixed log replays");
+        assert_eq!(
+            replayed, lifecycle,
+            "state replay rebuilds the exact machine"
+        );
         assert_eq!(
             replayed.state(),
             ConnectorState::Closed,
@@ -2024,14 +2992,26 @@ mod tests {
     #[test]
     fn research_use_requires_its_own_operation_scope() {
         let clock = FixedClock::at(OBSERVED_AT);
-        let mut lifecycle = ConnectorLifecycle::new();
+        let mut lifecycle = lifecycle();
         let lease = issue(OperationScope::ResearchUse, &clock);
         lifecycle
-            .research_use(&lease, &observation(&clock))
+            .research_use(
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("research use is denied without its own scope");
         admit(&mut lifecycle, OperationScope::ResearchUse, &clock);
         lifecycle
-            .research_use(&lease, &observation(&clock))
+            .research_use(
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect("research use is admitted with a current lease");
         assert!(
             !lifecycle.scope_admitted(OperationScope::ProviderConnection),
@@ -2044,15 +3024,23 @@ mod tests {
     fn leases_expire_before_every_operation() {
         let clock = FixedClock::at(OBSERVED_AT);
         for phase in nonterminal_phases() {
+            clock.set(OBSERVED_AT);
             let target = advanced_target(phase);
             let scope = required_scope_for_transition(phase, target)
                 .expect("every advanced target has a scope");
             let mut lifecycle = through_phase(phase, &clock);
             admit(&mut lifecycle, scope, &clock);
             let lease = issue(scope, &clock);
-            clock.now.set(VALID_UNTIL);
+            clock.set(VALID_UNTIL);
             let expired = lifecycle
-                .advance(target, &lease, &observation(&clock))
+                .advance(
+                    target,
+                    &lease,
+                    &subject(),
+                    &clock,
+                    authority(),
+                    &AtomicIdempotency::new(),
+                )
                 .expect_err("an expired lease denies the operation");
             let expiry_message = format!("expiry denies {} -> {}", phase.as_str(), target.as_str());
             assert_eq!(
@@ -2065,11 +3053,26 @@ mod tests {
                 lifecycle.scope_admitted(scope),
                 "expiry does not permanently deny the scope"
             );
-            clock.now.set(OBSERVED_AT);
-            let fresh = issue(scope, &clock);
-            admit(&mut lifecycle, scope, &clock);
+            // Time never moves backwards: issue a fresh lease for the later
+            // observation instead of rewinding the trusted clock.
+            clock.set(VALID_UNTIL + 1);
+            let fresh = issue_valid(scope, VALID_UNTIL, VALID_UNTIL + 1_000, &clock);
+            admit_valid(
+                &mut lifecycle,
+                scope,
+                VALID_UNTIL,
+                VALID_UNTIL + 1_000,
+                &clock,
+            );
             lifecycle
-                .advance(target, &fresh, &observation(&clock))
+                .advance(
+                    target,
+                    &fresh,
+                    &subject(),
+                    &clock,
+                    authority(),
+                    &AtomicIdempotency::new(),
+                )
                 .expect("a fresh lease permits the operation");
         }
     }
@@ -2083,9 +3086,18 @@ mod tests {
                 .expect("every advanced target has a scope");
             let mut lifecycle = through_phase(phase, &clock);
             let lease = issue(scope, &clock);
-            lifecycle.revoke(scope);
+            lifecycle
+                .revoke(scope, &clock, authority())
+                .expect("revocation records an authenticated decision");
             let denied = lifecycle
-                .advance(target, &lease, &observation(&clock))
+                .advance(
+                    target,
+                    &lease,
+                    &subject(),
+                    &clock,
+                    authority(),
+                    &AtomicIdempotency::new(),
+                )
                 .expect_err("revocation denies the outstanding lease");
             let revocation_message = format!(
                 "revocation denies {} -> {}: {}",
@@ -2105,9 +3117,12 @@ mod tests {
                 phase,
                 "revocation never advances the phase"
             );
-            let replayed =
-                ConnectorLifecycle::replay(lifecycle.log()).expect("the revocation log replays");
-            assert_eq!(replayed, lifecycle, "replay reproduces the revocation");
+            let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+                .expect("the revocation log replays");
+            assert_eq!(
+                replayed, lifecycle,
+                "state replay reproduces the revocation"
+            );
         }
     }
 
@@ -2118,11 +3133,18 @@ mod tests {
         let retention = issue(OperationScope::Retention, &clock);
         admit(&mut lifecycle, OperationScope::Retention, &clock);
         lifecycle
-            .advance(ConnectorState::Archive, &retention, &observation(&clock))
+            .advance(
+                ConnectorState::Archive,
+                &retention,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect("the first archive lease is current");
 
         // A long-lived session crosses the original lease's validity interval.
-        clock.now.set(LONG_SESSION_LATER);
+        clock.set(LONG_SESSION_LATER);
         admit_valid(
             &mut lifecycle,
             OperationScope::Publication,
@@ -2131,7 +3153,14 @@ mod tests {
             &clock,
         );
         let error = lifecycle
-            .advance(ConnectorState::Publish, &retention, &observation(&clock))
+            .advance(
+                ConnectorState::Publish,
+                &retention,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect_err("a stale lease cannot authorise a later operation");
         assert_eq!(
             error.reason_code(),
@@ -2150,7 +3179,14 @@ mod tests {
             &clock,
         );
         lifecycle
-            .advance(ConnectorState::Publish, &fresh, &observation(&clock))
+            .advance(
+                ConnectorState::Publish,
+                &fresh,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
             .expect("a fresh lease works after a long session");
         assert_eq!(
             lifecycle.state(),
@@ -2164,36 +3200,44 @@ mod tests {
     }
 
     #[test]
-    fn tampered_lease_or_observation_is_not_a_grant() {
+    fn forged_or_modified_leases_are_rejected() {
         let clock = FixedClock::at(OBSERVED_AT);
-        let mut lifecycle = ConnectorLifecycle::new();
-        admit(&mut lifecycle, OperationScope::ProviderConnection, &clock);
-        let mut tampered = issue(OperationScope::ProviderConnection, &clock);
+        let scope = OperationScope::ProviderConnection;
+        let mut lifecycle = lifecycle();
+        admit(&mut lifecycle, scope, &clock);
+        let mut tampered = issue(scope, &clock);
         tampered.authority_digest = "b".repeat(64);
         assert!(
-            !tampered.is_current_at(&observation(&clock)),
-            "a mutated authority digest breaks the lease seal"
+            tampered.is_current_at(&observation(&clock)),
+            "a time-only check is not an authority check"
         );
         let error = lifecycle
-            .advance(ConnectorState::Connect, &tampered, &observation(&clock))
-            .expect_err("a tampered lease cannot authorise a transition");
+            .advance(
+                ConnectorState::Connect,
+                &tampered,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("a modified lease cannot authorise a transition");
         assert_eq!(
             error.reason_code(),
             RIGHTS_NOT_ADMITTED,
-            "tampering fails closed"
+            "modification fails closed"
         );
-        let fake_observation = TrustedObservation {
-            now_utc_ns: OBSERVED_AT,
-            seal: String::new(),
-        };
-        let genuine = issue(OperationScope::ProviderConnection, &clock);
-        let error = lifecycle
-            .advance(ConnectorState::Connect, &genuine, &fake_observation)
-            .expect_err("a caller-supplied observation is not trusted");
+        let unconfigured = KeyedLeaseAuthority::unconfigured();
+        let error = evaluate_preflight(
+            Some(&valid_evidence(scope)),
+            &request(scope),
+            &observation(&clock),
+            &unconfigured,
+        )
+        .expect_err("an authority without a key cannot issue a lease");
         assert_eq!(
             error.reason_code(),
             RIGHTS_NOT_ADMITTED,
-            "observation authenticity is checked"
+            "production authority fails closed"
         );
         assert_eq!(
             lifecycle.state(),
@@ -2205,14 +3249,29 @@ mod tests {
     #[test]
     fn a_consumed_lease_cannot_be_reused_for_another_operation() {
         let clock = FixedClock::at(OBSERVED_AT);
-        let mut lifecycle = ConnectorLifecycle::new();
+        let mut lifecycle = lifecycle();
         let lease = issue(OperationScope::ProviderConnection, &clock);
         admit(&mut lifecycle, OperationScope::ProviderConnection, &clock);
+        let store = AtomicIdempotency::new();
         lifecycle
-            .advance(ConnectorState::Connect, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &store,
+            )
             .expect("the lease authorises connect");
         let error = lifecycle
-            .advance(ConnectorState::Discover, &lease, &observation(&clock))
+            .advance(
+                ConnectorState::Discover,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &store,
+            )
             .expect_err("the same lease cannot authorise discover");
         assert_eq!(
             error.reason_code(),
@@ -2224,5 +3283,559 @@ mod tests {
             ConnectorState::Connect,
             "reuse did not advance the phase"
         );
+    }
+
+    #[test]
+    fn session_requires_a_complete_subject() {
+        let incomplete = LeaseSubject {
+            instrument_ref: String::new(),
+            ..subject()
+        };
+        ConnectorLifecycle::new(incomplete).expect_err("an unbound session cannot start");
+        assert_eq!(
+            lifecycle().subject(),
+            &subject(),
+            "a complete session keeps its immutable subject"
+        );
+    }
+
+    #[test]
+    fn cross_source_lease_substitution_is_denied() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = lifecycle();
+        let scope = OperationScope::ProviderConnection;
+        admit(&mut lifecycle, scope, &clock);
+        let lease = issue(scope, &clock);
+        let error = lifecycle
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &other_source(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("a connection lease cannot be used for another source");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "cross-source substitution denied"
+        );
+        assert!(error.detail.contains("subject"), "the binding is named");
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Preflight,
+            "substitution never changed the phase"
+        );
+        // A lease issued for source A cannot capture source B either.
+        admit(&mut lifecycle, OperationScope::LocalCapture, &clock);
+        let capture = issue(OperationScope::LocalCapture, &clock);
+        let mut at_connect = through_subscribe(&clock);
+        admit(&mut at_connect, OperationScope::LocalCapture, &clock);
+        let error = at_connect
+            .advance(
+                ConnectorState::Capture,
+                &capture,
+                &other_source(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("a lease for source A cannot capture source B");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "cross-source capture denied"
+        );
+        assert_eq!(
+            at_connect.state(),
+            ConnectorState::Subscribe,
+            "cross-source capture never advanced the phase"
+        );
+    }
+
+    #[test]
+    fn cross_instrument_lease_substitution_is_denied() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = through_subscribe(&clock);
+        let scope = OperationScope::LocalCapture;
+        admit(&mut lifecycle, scope, &clock);
+        let lease = issue(scope, &clock);
+        let error = lifecycle
+            .advance(
+                ConnectorState::Capture,
+                &lease,
+                &other_instrument(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("a lease for one instrument cannot capture another");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "cross-instrument substitution denied"
+        );
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Subscribe,
+            "cross-instrument substitution never advanced the phase"
+        );
+    }
+
+    #[test]
+    fn rollback_of_trusted_time_fails_closed() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = lifecycle();
+        admit(&mut lifecycle, OperationScope::ProviderConnection, &clock);
+        let lease = issue(OperationScope::ProviderConnection, &clock);
+        lifecycle
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect("the trusted observation is fresh");
+        clock.set(OBSERVED_AT - 1);
+        let error = lifecycle
+            .preflight(
+                Some(&valid_evidence(OperationScope::LocalCapture)),
+                &request(OperationScope::LocalCapture),
+                &clock,
+                authority(),
+            )
+            .expect_err("a wall-clock rollback is denied");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "rollback fails closed"
+        );
+        assert!(
+            error.detail.contains("rolled back"),
+            "the rollback is named"
+        );
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Connect,
+            "rollback never changes the phase"
+        );
+    }
+
+    #[test]
+    fn concurrent_duplicate_claims_only_one_commits() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = lifecycle();
+        admit(&mut lifecycle, OperationScope::ProviderConnection, &clock);
+        let lease = issue(OperationScope::ProviderConnection, &clock);
+        let shared = Arc::new(AtomicIdempotency::new());
+        let shared_clock = Arc::new(FixedClock::at(OBSERVED_AT));
+        let machine = Arc::new(Mutex::new(lifecycle));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let machine = Arc::clone(&machine);
+            let claims = Arc::clone(&shared);
+            let worker_clock = Arc::clone(&shared_clock);
+            let attempted_lease = lease.clone();
+            handles.push(thread::spawn(move || {
+                let mut guard = machine.lock().expect("machine lock is available");
+                guard.advance(
+                    ConnectorState::Connect,
+                    &attempted_lease,
+                    &subject(),
+                    &*worker_clock,
+                    authority(),
+                    &claims,
+                )
+            }));
+        }
+        let successes = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker joined").is_ok())
+            .filter(|committed| *committed)
+            .count();
+        assert_eq!(successes, 1, "exactly one duplicate attempt commits");
+        assert_eq!(
+            machine.lock().expect("machine lock is available").state(),
+            ConnectorState::Connect,
+            "the committed attempt advanced exactly once"
+        );
+    }
+
+    #[test]
+    fn restart_does_not_revive_a_consumed_lease() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let shared = AtomicIdempotency::new();
+        let scope = OperationScope::ProviderConnection;
+        let lease = issue(scope, &clock);
+        let mut first = lifecycle();
+        admit(&mut first, scope, &clock);
+        first
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &shared,
+            )
+            .expect("the lease authorises connect before restart");
+        let mut restarted = lifecycle();
+        admit(&mut restarted, scope, &clock);
+        let error = restarted
+            .advance(
+                ConnectorState::Connect,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &shared,
+            )
+            .expect_err("a restart cannot revive a claimed lease");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "one-shot research denial"
+        );
+        assert_eq!(
+            restarted.state(),
+            ConnectorState::Preflight,
+            "the restarted machine did not move"
+        );
+    }
+
+    #[test]
+    fn research_use_is_one_shot_and_records_its_decision() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = lifecycle();
+        admit(&mut lifecycle, OperationScope::ResearchUse, &clock);
+        let lease = issue(OperationScope::ResearchUse, &clock);
+        let store = AtomicIdempotency::new();
+        lifecycle
+            .research_use(&lease, &subject(), &clock, authority(), &store)
+            .expect("the first research use consumes the lease");
+        let error = lifecycle
+            .research_use(&lease, &subject(), &clock, authority(), &store)
+            .expect_err("a second research use is denied");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "unpermitted use denied"
+        );
+        let records: Vec<_> = lifecycle
+            .log()
+            .iter()
+            .filter(|record| record.kind == DecisionKind::ResearchUsed)
+            .collect();
+        assert_eq!(
+            records.len(),
+            1,
+            "exactly one research decision is recorded"
+        );
+        assert_eq!(
+            records[0].lease_digest.as_deref(),
+            Some(lease.signature()),
+            "the decision is bound to the consumed lease"
+        );
+        let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+            .expect("the one-shot log replays");
+        assert_eq!(replayed, lifecycle, "state replay mirrors one-shot use");
+    }
+
+    #[test]
+    fn unpermitted_research_use_is_denied() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = lifecycle();
+        admit(&mut lifecycle, OperationScope::ResearchUse, &clock);
+        let bound_terms = terms_with_uses(&["publication"]);
+        let evidence = evidence_with_terms(OperationScope::ResearchUse, &bound_terms);
+        let bound_request = request_with_terms(OperationScope::ResearchUse, &bound_terms);
+        let lease = evaluate(&evidence, &bound_request, &clock)
+            .expect("a signed lease can carry an unpermitted use");
+        let error = lifecycle
+            .research_use(
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("research use is not a permitted use of this lease");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "elapsed retention denied"
+        );
+        assert!(error.detail.contains("permit"), "the use policy is named");
+    }
+
+    #[test]
+    fn archive_beyond_retention_maximum_is_denied() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = through_phase(ConnectorState::Validate, &clock);
+        admit(&mut lifecycle, OperationScope::Retention, &clock);
+        let bound_terms = LeaseTerms {
+            retention_until_utc_ns: OBSERVED_AT,
+            permitted_uses: terms().permitted_uses,
+        };
+        let evidence = evidence_with_terms(OperationScope::Retention, &bound_terms);
+        let bound_request = request_with_terms(OperationScope::Retention, &bound_terms);
+        // Issuance happens before the maximum; the operation happens at it.
+        let issuance_clock = FixedClock::at(OBSERVED_AT - 1);
+        let lease = evaluate(&evidence, &bound_request, &issuance_clock)
+            .expect("a signed lease can be issued before its retention maximum");
+        let error = lifecycle
+            .advance(
+                ConnectorState::Archive,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("an elapsed retention maximum denies archive");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "zero retention at issuance"
+        );
+        assert!(
+            error.detail.contains("retention"),
+            "the retention boundary is named"
+        );
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Validate,
+            "no archive happened"
+        );
+    }
+
+    #[test]
+    fn zero_retention_is_denied() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let scope = OperationScope::Retention;
+        let zero = LeaseTerms {
+            retention_until_utc_ns: 0,
+            permitted_uses: terms().permitted_uses,
+        };
+        let error = evaluate_preflight(
+            Some(&evidence_with_terms(scope, &zero)),
+            &request_with_terms(scope, &zero),
+            &observation(&clock),
+            authority(),
+        )
+        .expect_err("a missing retention maximum cannot issue a lease");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "zero retention at operation"
+        );
+        let mut lifecycle = through_phase(ConnectorState::Validate, &clock);
+        admit(&mut lifecycle, scope, &clock);
+        let mut lease = issue(scope, &clock);
+        lease.terms.retention_until_utc_ns = 0;
+        let error = lifecycle
+            .advance(
+                ConnectorState::Archive,
+                &lease,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("a zero retention maximum denies the operation");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "every record counted"
+        );
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Validate,
+            "final state is publish"
+        );
+    }
+
+    #[test]
+    fn verify_audit_log_requires_key_and_detects_tampering() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let lifecycle = through_published(&clock);
+        let records = lifecycle.log();
+        let verified = verify_audit_log(records, subject(), authority())
+            .expect("an authenticated, intact log verifies");
+        assert_eq!(verified.record_count, records.len(), "every record counted");
+        assert_eq!(
+            verified.final_state,
+            ConnectorState::Publish,
+            "final state is publish"
+        );
+        assert_eq!(verified.subject, subject(), "bound subject matches");
+        let unconfigured = KeyedLeaseAuthority::unconfigured();
+        let error = verify_audit_log(records, subject(), &unconfigured)
+            .expect_err("verification fails closed without a key");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "unconfigured key fails closed"
+        );
+        let mut tampered = records.to_vec();
+        tampered[1].reason_code = Some(LifecycleReason::InvalidTransition);
+        let error = verify_audit_log(&tampered, subject(), authority())
+            .expect_err("a tampered decision breaks the MAC chain");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "tampering fails closed"
+        );
+        let mut tampered = records.to_vec();
+        tampered[0].authority_mac = "a".repeat(64);
+        let error = verify_audit_log(&tampered, subject(), authority())
+            .expect_err("a replaced authority MAC is rejected");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "replaced MAC fails closed"
+        );
+        let error = verify_audit_log(&[], subject(), authority())
+            .expect_err("an empty log has no authority evidence");
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "empty log fails closed"
+        );
+    }
+
+    #[test]
+    fn state_replay_alone_is_not_an_authority_result() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let lifecycle = through_published(&clock);
+        let state = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+            .expect("state replay succeeds without any authority key");
+        assert_eq!(state.state(), ConnectorState::Publish, "replay final state");
+        let unconfigured = KeyedLeaseAuthority::unconfigured();
+        assert!(
+            verify_audit_log(lifecycle.log(), subject(), &unconfigured).is_err(),
+            "state replay never proves authority"
+        );
+    }
+
+    #[test]
+    fn publication_revocation_marks_artifact_inactive_and_blocks_reuse() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = through_published(&clock);
+        assert!(
+            lifecycle.artifact_active(),
+            "publication activates the artifact"
+        );
+        lifecycle
+            .revoke_publication(&clock, authority())
+            .expect("revocation is always available after publication");
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Revoked,
+            "revocation state"
+        );
+        assert!(
+            !lifecycle.artifact_active(),
+            "revocation never leaves an unauthorised artifact active"
+        );
+        let last = lifecycle.log().last().expect("a revocation record exists");
+        assert_eq!(
+            last.kind,
+            DecisionKind::PublicationRevoked,
+            "revocation decision recorded"
+        );
+        assert_eq!(last.to, ConnectorState::Revoked, "revocation target state");
+        let error = lifecycle
+            .revoke_publication(&clock, authority())
+            .expect_err("a second revocation has no active artifact");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "reuse of revocation is denied"
+        );
+        let publication = issue(OperationScope::Publication, &clock);
+        let error = lifecycle
+            .advance(
+                ConnectorState::Publish,
+                &publication,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("a revoked artifact cannot be published again");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "revocation reuse denied"
+        );
+        let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+            .expect("the revocation log replays");
+        assert_eq!(replayed, lifecycle, "state replay mirrors revocation");
+        lifecycle
+            .close(&clock, authority())
+            .expect("a revoked artifact can be closed");
+    }
+
+    #[test]
+    fn publication_retraction_marks_artifact_inactive_and_blocks_reuse() {
+        let clock = FixedClock::at(OBSERVED_AT);
+        let mut lifecycle = through_published(&clock);
+        lifecycle
+            .retract_publication(&clock, authority())
+            .expect("retraction is available after publication");
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Retracted,
+            "retraction state"
+        );
+        assert!(
+            !lifecycle.artifact_active(),
+            "retraction marks the artifact inactive"
+        );
+        let last = lifecycle.log().last().expect("a retraction record exists");
+        assert_eq!(
+            last.kind,
+            DecisionKind::PublicationRetracted,
+            "retraction decision recorded"
+        );
+        let error = lifecycle
+            .retract_publication(&clock, authority())
+            .expect_err("a second retraction is denied");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "retraction reuse denied"
+        );
+        let error = lifecycle
+            .revoke_publication(&clock, authority())
+            .expect_err("a retracted artifact cannot be revoked");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "revocation after retraction"
+        );
+        let publication = issue(OperationScope::Publication, &clock);
+        let error = lifecycle
+            .advance(
+                ConnectorState::Publish,
+                &publication,
+                &subject(),
+                &clock,
+                authority(),
+                &AtomicIdempotency::new(),
+            )
+            .expect_err("a retracted artifact cannot be published again");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "republish after retraction"
+        );
+        let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
+            .expect("the retraction log replays");
+        assert_eq!(replayed, lifecycle, "state replay mirrors retraction");
     }
 }
