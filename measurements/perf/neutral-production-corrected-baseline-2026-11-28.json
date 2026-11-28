@@ -3,6 +3,37 @@
   "artifact": "neutral-production-corrected-baseline-2026-11-28.json",
   "generated_utc_timestamp": "2026-11-28T04:51:53Z",
   "base_sha": "2ef503ff397186abfcd7fc619f0d1703d73aa9d1",
+  "production_source_revision": "e2bd10c5f39ec271a030a863384dc6effcf15f1c",
+  "production_source_tree_digest": "c64ea676afd615d0fb9096e4e2331e03d3034cdf",
+  "production_source_tree_digest_method": "git rev-parse e2bd10c5f39ec271a030a863384dc6effcf15f1c^{tree}; lowercase hex SHA-1 tree object id",
+  "benchmark_harness_digest": "c87149923baffb37b8eada46bb4de22a0023c93b206f9a136f2cb7590f12d8d4",
+  "benchmark_verifier_digest": "eb7bba4c61673f1ee1ca2023e713027ee55808553374bd9e3d29c2650317e954",
+  "cargo_lock_digest": "aff3f53548684440ed597cd8f52648c3328da8b2665d756957008208d7fabb12",
+  "file_digest_method": "lowercase hex SHA-256 of exact bytes from git show <measured revision>:<path>; harness=benches/production_components.rs, verifier=scripts/verify_benchmark_evidence.py, lock=Cargo.lock",
+  "rustc_version": "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+  "target_triple": "aarch64-apple-darwin",
+  "build_profile": "release (cargo bench); lto=thin, codegen-units=8, panic=abort",
+  "compiler_flags": "(none)",
+  "benchmark_binary_digest": "sha256:6fe7a18d30f1a6c9e787752fae619c636339cdacf34ecaa033e73a812e342a8a",
+  "workload_digest": {
+    "method": "fnv1a128 over each process's seeded workload bytes; ordered by process_index and copied verbatim from each process binding and per-process metadata",
+    "per_process": [
+      "fnv1a128:b501eddf274f2471d21e260916215800",
+      "fnv1a128:2aaa1d7da093673183420994d524f344",
+      "fnv1a128:8764c6d1d5c8d7bc2f32f29e11edd3f9",
+      "fnv1a128:370eb07c75e171627ff64a186ac1b50b",
+      "fnv1a128:6f6efb05749a6741af7107646c2b2ca8"
+    ]
+  },
+  "raw_observation_digest": "05f604482ec0bcdea47d12b1e9fd3161fe9c1eda3b32be18bc94ad96b83ff194",
+  "raw_observation_digest_method": "sha256 over UTF-8 bytes formed by concatenating, in documented stage order, each stage's DIGEST INPUT FORMAT byte string with no separators",
+  "measurement_revision_vs_base": {
+    "measured_revision": "e2bd10c5f39ec271a030a863384dc6effcf15f1c",
+    "binding_base": "2df4b8e94b9b9c7eea95488c89659c788ca14c49",
+    "legacy_harness_captured_base_sha": "2ef503ff397186abfcd7fc619f0d1703d73aa9d1",
+    "later_source_changes_not_measured": true,
+    "statement": "Measured at production tree e2bd10c5f39ec271a030a863384dc6effcf15f1c (the P1.2 merge). Binding base 2df4b8e94b9b9c7eea95488c89659c788ca14c49 adds later P1.3 connector-lifecycle and source-event source changes that were NOT measured. The legacy base_sha and each process source_sha retain the harness-captured 2ef503ff397186abfcd7fc619f0d1703d73aa9d1 byte-for-byte; this evidence must not be relabelled as covering the later base or any later source."
+  },
   "harness": "production_components",
   "mode": "corrected-baseline",
   "methodology": {
