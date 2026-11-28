@@ -3316,7 +3316,11 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("a connection lease cannot be used for another source");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "cross-source substitution denied"
+        );
         assert!(error.detail.contains("subject"), "the binding is named");
         assert_eq!(
             lifecycle.state(),
@@ -3338,7 +3342,11 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("a lease for source A cannot capture source B");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "cross-source capture denied"
+        );
         assert_eq!(
             at_connect.state(),
             ConnectorState::Subscribe,
@@ -3363,7 +3371,11 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("a lease for one instrument cannot capture another");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "cross-instrument substitution denied"
+        );
         assert_eq!(
             lifecycle.state(),
             ConnectorState::Subscribe,
@@ -3482,7 +3494,11 @@ mod tests {
                 &shared,
             )
             .expect_err("a restart cannot revive a claimed lease");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "one-shot research denial"
+        );
         assert_eq!(
             restarted.state(),
             ConnectorState::Preflight,
@@ -3503,7 +3519,11 @@ mod tests {
         let error = lifecycle
             .research_use(&lease, &subject(), &clock, authority(), &store)
             .expect_err("a second research use is denied");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "unpermitted use denied"
+        );
         let records: Vec<_> = lifecycle
             .log()
             .iter()
@@ -3543,7 +3563,11 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("research use is not a permitted use of this lease");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "elapsed retention denied"
+        );
         assert!(error.detail.contains("permit"), "the use policy is named");
     }
 
@@ -3572,7 +3596,11 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("an elapsed retention maximum denies archive");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "zero retention at issuance"
+        );
         assert!(
             error.detail.contains("retention"),
             "the retention boundary is named"
@@ -3599,7 +3627,11 @@ mod tests {
             authority(),
         )
         .expect_err("a missing retention maximum cannot issue a lease");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "zero retention at operation"
+        );
         let mut lifecycle = through_phase(ConnectorState::Validate, &clock);
         admit(&mut lifecycle, scope, &clock);
         let mut lease = issue(scope, &clock);
@@ -3614,8 +3646,16 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("a zero retention maximum denies the operation");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
-        assert_eq!(lifecycle.state(), ConnectorState::Validate);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "every record counted"
+        );
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Validate,
+            "final state is publish"
+        );
     }
 
     #[test]
@@ -3625,26 +3665,46 @@ mod tests {
         let records = lifecycle.log();
         let verified = verify_audit_log(records, subject(), authority())
             .expect("an authenticated, intact log verifies");
-        assert_eq!(verified.record_count, records.len());
-        assert_eq!(verified.final_state, ConnectorState::Publish);
-        assert_eq!(verified.subject, subject());
+        assert_eq!(verified.record_count, records.len(), "every record counted");
+        assert_eq!(
+            verified.final_state,
+            ConnectorState::Publish,
+            "final state is publish"
+        );
+        assert_eq!(verified.subject, subject(), "bound subject matches");
         let unconfigured = KeyedLeaseAuthority::unconfigured();
         let error = verify_audit_log(records, subject(), &unconfigured)
             .expect_err("verification fails closed without a key");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "unconfigured key fails closed"
+        );
         let mut tampered = records.to_vec();
         tampered[1].reason_code = Some(LifecycleReason::InvalidTransition);
         let error = verify_audit_log(&tampered, subject(), authority())
             .expect_err("a tampered decision breaks the MAC chain");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "tampering fails closed"
+        );
         let mut tampered = records.to_vec();
         tampered[0].authority_mac = "a".repeat(64);
         let error = verify_audit_log(&tampered, subject(), authority())
             .expect_err("a replaced authority MAC is rejected");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "replaced MAC fails closed"
+        );
         let error = verify_audit_log(&[], subject(), authority())
             .expect_err("an empty log has no authority evidence");
-        assert_eq!(error.reason_code(), RIGHTS_NOT_ADMITTED);
+        assert_eq!(
+            error.reason_code(),
+            RIGHTS_NOT_ADMITTED,
+            "empty log fails closed"
+        );
     }
 
     #[test]
@@ -3653,7 +3713,7 @@ mod tests {
         let lifecycle = through_published(&clock);
         let state = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
             .expect("state replay succeeds without any authority key");
-        assert_eq!(state.state(), ConnectorState::Publish);
+        assert_eq!(state.state(), ConnectorState::Publish, "replay final state");
         let unconfigured = KeyedLeaseAuthority::unconfigured();
         assert!(
             verify_audit_log(lifecycle.log(), subject(), &unconfigured).is_err(),
@@ -3672,14 +3732,22 @@ mod tests {
         lifecycle
             .revoke_publication(&clock, authority())
             .expect("revocation is always available after publication");
-        assert_eq!(lifecycle.state(), ConnectorState::Revoked);
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Revoked,
+            "revocation state"
+        );
         assert!(
             !lifecycle.artifact_active(),
             "revocation never leaves an unauthorised artifact active"
         );
         let last = lifecycle.log().last().expect("a revocation record exists");
-        assert_eq!(last.kind, DecisionKind::PublicationRevoked);
-        assert_eq!(last.to, ConnectorState::Revoked);
+        assert_eq!(
+            last.kind,
+            DecisionKind::PublicationRevoked,
+            "revocation decision recorded"
+        );
+        assert_eq!(last.to, ConnectorState::Revoked, "revocation target state");
         let error = lifecycle
             .revoke_publication(&clock, authority())
             .expect_err("a second revocation has no active artifact");
@@ -3699,7 +3767,11 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("a revoked artifact cannot be published again");
-        assert_eq!(error.reason_code(), "INVALID_TRANSITION");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "revocation reuse denied"
+        );
         let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
             .expect("the revocation log replays");
         assert_eq!(replayed, lifecycle, "state replay mirrors revocation");
@@ -3715,21 +3787,37 @@ mod tests {
         lifecycle
             .retract_publication(&clock, authority())
             .expect("retraction is available after publication");
-        assert_eq!(lifecycle.state(), ConnectorState::Retracted);
+        assert_eq!(
+            lifecycle.state(),
+            ConnectorState::Retracted,
+            "retraction state"
+        );
         assert!(
             !lifecycle.artifact_active(),
             "retraction marks the artifact inactive"
         );
         let last = lifecycle.log().last().expect("a retraction record exists");
-        assert_eq!(last.kind, DecisionKind::PublicationRetracted);
+        assert_eq!(
+            last.kind,
+            DecisionKind::PublicationRetracted,
+            "retraction decision recorded"
+        );
         let error = lifecycle
             .retract_publication(&clock, authority())
             .expect_err("a second retraction is denied");
-        assert_eq!(error.reason_code(), "INVALID_TRANSITION");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "retraction reuse denied"
+        );
         let error = lifecycle
             .revoke_publication(&clock, authority())
             .expect_err("a retracted artifact cannot be revoked");
-        assert_eq!(error.reason_code(), "INVALID_TRANSITION");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "revocation after retraction"
+        );
         let publication = issue(OperationScope::Publication, &clock);
         let error = lifecycle
             .advance(
@@ -3741,7 +3829,11 @@ mod tests {
                 &AtomicIdempotency::new(),
             )
             .expect_err("a retracted artifact cannot be published again");
-        assert_eq!(error.reason_code(), "INVALID_TRANSITION");
+        assert_eq!(
+            error.reason_code(),
+            "INVALID_TRANSITION",
+            "republish after retraction"
+        );
         let replayed = ConnectorLifecycle::replay_state(lifecycle.log(), subject())
             .expect("the retraction log replays");
         assert_eq!(replayed, lifecycle, "state replay mirrors retraction");
