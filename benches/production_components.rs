@@ -22,6 +22,20 @@
 //! A faster path that changes event order, journal bytes or replayed state is a
 //! failure: the same correctness checks run before and after the measured pass
 //! and their digests must be identical.
+//!
+//! RAW EVIDENCE DIGEST INPUT FORMAT (byte-exact; `scripts/verify_benchmark_evidence.py`
+//! reimplements this independently): for one stage, build a UTF-8 byte string by
+//! concatenating one line per raw observation, ordered by process index ascending
+//! (the order of processes in an aggregated evidence file), then repetition index
+//! ascending, then the observation order recorded in that repetition's `raw_ns`
+//! array. A line is exactly
+//! `stage_id|repetition_index|process_index|observation_ns_integer` followed by a
+//! single LF (`\n`), including after the final line. `stage_id` is the exact stage
+//! name, and all indices and nanosecond values are unsigned decimal integers with
+//! no leading zeros (zero is `0`). The lowercase-hex SHA-256 of that byte string
+//! is `raw_observations_sha256`. The untimed correctness pre-pass is never sampled;
+//! write, replay/recovery and total stages keep separate stage ids and are never
+//! merged into one digest. No performance gate or resource maximum is implied.
 
 #![expect(
     clippy::print_stdout,
@@ -77,6 +91,7 @@ const SBE_CHECKSUM_BYTES: usize = 8;
 const DISCLAIMER: &str = "neutral-workload measurements of real Fieldbook components; not a production latency/throughput certificate, not nanosecond/HFT, not horizontal scale, and no resource maxima are set";
 const WARMUP_POLICY: &str = "one untimed correctness pre-pass immediately before the measured pass; no per-stage untimed warm-up";
 const QUANTILE_METHOD: &str = "nearest-rank: sorted samples, rank=floor(N*p) clamped to [0,N-1], zero-indexed; units nanoseconds";
+const DIGEST_INPUT_FORMAT: &str = "sha256 over UTF-8 bytes of newline-delimited stage_id|repetition_index|process_index|observation_ns_integer lines, in process order then within-process repetition order then observation order; each line ends with one LF, including the last";
 
 #[derive(Debug, Clone)]
 struct Config {
@@ -88,6 +103,9 @@ struct Config {
     reps: usize,
     label: String,
     output: Option<PathBuf>,
+    // Actual load average captured by the caller at process start, passed
+    // through verbatim. Never synthesised: absent means `null` in the artifact.
+    start_load_average: Option<String>,
 }
 
 impl Config {
@@ -101,6 +119,7 @@ impl Config {
             reps: 1,
             label: "local".to_owned(),
             output: None,
+            start_load_average: None,
         }
     }
 
@@ -114,6 +133,7 @@ impl Config {
             reps: 1,
             label: "self-test".to_owned(),
             output: None,
+            start_load_average: None,
         }
     }
 
@@ -152,6 +172,7 @@ struct Bindings {
     filesystem: String,
     workload_digest: String,
     seed: u64,
+    start_load_average: Option<String>,
     event_count: u64,
     warmup_policy: String,
     duration_ns: u64,
@@ -315,6 +336,7 @@ struct PassResult {
 
 #[derive(Debug, Clone)]
 struct Artifact {
+    repetition_index: usize,
     bindings: Bindings,
     config: Config,
     results: Vec<StageResult>,
@@ -536,6 +558,7 @@ fn collect_bindings(config: &Config, duration_ns: u64, workload_digest: &str) ->
         filesystem: filesystem_type(&env::temp_dir(), &os),
         workload_digest: workload_digest.to_owned(),
         seed: config.seed,
+        start_load_average: config.start_load_average.clone(),
         event_count: config.events as u64,
         warmup_policy: WARMUP_POLICY.to_owned(),
         duration_ns,
@@ -1099,10 +1122,10 @@ fn make_checks(
     checks
 }
 
-fn run_bench(config: &Config) -> Result<Artifact, String> {
+fn run_bench(config: &Config) -> Result<Vec<Artifact>, String> {
     config.validate()?;
-    let mut artifacts = Vec::new();
-    for _ in 0..config.reps {
+    let mut artifacts = Vec::with_capacity(config.reps);
+    for repetition_index in 0..config.reps {
         let before_directory = tempfile::tempdir()
             .map_err(|error| format!("creating pre-check directory: {error}"))?;
         let before = run_pass(config, before_directory.path())?;
@@ -1147,6 +1170,7 @@ fn run_bench(config: &Config) -> Result<Artifact, String> {
             &bindings,
         );
         artifacts.push(Artifact {
+            repetition_index,
             bindings,
             config: config.clone(),
             results,
@@ -1156,10 +1180,10 @@ fn run_bench(config: &Config) -> Result<Artifact, String> {
             checks,
         });
     }
-    artifacts
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no benchmark repetition was recorded".to_owned())
+    if artifacts.is_empty() {
+        return Err("no benchmark repetition was recorded".to_owned());
+    }
+    Ok(artifacts)
 }
 
 fn jstr(value: &str) -> String {
@@ -1190,7 +1214,8 @@ fn binding_json(binding: &Bindings) -> String {
             "\"target_triple\":{target_triple},\"compiler_flags\":{compiler_flags},",
             "\"build_profile\":{build_profile},\"debug_assertions\":{debug_assertions},",
             "\"os\":{os},\"cpu\":{cpu},\"machine\":{machine},\"filesystem\":{filesystem},",
-            "\"workload_digest\":{workload},\"seed\":{seed},\"event_count\":{events},",
+            "\"workload_digest\":{workload},\"seed\":{seed},",
+            "\"start_load_average\":{start_load},\"event_count\":{events},",
             "\"warmup_policy\":{warmup},\"duration_ns\":{duration},\"repetitions\":{reps},",
             "\"quantile_method\":{quantile},\"payload_bytes\":{payload},",
             "\"batch_size\":{batch},\"chunk_bytes\":{chunk},\"interrupt_at\":{interrupt}}}"
@@ -1209,6 +1234,11 @@ fn binding_json(binding: &Bindings) -> String {
         filesystem = jstr(&binding.filesystem),
         workload = jstr(&binding.workload_digest),
         seed = binding.seed,
+        start_load = binding
+            .start_load_average
+            .as_deref()
+            .map(jstr)
+            .unwrap_or_else(|| "null".to_owned()),
         events = binding.event_count,
         warmup = jstr(&binding.warmup_policy),
         duration = binding.duration_ns,
@@ -1352,7 +1382,8 @@ fn artifact_json(artifact: &Artifact) -> String {
     format!(
         concat!(
             "{{\"schema_version\":{schema},\"harness\":\"production_components\",",
-            "\"mode\":\"bench\",\"label\":{label},\"disclaimer\":{disclaimer},",
+            "\"mode\":\"bench\",\"label\":{label},\"repetition_index\":{repetition},",
+            "\"disclaimer\":{disclaimer},",
             "\"stage_separation\":\"each stage timer wraps exactly one production call; pipeline_total wraps the whole measured pass\",",
             "\"checks_passed\":{passed},\"checks\":{checks},",
             "\"binding\":{binding},\"counters\":{counters},",
@@ -1361,6 +1392,7 @@ fn artifact_json(artifact: &Artifact) -> String {
         ),
         schema = SCHEMA_VERSION,
         label = jstr(&artifact.config.label),
+        repetition = artifact.repetition_index,
         disclaimer = jstr(DISCLAIMER),
         passed = passed,
         checks = checks_json(&artifact.checks),
@@ -1484,6 +1516,7 @@ fn parse_args(args: &[String]) -> Result<(bool, bool, Config), String> {
                     .map_err(|_| "invalid --seed".to_owned())?
             }
             "--reps" => config.reps = parse_usize(value, key)?,
+            "--start-load-average" => config.start_load_average = Some(value.to_owned()),
             "--label" => config.label = value.to_owned(),
             "--output" => config.output = Some(PathBuf::from(value)),
             other => return Err(format!("unknown option `{other}`")),
@@ -1516,23 +1549,71 @@ fn run() -> Result<String, String> {
             "{\"schema_version\":1,\"harness\":\"production_components\",",
             "\"mode\":\"usage\",\"options\":[\"--self-test\",\"--events=N\",",
             "\"--payload=N\",\"--batch=N\",\"--chunk=N\",\"--seed=N\",",
-            "\"--reps=N\",\"--label=STR\",\"--output=PATH\",\"--help\"]}"
+            "\"--reps=N\",\"--start-load-average=STR\",\"--label=STR\",",
+            "\"--output=PATH\",\"--help\"]}"
         )
         .to_owned());
     }
     if self_test_requested || args.is_empty() {
         return self_test();
     }
-    let artifact = run_bench(&config)?;
-    let text = artifact_json(&artifact);
+    let artifacts = run_bench(&config)?;
+    let passed = artifacts
+        .iter()
+        .all(|artifact| artifact.checks.iter().all(|check| check.passed));
+    // Every executed repetition is retained as a full artifact. The top-level
+    // single-pass fields remain as a compatible view of repetition 0, while
+    // `artifacts` carries all repetitions for independent verification.
+    let first = &artifacts[0];
+    let binding = binding_json(&first.bindings);
+    let results = first
+        .results
+        .iter()
+        .map(|result| result_json(result, &binding))
+        .collect::<Vec<_>>()
+        .join(",");
+    let artifacts_json = artifacts
+        .iter()
+        .map(artifact_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let text = format!(
+        concat!(
+            "{{\"schema_version\":{schema},\"harness\":\"production_components\",",
+            "\"mode\":\"bench\",\"label\":{label},\"disclaimer\":{disclaimer},",
+            "\"stage_separation\":\"each stage timer wraps exactly one production call; pipeline_total wraps the whole measured pass\",",
+            "\"checks_passed\":{passed},\"checks\":{checks},",
+            "\"binding\":{binding},\"counters\":{counters},",
+            "\"correctness_before\":{before},\"correctness_after\":{after},",
+            "\"results\":[{results}],\"repetitions_executed\":{executed},",
+            "\"repetitions_retained\":{retained},\"digest_input_format\":{digest_format},",
+            "\"artifacts\":[{artifacts}]}}"
+        ),
+        schema = SCHEMA_VERSION,
+        label = jstr(&config.label),
+        disclaimer = jstr(DISCLAIMER),
+        passed = passed,
+        checks = checks_json(&first.checks),
+        binding = binding,
+        counters = counters_json(&first.counters, first.bindings.duration_ns),
+        before = correctness_json(&first.before),
+        after = correctness_json(&first.after),
+        results = results,
+        executed = artifacts.len(),
+        retained = artifacts.len(),
+        digest_format = jstr(DIGEST_INPUT_FORMAT),
+        artifacts = artifacts_json,
+    );
     if let Some(path) = &config.output {
         fs::write(path, format!("{text}\n"))
             .map_err(|error| format!("writing artifact to {}: {error}", path.display()))?;
     }
     Ok(format!(
-        "{{\"schema_version\":1,\"harness\":\"production_components\",\"mode\":\"bench\",\"artifact_digest\":\"sha256:{}\",\"passed\":{}}}",
+        "{{\"schema_version\":1,\"harness\":\"production_components\",\"mode\":\"bench\",\"artifact_digest\":\"sha256:{}\",\"passed\":{},\"repetitions_executed\":{},\"repetitions_retained\":{}}}",
         sha256_hex(format!("{text}\n").as_bytes()),
-        artifact.checks.iter().all(|check| check.passed)
+        passed,
+        artifacts.len(),
+        artifacts.len()
     ))
 }
 
