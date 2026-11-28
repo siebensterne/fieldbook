@@ -31,6 +31,13 @@ QUANTILE METHOD (lower-nearest-rank): sort ascending, then take index
 ``min(N-1, floor(p*N))``, zero-indexed, with p in {1/2, 9/10, 19/20, 99/100,
 999/1000}. Fractions are exact rationals, not floating point. Nanoseconds.
 
+CLI BINDING: default mode still verifies the historical corrected baseline at
+the recorded measured revision. An explicit ``--artifact=PATH`` together with
+``--expected-revision=SHA`` verifies a different artifact at an explicitly
+declared source revision; the supported explicit revision is the P1.5 final
+head recorded below. Earlier baseline files are historical only and are never
+rewritten by this tool.
+
 Run with ``--self-test`` for deterministic positive and negative cases.
 """
 
@@ -43,15 +50,18 @@ import statistics
 import subprocess
 import sys
 from collections.abc import Callable
+from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EVIDENCE = ROOT / "measurements/perf/neutral-production-corrected-baseline-2026-11-28.json"
+FINAL_EVIDENCE = ROOT / "measurements/perf/neutral-production-final-head-2026-11-28.json"
 EXPECTED_BASE_SHA = "2ef503ff397186abfcd7fc619f0d1703d73aa9d1"
 EXPECTED_PRODUCTION_SOURCE_REVISION = "e2bd10c5f39ec271a030a863384dc6effcf15f1c"
 BINDING_BASE_SHA = "2df4b8e94b9b9c7eea95488c89659c788ca14c49"
+FINAL_HEAD_SHA = "f7e1896c21b2f3cd822d66768d0046d6a62f6a70"
 PACKAGED_PROVENANCE_FILES = {
     "benchmark_harness_digest": "benches/production_components.rs",
     "benchmark_verifier_digest": "scripts/verify_benchmark_evidence.py",
@@ -74,6 +84,36 @@ PROVENANCE_KEYS = (
 )
 FileReader = Callable[[str], bytes]
 TreeReader = Callable[[str], str]
+
+
+@dataclass(frozen=True)
+class VerificationContext:
+    """Bind one verification run to an artifact path and expected revision."""
+
+    artifact_path: Path
+    expected_revision: str
+    expected_base_sha: str
+    final_head: bool
+
+    @property
+    def artifact_name(self) -> str:
+        """Return the declared artifact file name for this run."""
+        return self.artifact_path.name
+
+
+DEFAULT_CONTEXT = VerificationContext(
+    DEFAULT_EVIDENCE,
+    EXPECTED_PRODUCTION_SOURCE_REVISION,
+    EXPECTED_BASE_SHA,
+    False,
+)
+FINAL_CONTEXT = VerificationContext(
+    FINAL_EVIDENCE,
+    FINAL_HEAD_SHA,
+    FINAL_HEAD_SHA,
+    True,
+)
+
 SELF_TEST_SOURCES = {
     "benches/production_components.rs": b"self-test harness source\n",
     "scripts/verify_benchmark_evidence.py": b"self-test verifier source\n",
@@ -266,6 +306,7 @@ def verify_provenance(
     revision: str,
     read_file: FileReader,
     read_tree: TreeReader,
+    context: VerificationContext = DEFAULT_CONTEXT,
 ) -> None:
     """Verify every declared provenance digest against the measured revision."""
     missing = [key for key in PROVENANCE_KEYS if key not in evidence]
@@ -276,7 +317,7 @@ def verify_provenance(
     record(
         checks,
         "provenance_revision",
-        declared_revision == EXPECTED_PRODUCTION_SOURCE_REVISION == revision
+        declared_revision == context.expected_revision == revision
         and evidence["measurement_revision_vs_base"]["measured_revision"] == declared_revision,
         declared_revision,
     )
@@ -308,24 +349,38 @@ def verify_provenance(
     else:
         record(checks, "raw_observation_digest", raw == evidence["raw_observation_digest"], raw)
     relation = evidence["measurement_revision_vs_base"]
+    if context.final_head:
+        relation_ok = (
+            relation["binding_base"] == context.expected_revision
+            and relation["legacy_harness_captured_base_sha"] == evidence["base_sha"]
+            and relation["later_source_changes_not_measured"] is True
+            and "NOT measured" in relation["statement"]
+            and declared_revision == evidence["base_sha"] == context.expected_revision
+        )
+    else:
+        relation_ok = (
+            relation["binding_base"] == BINDING_BASE_SHA
+            and relation["legacy_harness_captured_base_sha"] == evidence["base_sha"]
+            and relation["later_source_changes_not_measured"] is True
+            and "NOT measured" in relation["statement"]
+            and declared_revision != evidence["base_sha"]
+            and declared_revision != BINDING_BASE_SHA
+        )
     record(
         checks,
         "measurement_revision_vs_base",
-        relation["binding_base"] == BINDING_BASE_SHA
-        and relation["legacy_harness_captured_base_sha"] == evidence["base_sha"]
-        and relation["later_source_changes_not_measured"] is True
-        and "NOT measured" in relation["statement"]
-        and declared_revision != evidence["base_sha"]
-        and declared_revision != BINDING_BASE_SHA,
+        relation_ok,
         json.dumps(relation, sort_keys=True),
     )
 
 
-def verify(evidence: dict[str, Any]) -> list[dict[str, Any]]:
+def verify(
+    evidence: dict[str, Any], context: VerificationContext = DEFAULT_CONTEXT
+) -> list[dict[str, Any]]:
     """Recompute every declared digest and statistic, returning all check results."""
     checks: list[dict[str, Any]] = []
     try:
-        verify_structure(checks, evidence)
+        verify_structure(checks, evidence, context)
         processes = evidence["processes"]
         verify_processes(checks, evidence, processes)
         verify_artifacts(checks, processes)
@@ -341,11 +396,12 @@ def verify_with_provenance(
     revision: str,
     read_file: FileReader,
     read_tree: TreeReader,
+    context: VerificationContext = DEFAULT_CONTEXT,
 ) -> list[dict[str, Any]]:
     """Run all evidence checks plus provenance checks, failing closed on error."""
-    checks = verify(evidence)
+    checks = verify(evidence, context)
     try:
-        verify_provenance(checks, evidence, revision, read_file, read_tree)
+        verify_provenance(checks, evidence, revision, read_file, read_tree, context)
     except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
         record(checks, "provenance_completed", False, f"{type(error).__name__}: {error}")
     else:
@@ -353,11 +409,15 @@ def verify_with_provenance(
     return checks
 
 
-def verify_structure(checks: list[dict[str, Any]], evidence: dict[str, Any]) -> None:
+def verify_structure(
+    checks: list[dict[str, Any]],
+    evidence: dict[str, Any],
+    context: VerificationContext = DEFAULT_CONTEXT,
+) -> None:
     """Check top-level methodology, provenance and claim-boundary declarations."""
     record(checks, "schema_version", evidence.get("schema_version") == 1)
-    record(checks, "base_sha", evidence.get("base_sha") == EXPECTED_BASE_SHA)
-    record(checks, "artifact_name", evidence.get("artifact") == DEFAULT_EVIDENCE.name)
+    record(checks, "base_sha", evidence.get("base_sha") == context.expected_base_sha)
+    record(checks, "artifact_name", evidence.get("artifact") == context.artifact_name)
     methodology = evidence["methodology"]
     record(checks, "digest_input_format", methodology["digest_input_format"] == DIGEST_INPUT_FORMAT)
     record(checks, "quantile_method_declared", "floor" in methodology["quantile_method"])
@@ -551,15 +611,21 @@ def verify_stages(
 def self_test() -> dict[str, Any]:
     """Run positive and negative cases against a small synthetic evidence file."""
     cases: list[dict[str, Any]] = []
-    for name, mutated, expect_pass in self_test_cases():
-        evidence = synthetic_evidence()
+    selected = [
+        (name, mutated, expect_pass, DEFAULT_CONTEXT)
+        for name, mutated, expect_pass in self_test_cases()
+    ]
+    selected.extend(self_test_final_head_cases())
+    for name, mutated, expect_pass, context in selected:
+        evidence = synthetic_evidence(context)
         if mutated is not None:
             mutated(evidence)
         outcome = verify_with_provenance(
             evidence,
-            EXPECTED_PRODUCTION_SOURCE_REVISION,
+            context.expected_revision,
             self_test_file_reader,
             self_test_tree_reader,
+            context,
         )
         passed = all(check["passed"] for check in outcome)
         cases.append(
@@ -580,7 +646,7 @@ def self_test() -> dict[str, Any]:
     }
 
 
-def synthetic_evidence() -> dict[str, Any]:
+def synthetic_evidence(context: VerificationContext = DEFAULT_CONTEXT) -> dict[str, Any]:
     """Build a fully consistent, deliberately tiny evidence object for self-tests."""
     processes: list[dict[str, Any]] = []
     for process_index in range(5):
@@ -637,7 +703,7 @@ def synthetic_evidence() -> dict[str, Any]:
             {
                 "process_index": process_index,
                 "seed": 1000 + process_index,
-                "source_sha": EXPECTED_BASE_SHA,
+                "source_sha": context.expected_base_sha,
                 "binary_digest": SELF_TEST_BINARY_DIGEST,
                 "workload_digest": workload,
                 "start_load_average": "1.00 0.50 0.25",
@@ -698,8 +764,8 @@ def synthetic_evidence() -> dict[str, Any]:
     ).hexdigest()
     return {
         "schema_version": 1,
-        "artifact": DEFAULT_EVIDENCE.name,
-        "base_sha": EXPECTED_BASE_SHA,
+        "artifact": context.artifact_name,
+        "base_sha": context.expected_base_sha,
         "methodology": {
             "digest_input_format": DIGEST_INPUT_FORMAT,
             "quantile_method": "lower-nearest-rank rank=floor(p*N)",
@@ -716,7 +782,7 @@ def synthetic_evidence() -> dict[str, Any]:
             "tail_quantiles_provisional": True,
             "not_production_certificate": True,
         },
-        "production_source_revision": EXPECTED_PRODUCTION_SOURCE_REVISION,
+        "production_source_revision": context.expected_revision,
         "production_source_tree_digest": SELF_TEST_TREE,
         "benchmark_harness_digest": file_digests["benches/production_components.rs"],
         "benchmark_verifier_digest": file_digests["scripts/verify_benchmark_evidence.py"],
@@ -731,9 +797,9 @@ def synthetic_evidence() -> dict[str, Any]:
         },
         "raw_observation_digest": raw_observation_digest,
         "measurement_revision_vs_base": {
-            "measured_revision": EXPECTED_PRODUCTION_SOURCE_REVISION,
-            "binding_base": BINDING_BASE_SHA,
-            "legacy_harness_captured_base_sha": EXPECTED_BASE_SHA,
+            "measured_revision": context.expected_revision,
+            "binding_base": (context.expected_revision if context.final_head else BINDING_BASE_SHA),
+            "legacy_harness_captured_base_sha": context.expected_base_sha,
             "later_source_changes_not_measured": True,
             "statement": "self-test source later changes were NOT measured",
         },
@@ -813,6 +879,25 @@ def self_test_cases() -> list[tuple[str, Any, bool]]:
     ]
 
 
+def self_test_final_head_cases() -> list[tuple[str, Any, bool, VerificationContext]]:
+    """Return final-head-mode cases, including wrong-revision and harness drift."""
+
+    def wrong_revision(evidence: dict[str, Any]) -> None:
+        """Replace the declared measured revision with a different valid SHA."""
+        evidence["production_source_revision"] = EXPECTED_BASE_SHA
+        evidence["measurement_revision_vs_base"]["measured_revision"] = EXPECTED_BASE_SHA
+
+    def drift_harness(evidence: dict[str, Any]) -> None:
+        """Drift the declared harness digest in final-head mode."""
+        evidence["benchmark_harness_digest"] = "0" * 64
+
+    return [
+        ("SELF-014-final-head-clean", None, True, FINAL_CONTEXT),
+        ("SELF-015-final-head-wrong-revision", wrong_revision, False, FINAL_CONTEXT),
+        ("SELF-016-final-head-harness-digest-drift", drift_harness, False, FINAL_CONTEXT),
+    ]
+
+
 class HelpRequestedError(Exception):
     """Signal that the caller asked for machine-readable usage information."""
 
@@ -822,39 +907,78 @@ def emit(payload: dict[str, Any]) -> None:
     print(json.dumps(payload, sort_keys=True, ensure_ascii=False))
 
 
-def parse_args(argv: list[str]) -> tuple[bool, Path]:
-    """Parse the two supported flags; reject anything else fail-closed."""
+def parse_args(argv: list[str]) -> tuple[bool, Path, str]:
+    """Parse artifact, revision and self-test flags; reject anything else."""
     self_test_requested = False
     evidence = DEFAULT_EVIDENCE
+    revision = EXPECTED_PRODUCTION_SOURCE_REVISION
     index = 0
     while index < len(argv):
         option = argv[index]
-        if option == "--self-test":
+        key, _, inline = option.partition("=")
+        if key in ("--artifact", "--evidence"):
+            if inline:
+                value = inline
+            else:
+                index += 1
+                if index >= len(argv):
+                    raise ValueError(f"{key} requires a path")
+                value = argv[index]
+            evidence = Path(value)
+        elif key == "--expected-revision":
+            if inline:
+                value = inline
+            else:
+                index += 1
+                if index >= len(argv):
+                    raise ValueError("--expected-revision requires a SHA")
+                value = argv[index]
+            if value not in (EXPECTED_PRODUCTION_SOURCE_REVISION, FINAL_HEAD_SHA):
+                raise ValueError(f"unsupported expected revision: {value}")
+            revision = value
+        elif option == "--self-test":
             self_test_requested = True
-        elif option == "--evidence":
-            index += 1
-            if index >= len(argv):
-                raise ValueError("--evidence requires a path")
-            evidence = Path(argv[index])
         elif option in ("--help", "-h"):
             raise HelpRequestedError()
         else:
             raise ValueError(f"unknown option: {option}")
         index += 1
-    return self_test_requested, evidence
+    return self_test_requested, evidence, revision
+
+
+def make_context(path: Path, revision: str) -> VerificationContext:
+    """Return the verification context for a requested artifact and revision."""
+    if revision == FINAL_HEAD_SHA:
+        return VerificationContext(path, FINAL_HEAD_SHA, FINAL_HEAD_SHA, True)
+    return VerificationContext(path, EXPECTED_PRODUCTION_SOURCE_REVISION, EXPECTED_BASE_SHA, False)
+
+
+def revision_exists(revision: str) -> bool:
+    """Report whether the expected revision resolves to a commit in the repo."""
+    try:
+        git_bytes("rev-parse", "--verify", f"{revision}^{{commit}}")
+    except (RuntimeError, OSError):
+        return False
+    return True
 
 
 def main() -> int:
     """Verify the corrected baseline evidence or run deterministic self-tests."""
     try:
-        self_test_requested, evidence_path = parse_args(sys.argv[1:])
+        self_test_requested, evidence_path, revision = parse_args(sys.argv[1:])
     except (HelpRequestedError, ValueError) as error:
         emit(
             {
                 "tool": "verify_benchmark_evidence",
                 "mode": "usage",
                 "ok": isinstance(error, HelpRequestedError),
-                "options": ["--self-test", "--evidence=PATH", "--help"],
+                "options": [
+                    "--self-test",
+                    "--artifact=PATH",
+                    "--evidence=PATH",
+                    "--expected-revision=SHA",
+                    "--help",
+                ],
                 "error": str(error) or None,
             }
         )
@@ -886,11 +1010,23 @@ def main() -> int:
             }
         )
         return 1
+    context = make_context(evidence_path, revision)
+    if not revision_exists(context.expected_revision):
+        emit(
+            {
+                "tool": "verify_benchmark_evidence",
+                "mode": "verify",
+                "ok": False,
+                "error": f"expected revision {context.expected_revision} is not in this repo",
+            }
+        )
+        return 1
     checks = verify_with_provenance(
         evidence,
-        EXPECTED_PRODUCTION_SOURCE_REVISION,
-        packaged_file_reader(EXPECTED_PRODUCTION_SOURCE_REVISION),
+        context.expected_revision,
+        packaged_file_reader(context.expected_revision),
         tree_reader(),
+        context,
     )
     failed = [check for check in checks if not check["passed"]]
     stages = evidence.get("stages", {})
@@ -901,7 +1037,8 @@ def main() -> int:
             "mode": "verify",
             "evidence": str(evidence_path),
             "evidence_sha256": hashlib.sha256(raw).hexdigest(),
-            "measured_revision": EXPECTED_PRODUCTION_SOURCE_REVISION,
+            "expected_revision": context.expected_revision,
+            "measured_revision": context.expected_revision,
             "ok": not failed,
             "checks_total": len(checks),
             "failed": len(failed),
