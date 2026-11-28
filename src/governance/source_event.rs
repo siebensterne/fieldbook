@@ -22,6 +22,10 @@ use std::fmt;
 
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de;
+use serde::de::Deserializer;
+use serde::de::IgnoredAny;
+use serde::de::Visitor;
 
 use crate::util::sha256_hex;
 
@@ -112,8 +116,84 @@ impl SourceEventError {
     }
 }
 
+/// Marker embedded in a typed enum rejection so decode can name the normative
+/// code without falling back to an untyped JSON parse.
+const QUALITY_STATE_MARKER: &str = "FIELDBOOK_INVALID_QUALITY_STATE";
+const CONTINUITY_STATE_MARKER: &str = "FIELDBOOK_INVALID_CONTINUITY_STATE";
+
+/// Typed enum reader: every non-string value and every unknown string value is
+/// rejected with the field's own normative code. Missing, extra and duplicate
+/// members are still rejected by the enclosing struct's derived reader.
+struct EnumValue<T> {
+    field: &'static str,
+    marker: &'static str,
+    parse: fn(&str) -> Option<T>,
+}
+
+impl<T> EnumValue<T> {
+    fn invalid<E: de::Error>(&self) -> E {
+        E::custom(self.marker)
+    }
+
+    fn parse_value<E: de::Error>(&self, value: &str) -> Result<T, E> {
+        (self.parse)(value).ok_or_else(|| self.invalid())
+    }
+}
+
+impl<'de, T> Visitor<'de> for EnumValue<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "a valid {} state", self.field)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        self.parse_value(value)
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        self.visit_str(&value)
+    }
+
+    fn visit_i64<E: de::Error>(self, _value: i64) -> Result<Self::Value, E> {
+        Err(self.invalid())
+    }
+
+    fn visit_u64<E: de::Error>(self, _value: u64) -> Result<Self::Value, E> {
+        Err(self.invalid())
+    }
+
+    fn visit_i128<E: de::Error>(self, _value: i128) -> Result<Self::Value, E> {
+        Err(self.invalid())
+    }
+
+    fn visit_u128<E: de::Error>(self, _value: u128) -> Result<Self::Value, E> {
+        Err(self.invalid())
+    }
+
+    fn visit_f64<E: de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+        Err(self.invalid())
+    }
+
+    fn visit_bool<E: de::Error>(self, _value: bool) -> Result<Self::Value, E> {
+        Err(self.invalid())
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Err(self.invalid())
+    }
+
+    fn visit_seq<A: de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+        Err(de::Error::custom(self.marker))
+    }
+
+    fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+        Err(de::Error::custom(self.marker))
+    }
+}
+
 /// Quality state of a source event. Values are the exact wire spellings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QualityState {
     Captured,
@@ -135,8 +215,27 @@ impl QualityState {
     }
 }
 
+impl<'de> Deserialize<'de> for QualityState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn parse(value: &str) -> Option<QualityState> {
+            match value {
+                "CAPTURED" => Some(QualityState::Captured),
+                "DECODED" => Some(QualityState::Decoded),
+                "VALIDATED" => Some(QualityState::Validated),
+                "QUARANTINED" => Some(QualityState::Quarantined),
+                _ => None,
+            }
+        }
+        deserializer.deserialize_any(EnumValue {
+            field: "quality_state",
+            marker: QUALITY_STATE_MARKER,
+            parse,
+        })
+    }
+}
+
 /// Continuity state of a source event. Values are the exact wire spellings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ContinuityState {
     Continuous,
@@ -155,6 +254,25 @@ impl ContinuityState {
             Self::Recovered => "RECOVERED",
             Self::Unknown => "UNKNOWN",
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for ContinuityState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn parse(value: &str) -> Option<ContinuityState> {
+            match value {
+                "CONTINUOUS" => Some(ContinuityState::Continuous),
+                "GAP_SUSPECTED" => Some(ContinuityState::GapSuspected),
+                "RECOVERED" => Some(ContinuityState::Recovered),
+                "UNKNOWN" => Some(ContinuityState::Unknown),
+                _ => None,
+            }
+        }
+        deserializer.deserialize_any(EnumValue {
+            field: "continuity_state",
+            marker: CONTINUITY_STATE_MARKER,
+            parse,
+        })
     }
 }
 
@@ -198,62 +316,272 @@ fn serde_error_field(message: &str) -> String {
 
 /// Classify a typed-deserialization failure without ever collapsing the input
 /// into a `serde_json::Value` (which would silently discard duplicate members).
-fn from_serde_error(error: serde_json::Error) -> SourceEventError {
+/// Every field with a normative code is named by its own typed reader or by
+/// the narrow integer-value probe below; only a genuinely malformed document
+/// falls through to `MalformedJson`.
+fn from_json_error(input: &str, error: serde_json::Error) -> SourceEventError {
     let message = error.to_string();
-    let reason = if message.contains("duplicate field")
+    if message.contains("duplicate field")
         || message.contains("missing field")
         || message.contains("unknown field")
     {
-        SourceEventReason::UnknownOrMissingMember
-    } else if message.contains("unknown variant") && message.contains("`CAPTURED`") {
-        SourceEventReason::InvalidQualityState
-    } else if message.contains("unknown variant") && message.contains("`CONTINUOUS`") {
-        SourceEventReason::InvalidContinuityState
-    } else {
-        SourceEventReason::MalformedJson
-    };
-    let field = match reason {
-        SourceEventReason::InvalidQualityState => "quality_state".to_owned(),
-        SourceEventReason::InvalidContinuityState => "continuity_state".to_owned(),
-        _ => serde_error_field(&message),
-    };
-    SourceEventError::new(reason, field)
+        return SourceEventError::new(
+            SourceEventReason::UnknownOrMissingMember,
+            serde_error_field(&message),
+        );
+    }
+    if message.contains(QUALITY_STATE_MARKER) {
+        return SourceEventError::new(SourceEventReason::InvalidQualityState, "quality_state");
+    }
+    if message.contains(CONTINUITY_STATE_MARKER) {
+        return SourceEventError::new(
+            SourceEventReason::InvalidContinuityState,
+            "continuity_state",
+        );
+    }
+    if let Some(invalid) = invalid_integer_error(input) {
+        return invalid;
+    }
+    SourceEventError::new(
+        SourceEventReason::MalformedJson,
+        serde_error_field(&message),
+    )
 }
 
-/// Widened probe used only after the typed parse has already failed. It never
-/// replaces that parse: duplicate, unknown and missing members have been
-/// rejected by it first. `i128` accepts negative and wide integers so the
-/// offending field can be named with its normative code.
+/// One observed JSON integer value, kept as a type rather than a generic JSON
+/// tree. It distinguishes absence, `null`, out-of-range integers and every
+/// non-integer JSON value so each field can be named with its normative code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ProbeValue {
+    #[default]
+    Missing,
+    Null,
+    NonInteger,
+    Integer(i128),
+}
+
+impl<'de> Deserialize<'de> for ProbeValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ValueVisitor;
+
+        impl<'de> Visitor<'de> for ValueVisitor {
+            type Value = ProbeValue;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an integer JSON value")
+            }
+
+            fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+                Ok(ProbeValue::Null)
+            }
+
+            fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(ProbeValue::Integer(i128::from(value)))
+            }
+
+            fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(ProbeValue::Integer(i128::from(value)))
+            }
+
+            fn visit_i128<E: de::Error>(self, value: i128) -> Result<Self::Value, E> {
+                Ok(ProbeValue::Integer(value))
+            }
+
+            fn visit_u128<E: de::Error>(self, value: u128) -> Result<Self::Value, E> {
+                Ok(ProbeValue::Integer(
+                    i128::try_from(value).unwrap_or(i128::MAX),
+                ))
+            }
+
+            fn visit_f64<E: de::Error>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(ProbeValue::NonInteger)
+            }
+
+            fn visit_bool<E: de::Error>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(ProbeValue::NonInteger)
+            }
+
+            fn visit_str<E: de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+                Ok(ProbeValue::NonInteger)
+            }
+
+            fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                self.visit_str(&value)
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+                Ok(ProbeValue::NonInteger)
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+                Ok(ProbeValue::NonInteger)
+            }
+        }
+
+        deserializer.deserialize_any(ValueVisitor)
+    }
+}
+
+/// Narrow probe used only after the typed parse has failed. It never replaces
+/// that parse: duplicate, unknown and missing members have already been
+/// rejected before this runs.
 #[derive(Deserialize)]
 struct IntegerProbe {
     #[serde(default)]
-    connection_epoch: Option<i128>,
+    schema_version: ProbeValue,
     #[serde(default)]
-    provider_sequence: Option<i128>,
+    connection_epoch: ProbeValue,
     #[serde(default)]
-    source_timestamp_ns: Option<i128>,
+    capture_sequence: ProbeValue,
+    #[serde(default)]
+    canonical_sequence: ProbeValue,
+    #[serde(default)]
+    provider_sequence: ProbeValue,
+    #[serde(default)]
+    source_timestamp_ns: ProbeValue,
+    #[serde(default)]
+    receive_utc_ns: ProbeValue,
+    #[serde(default)]
+    receive_monotonic_ns: ProbeValue,
+}
+
+impl ProbeValue {
+    /// A required u64 field is invalid when it is present but null, not an
+    /// integer, negative or above `u64::MAX`.
+    fn invalid_u64(self) -> bool {
+        match self {
+            Self::Missing => false,
+            Self::Integer(value) => value < 0 || u64::try_from(value).is_err(),
+            Self::Null | Self::NonInteger => true,
+        }
+    }
+}
+
+/// Structural reader for member presence only. Every v1 member is required;
+/// `Option` fields in the typed envelope must not silently default to null
+/// when a member is absent. `IgnoredAny` keeps value validation in the typed
+/// reader below while still detecting missing, extra and duplicate members.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnvelopeMembers {
+    schema_version: IgnoredAny,
+    source_id: IgnoredAny,
+    source_product_ref: IgnoredAny,
+    session_ref: IgnoredAny,
+    decoder_version: IgnoredAny,
+    reference_data_revision: IgnoredAny,
+    rights_evidence_ref: IgnoredAny,
+    connection_epoch: IgnoredAny,
+    capture_sequence: IgnoredAny,
+    canonical_sequence: IgnoredAny,
+    provider_sequence: IgnoredAny,
+    source_timestamp_ns: IgnoredAny,
+    receive_utc_ns: IgnoredAny,
+    receive_monotonic_ns: IgnoredAny,
+    raw_frame_digest: IgnoredAny,
+    envelope_digest: IgnoredAny,
+    quality_state: IgnoredAny,
+    continuity_state: IgnoredAny,
+}
+
+impl EnvelopeMembers {
+    fn require_all(self) {
+        let Self {
+            schema_version,
+            source_id,
+            source_product_ref,
+            session_ref,
+            decoder_version,
+            reference_data_revision,
+            rights_evidence_ref,
+            connection_epoch,
+            capture_sequence,
+            canonical_sequence,
+            provider_sequence,
+            source_timestamp_ns,
+            receive_utc_ns,
+            receive_monotonic_ns,
+            raw_frame_digest,
+            envelope_digest,
+            quality_state,
+            continuity_state,
+        } = self;
+        let _ = (
+            schema_version,
+            source_id,
+            source_product_ref,
+            session_ref,
+            decoder_version,
+            reference_data_revision,
+            rights_evidence_ref,
+            connection_epoch,
+            capture_sequence,
+            canonical_sequence,
+            provider_sequence,
+            source_timestamp_ns,
+            receive_utc_ns,
+            receive_monotonic_ns,
+            raw_frame_digest,
+            envelope_digest,
+            quality_state,
+            continuity_state,
+        );
+    }
 }
 
 fn invalid_integer_error(input: &str) -> Option<SourceEventError> {
     let probe = serde_json::from_str::<IntegerProbe>(input).ok()?;
-    let is_out_of_u64 = |value: Option<i128>| value.is_some_and(|v| u64::try_from(v).is_err());
-    if is_out_of_u64(probe.connection_epoch) {
-        return Some(SourceEventError::new(
+    let error = |reason, field| Some(SourceEventError::new(reason, field));
+    // schema_version must be the literal 1; a different observed value maps
+    // to the schema code, while a valid 1 leaves the actual offending field
+    // to be classified below.
+    if probe.schema_version != ProbeValue::Missing
+        && probe.schema_version != ProbeValue::Integer(i128::from(SOURCE_EVENT_SCHEMA_VERSION))
+    {
+        return error(
+            SourceEventReason::UnsupportedSchemaVersion,
+            "schema_version",
+        );
+    }
+    if probe.connection_epoch.invalid_u64() {
+        return error(
             SourceEventReason::InvalidConnectionEpoch,
             "connection_epoch",
-        ));
+        );
     }
-    if is_out_of_u64(probe.provider_sequence) {
-        return Some(SourceEventError::new(
+    if probe.capture_sequence.invalid_u64() {
+        return error(
+            SourceEventReason::NonMonotonicCaptureSequence,
+            "capture_sequence",
+        );
+    }
+    if probe.canonical_sequence.invalid_u64() {
+        return error(
+            SourceEventReason::NonMonotonicCanonicalSequence,
+            "canonical_sequence",
+        );
+    }
+    if probe.receive_utc_ns.invalid_u64() {
+        return error(SourceEventReason::InvalidReceiveTime, "receive_utc_ns");
+    }
+    if probe.receive_monotonic_ns.invalid_u64() {
+        return error(
+            SourceEventReason::InvalidReceiveTime,
+            "receive_monotonic_ns",
+        );
+    }
+    // These two fields are u64-or-null, so null is never a defect.
+    if probe.provider_sequence != ProbeValue::Null && probe.provider_sequence.invalid_u64() {
+        return error(
             SourceEventReason::InvalidProviderSequence,
             "provider_sequence",
-        ));
+        );
     }
-    if is_out_of_u64(probe.source_timestamp_ns) {
-        return Some(SourceEventError::new(
+    if probe.source_timestamp_ns != ProbeValue::Null && probe.source_timestamp_ns.invalid_u64() {
+        return error(
             SourceEventReason::InvalidSourceTimestamp,
             "source_timestamp_ns",
-        ));
+        );
     }
     None
 }
@@ -307,23 +635,22 @@ impl SourceEventEnvelope {
 
     /// Decode a complete v1 envelope into the typed struct and validate it.
     ///
-    /// Parsing goes straight into [`SourceEventEnvelope`]: `deny_unknown_fields`
-    /// rejects extra members and serde rejects duplicate members instead of
-    /// letting a later `Value` parse overwrite them. The digest is then built
-    /// from the serialized typed fields, preserving the v1 wire shape.
+    /// A member-presence reader rejects absent, extra and duplicate members
+    /// before parsing straight into [`SourceEventEnvelope`]. Enum values and
+    /// integer values keep their own normative codes through typed readers;
+    /// no untyped JSON fallback can collapse them into a generic error. The
+    /// digest is then built from the serialized typed fields, preserving the
+    /// unchanged v1 wire shape.
     ///
     /// # Errors
     /// Returns the typed rejection for any invalid field. There is no partial
     /// envelope on failure.
     pub fn from_json(input: &str) -> Result<Self, SourceEventError> {
-        let event: Self = serde_json::from_str(input).map_err(|error| {
-            if error.to_string().contains("expected u64")
-                && let Some(invalid) = invalid_integer_error(input)
-            {
-                return invalid;
-            }
-            from_serde_error(error)
-        })?;
+        let members = serde_json::from_str::<EnvelopeMembers>(input)
+            .map_err(|error| from_json_error(input, error))?;
+        members.require_all();
+        let event: Self =
+            serde_json::from_str(input).map_err(|error| from_json_error(input, error))?;
         event.validate()?;
         Ok(event)
     }
@@ -1035,6 +1362,137 @@ mod tests {
             tracker.last("source-a", "session-a"),
             None,
             "no state was changed"
+        );
+    }
+
+    #[test]
+    fn enum_wrong_types_map_to_the_field_normative_code() {
+        let base = serde_json::to_string(&sample()).expect("serializable sample");
+        let cases = [
+            (
+                base.replace("\"quality_state\":\"VALIDATED\"", "\"quality_state\":7"),
+                "INVALID_QUALITY_STATE",
+                "quality_state",
+            ),
+            (
+                base.replace("\"quality_state\":\"VALIDATED\"", "\"quality_state\":null"),
+                "INVALID_QUALITY_STATE",
+                "quality_state",
+            ),
+            (
+                base.replace(
+                    "\"quality_state\":\"VALIDATED\"",
+                    "\"quality_state\":{\"state\":\"VALIDATED\"}",
+                ),
+                "INVALID_QUALITY_STATE",
+                "quality_state",
+            ),
+            (
+                base.replace(
+                    "\"continuity_state\":\"CONTINUOUS\"",
+                    "\"continuity_state\":0",
+                ),
+                "INVALID_CONTINUITY_STATE",
+                "continuity_state",
+            ),
+            (
+                base.replace(
+                    "\"continuity_state\":\"CONTINUOUS\"",
+                    "\"continuity_state\":null",
+                ),
+                "INVALID_CONTINUITY_STATE",
+                "continuity_state",
+            ),
+            (
+                base.replace(
+                    "\"continuity_state\":\"CONTINUOUS\"",
+                    "\"continuity_state\":{\"state\":\"CONTINUOUS\"}",
+                ),
+                "INVALID_CONTINUITY_STATE",
+                "continuity_state",
+            ),
+        ];
+        for (json, code, field) in cases {
+            let error =
+                SourceEventEnvelope::from_json(&json).expect_err("a wrong enum type is rejected");
+            assert_eq!(error.reason_code(), code, "the enum has its own code");
+            assert_eq!(error.field, field, "the offending enum field is named");
+        }
+    }
+
+    #[test]
+    fn integer_types_map_to_the_field_normative_code() {
+        let base = serde_json::to_string(&sample()).expect("serializable sample");
+        let cases = [
+            (
+                base.replace("\"schema_version\":1", "\"schema_version\":1.0"),
+                "SCHEMA_VERSION_MISMATCH",
+                "schema_version",
+            ),
+            (
+                base.replace("\"capture_sequence\":10", "\"capture_sequence\":null"),
+                "NON_MONOTONIC_CAPTURE_SEQUENCE",
+                "capture_sequence",
+            ),
+            (
+                base.replace("\"canonical_sequence\":20", "\"canonical_sequence\":1.0"),
+                "NON_MONOTONIC_CANONICAL_SEQUENCE",
+                "canonical_sequence",
+            ),
+            (
+                base.replace("\"connection_epoch\":7", "\"connection_epoch\":1.0"),
+                "INVALID_CONNECTION_EPOCH",
+                "connection_epoch",
+            ),
+            (
+                base.replace(
+                    "\"receive_utc_ns\":1700000000000000001",
+                    "\"receive_utc_ns\":-1",
+                ),
+                "INVALID_RECEIVE_TIME",
+                "receive_utc_ns",
+            ),
+            (
+                base.replace(
+                    "\"receive_monotonic_ns\":4200",
+                    "\"receive_monotonic_ns\":null",
+                ),
+                "INVALID_RECEIVE_TIME",
+                "receive_monotonic_ns",
+            ),
+            (
+                base.replace("\"provider_sequence\":null", "\"provider_sequence\":1.0"),
+                "INVALID_PROVIDER_SEQUENCE",
+                "provider_sequence",
+            ),
+            (
+                base.replace(
+                    "\"source_timestamp_ns\":1700000000000000000",
+                    "\"source_timestamp_ns\":1.0",
+                ),
+                "INVALID_SOURCE_TIMESTAMP",
+                "source_timestamp_ns",
+            ),
+        ];
+        for (json, code, field) in cases {
+            let error = SourceEventEnvelope::from_json(&json)
+                .expect_err("a wrong integer type is rejected");
+            assert_eq!(error.reason_code(), code, "the field has its own code");
+            assert_eq!(error.field, field, "the offending field is named");
+        }
+    }
+
+    #[test]
+    fn u64_maximum_is_valid_where_the_field_rule_allows_it() {
+        let mut event = base_event();
+        event.capture_sequence = u64::MAX;
+        event.canonical_sequence = u64::MAX;
+        event.provider_sequence = Some(u64::MAX);
+        event.source_timestamp_ns = Some(u64::MAX);
+        let event = event.seal().expect("u64 maximum values seal");
+        assert!(
+            event.validate().is_ok(),
+            "u64 maximum is valid for sequence and timestamp fields"
         );
     }
 }

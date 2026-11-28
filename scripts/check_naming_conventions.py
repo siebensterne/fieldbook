@@ -12,6 +12,11 @@ ROOT = Path(__file__).resolve().parents[1]
 PHASE = re.compile(r"(?:^|[-_])(?:p|m|h|d|e|v)[0-9]+(?:$|[-_.])", re.IGNORECASE)
 ACTIVE_PREFIXES = ("src/", "tests/", "xtask/", "scripts/", "tools/")
 EVIDENCE_PREFIXES = ("measurements/", "captures/")
+# Canonical golden fixtures are copied byte-identically from the workspace
+# manifest, which fixes their filenames (including phase-shaped IDs such as
+# P13-INT-SCHEMA). They are conformance evidence, not active code paths, so
+# the phase-label convention must not reject the required copies.
+GOLDEN_FIXTURE_PREFIXES = ("tests/contract_fixtures/",)
 
 
 def tracked_paths(root: Path) -> list[str]:
@@ -25,6 +30,8 @@ def phase_label_findings(paths: list[str]) -> list[str]:
     findings: list[str] = []
     for rel in paths:
         if rel.startswith(EVIDENCE_PREFIXES):
+            continue
+        if rel.startswith(GOLDEN_FIXTURE_PREFIXES):
             continue
         if not rel.startswith(ACTIVE_PREFIXES):
             continue
